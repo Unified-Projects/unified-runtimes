@@ -2,12 +2,16 @@ name: CodeQL
 
 on:
     push:
-        branches: ["main", "dev"]
+        branches: ["main"]
     pull_request:
-        branches: ["main", "dev"]
+        branches: ["dev", "main"]
     schedule:
         # Run weekly on Sundays at 00:00 UTC
         - cron: "0 0 * * 0"
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
 
 jobs:
     analyze-actions:
@@ -23,16 +27,16 @@ jobs:
 
         steps:
             - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
             - name: Initialize CodeQL
-              uses: github/codeql-action/init@45c373516f557556c15d420e3f5e0aa3d64366bc # v3
+              uses: github/codeql-action/init@5d4e8d1aca955e8d8589aabd499c5cae939e33c7 # v3
               with:
                   languages: actions
                   queries: security-and-quality
 
             - name: Perform CodeQL Analysis
-              uses: github/codeql-action/analyze@45c373516f557556c15d420e3f5e0aa3d64366bc # v3
+              uses: github/codeql-action/analyze@5d4e8d1aca955e8d8589aabd499c5cae939e33c7 # v3
               with:
                   category: "/language:actions"
 
@@ -43,6 +47,9 @@ jobs:
 
     rust-security-audit:
         name: Rust Security Audit
+        concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         permissions:
             security-events: write
@@ -50,7 +57,7 @@ jobs:
 
         steps:
             - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
             - name: Set up Rust
               uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
@@ -96,13 +103,16 @@ jobs:
 
     license-check:
         name: License Check
+        concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         permissions:
             contents: read
 
         steps:
             - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
             - name: Set up Rust
               uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
