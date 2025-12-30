@@ -3,12 +3,33 @@ name: CI
 on:
     push:
         branches: ["main", "dev"]
+        paths-ignore:
+            - "**/*.md"
+            - "docs/**"
+            - "LICENCE"
+            - "LICENSE"
+            - "LICENSE.*"
+            - ".vscode/**"
+            - ".editorconfig"
     pull_request:
         branches: ["main", "dev"]
+        paths-ignore:
+            - "**/*.md"
+            - "docs/**"
+            - "LICENCE"
+            - "LICENSE"
+            - "LICENSE.*"
+            - ".vscode/**"
+            - ".editorconfig"
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
 
 env:
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
+    COMPOSE_PROJECT_NAME: urt-ci
 
 jobs:
     lint:
@@ -35,17 +56,14 @@ jobs:
             - name: Lint with Clippy
               run: cargo clippy --all-targets --all-features -- -D warnings
 
-            - name: Cleanup
-              if: always()
-              run: |
-                  cargo clean 2>/dev/null || true
-                  rm -rf ~/.cargo/registry/cache 2>/dev/null || true
+            # No explicit cleanup: preserves rust-cache contents for faster CI
 
     test:
         name: Unit Tests
         runs-on: ubuntu-latest
         permissions:
             contents: read
+        needs: lint
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -68,17 +86,14 @@ jobs:
             - name: Run doc tests
               run: cargo test --doc --verbose
 
-            - name: Cleanup
-              if: always()
-              run: |
-                  cargo clean 2>/dev/null || true
-                  rm -rf ~/.cargo/registry/cache 2>/dev/null || true
+            # No explicit cleanup: preserves rust-cache contents for faster CI
 
     build:
         name: Build
         runs-on: ubuntu-latest
         permissions:
             contents: read
+        needs: test
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -105,11 +120,7 @@ jobs:
                   path: target/release/urt-executor
                   retention-days: 7
 
-            - name: Cleanup
-              if: always()
-              run: |
-                  cargo clean 2>/dev/null || true
-                  rm -rf ~/.cargo/registry/cache 2>/dev/null || true
+            # No explicit cleanup: preserves rust-cache contents for faster CI
 
     docker-build:
         name: Docker Build
@@ -118,6 +129,7 @@ jobs:
             contents: read
         outputs:
             image_tag: ${{ steps.image.outputs.image_tag }}
+        needs: build
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -140,6 +152,8 @@ jobs:
                   tags: ${{ steps.image.outputs.image_tag }}
                   push: false
                   outputs: type=oci,dest=/tmp/urt-executor.tar
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
 
             - name: Cleanup
               if: always()
@@ -152,6 +166,7 @@ jobs:
         runs-on: ubuntu-latest
         permissions:
             contents: read
+        needs: docker-build
         env:
             E2E_RUNTIME_IMAGE: openruntimes/node:v5-22
             E2E_TIMEOUT_SECS: 300
@@ -164,6 +179,16 @@ jobs:
             - name: Pull runtime image
               run: docker pull $E2E_RUNTIME_IMAGE
 
+            - name: Build test-runner image (cached)
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+              with:
+                  context: .
+                  file: crates/urt-executor/Dockerfile.test
+                  tags: ${{ env.COMPOSE_PROJECT_NAME }}-test-runner:latest
+                  load: true
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
             - name: Pre-cleanup stale containers
               working-directory: crates/urt-executor
               run: |
@@ -174,7 +199,7 @@ jobs:
 
             - name: Run dockerized tests
               working-directory: crates/urt-executor
-              run: docker compose -f docker-compose.test.yml --profile test up --build --abort-on-container-exit
+              run: docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f docker-compose.test.yml --profile test up --no-build --abort-on-container-exit
 
             - name: Cleanup
               if: always()

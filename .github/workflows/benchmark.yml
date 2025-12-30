@@ -3,6 +3,14 @@ name: Benchmark
 on:
     push:
         branches: ["main", "dev"]
+        paths-ignore:
+            - "**/*.md"
+            - "docs/**"
+            - "LICENCE"
+            - "LICENSE"
+            - "LICENSE.*"
+            - ".vscode/**"
+            - ".editorconfig"
     workflow_dispatch:
         inputs:
             duration:
@@ -18,6 +26,10 @@ on:
                 required: false
                 default: "node"
 
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
 env:
     CARGO_TERM_COLOR: always
     BENCH_SECRET: benchmark-secret
@@ -25,6 +37,7 @@ env:
     BENCH_RUNTIME_IMAGE: ${{ github.event.inputs.runtime_image || 'openruntimes/node:v5-22' }}
     BENCH_FUNCTION: ${{ github.event.inputs.function || 'node' }}
     BENCH_OUTPUT_JSON: benchmark_results.json
+    COMPOSE_PROJECT_NAME: urt-bench
 
 jobs:
     benchmark:
@@ -39,35 +52,56 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-            - name: Pre-clean Stale Containers
+            - name: Pre-build urt-executor image (cached)
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+              with:
+                  context: .
+                  file: docker/Dockerfile
+                  tags: ${{ env.COMPOSE_PROJECT_NAME }}-urt-executor:latest
+                  load: true
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            - name: Pre-build bench-runner image (cached)
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+              with:
+                  context: .
+                  file: crates/urt-executor/Dockerfile.test
+                  tags: ${{ env.COMPOSE_PROJECT_NAME }}-bench-runner:latest
+                  load: true
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            - name: Pre-clean stale containers
               run: |
-                  # Remove any stale containers and networks from previous runs
-                  docker compose -f crates/urt-executor/docker-compose.test.yml \
-                    --profile test --profile bench down -v --remove-orphans 2>/dev/null || true
+                  docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
+                      --profile test --profile bench down -v --remove-orphans 2>/dev/null || true
                   docker ps -a --filter "label=urt.managed" -q | xargs -r docker rm -f 2>/dev/null || true
                   docker network rm e2e-test-network 2>/dev/null || true
 
-            - name: Run Dockerized Benchmarks
+            - name: Run dockerized benchmarks
               run: |
-                  docker compose -f crates/urt-executor/docker-compose.test.yml \
-                    --profile bench up --build --abort-on-container-exit --exit-code-from bench-runner
+                  docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
+                      --profile bench up --no-build --abort-on-container-exit --exit-code-from bench-runner
 
-            - name: Capture Benchmark Output
+            - name: Capture benchmark output
               if: always()
               run: |
-                  docker compose -f crates/urt-executor/docker-compose.test.yml \
-                    logs --no-color bench-runner > benchmark_output.txt || true
+                  docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
+                      logs --no-color bench-runner > benchmark_output.txt || true
 
-                  BENCH_CONTAINER_ID=$(docker compose -f crates/urt-executor/docker-compose.test.yml ps -q bench-runner)
+                  BENCH_CONTAINER_ID=$(docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml ps -q bench-runner)
                   if [ -n "$BENCH_CONTAINER_ID" ]; then
                       docker cp "$BENCH_CONTAINER_ID:/app/${BENCH_OUTPUT_JSON}" "${BENCH_OUTPUT_JSON}" || true
                   fi
-            - name: Write Benchmark Summary
+
+            - name: Write benchmark summary
               if: always()
               run: |
                   {
                       echo "## Benchmark Summary"
                       echo ""
+
                       if [ -f benchmark_results.json ]; then
                           echo "| Benchmark | RPS | Success % | p50 (ms) | p90 (ms) | p99 (ms) |"
                           echo "|-----------|-----|-----------|----------|----------|----------|"
@@ -83,7 +117,8 @@ jobs:
                                   $u.health | row("Health Endpoint"),
                                   $u.execution | row("Function Execution"),
                                   $u.list_runtimes | row("List Runtimes")
-                              ] | .[]' benchmark_results.json
+                              ] | .[]
+                          ' benchmark_results.json
                           echo ""
                       else
                           echo "_No benchmark_results.json found._"
@@ -101,7 +136,7 @@ jobs:
                       fi
                   } >> "$GITHUB_STEP_SUMMARY"
 
-            - name: Upload Results
+            - name: Upload results
               if: always()
               uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
               with:
@@ -111,17 +146,17 @@ jobs:
                       benchmark_results.json
                   retention-days: 90
 
-            - name: Show Executor Logs on Failure
+            - name: Show executor logs on failure
               if: failure()
               run: |
                   echo "=== URT Executor Logs ==="
-                  docker compose -f crates/urt-executor/docker-compose.test.yml \
-                    logs --no-color urt-executor | tail -100
+                  docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
+                      logs --no-color urt-executor | tail -100
 
-            - name: Clean Up Resources
+            - name: Clean up resources
               if: always()
               run: |
-                  docker compose -f crates/urt-executor/docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true
+                  docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true
                   docker ps -a --filter "label=urt.managed" -q | xargs -r docker rm -f 2>/dev/null || true
                   docker network rm e2e-test-network 2>/dev/null || true
                   docker system prune -f 2>/dev/null || true
