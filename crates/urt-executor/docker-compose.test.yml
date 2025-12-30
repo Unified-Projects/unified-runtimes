@@ -24,6 +24,7 @@ services:
     volumes:
       # Mount Docker socket so tests can create containers
       - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp:/tmp
     environment:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - RUST_LOG=info
@@ -71,32 +72,6 @@ services:
     networks:
       - e2e-test-network
 
-  # OpenRuntimes Executor (for benchmark comparison)
-  opr-executor:
-    profiles: ["bench"]
-    image: openruntimes/executor:latest
-    environment:
-      - OPR_EXECUTOR_SECRET=${OPR_EXECUTOR_SECRET:-${BENCH_SECRET:-benchmark-secret}}
-      - OPR_EXECUTOR_NETWORK=e2e-test-network
-      - OPR_EXECUTOR_RUNTIMES=node-22
-      - OPR_EXECUTOR_RUNTIME_VERSIONS=v5
-      - OPR_EXECUTOR_IMAGE_PULL=enabled
-      - OPR_EXECUTOR_KEEP_ALIVE=true
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -sf -H \"Authorization: Bearer $$OPR_EXECUTOR_SECRET\" -H \"x-open-runtimes-secret: $$OPR_EXECUTOR_SECRET\" http://localhost:80/v1/health",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    networks:
-      - e2e-test-network
-
   # Benchmark runner (uses the executor services above)
   bench-runner:
     profiles: ["bench"]
@@ -111,22 +86,17 @@ services:
       - RUST_BACKTRACE=1
       # Benchmark configuration - use service names for Docker networking
       - URT_URL=http://urt-executor:80
-      - OPR_URL=http://opr-executor:80
       - BENCH_SECRET=${BENCH_SECRET:-benchmark-secret}
       - URT_SECRET=${URT_SECRET:-${BENCH_SECRET:-benchmark-secret}}
-      - OPR_EXECUTOR_SECRET=${OPR_EXECUTOR_SECRET:-${BENCH_SECRET:-benchmark-secret}}
       - BENCH_DURATION=${BENCH_DURATION:-30}
       - BENCH_WARMUP=${BENCH_WARMUP:-3}
       - BENCH_TIMEOUT=${BENCH_TIMEOUT:-30}
       - BENCH_RUNTIME_IMAGE=${BENCH_RUNTIME_IMAGE:-openruntimes/node:v5-22}
       - BENCH_FUNCTION=${BENCH_FUNCTION:-node}
-      - BENCH_RUNTIME_TARGET=${BENCH_RUNTIME_TARGET:-both}
       - BENCH_OUTPUT_JSON=${BENCH_OUTPUT_JSON:-benchmark_results.json}
     command: ["cargo", "bench", "--package", "urt-executor", "--bench", "benchmark"]
     depends_on:
       urt-executor:
-        condition: service_healthy
-      opr-executor:
         condition: service_healthy
     networks:
       - e2e-test-network

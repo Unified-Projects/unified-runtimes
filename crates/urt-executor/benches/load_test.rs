@@ -450,76 +450,6 @@ pub fn print_results(results: &BenchmarkResults) {
     println!("{:=<60}", "");
 }
 
-/// Compare two benchmark results
-pub fn compare_results(urt: &BenchmarkResults, opr: &BenchmarkResults) {
-    println!("\n{:=^80}", " COMPARISON ");
-    println!(
-        "{:<30} {:>20} {:>20}",
-        "Metric", "URT Executor", "OpenRuntimes"
-    );
-    println!("{:-<80}", "");
-
-    let rps_diff = if opr.rps > 0.0 {
-        (urt.rps - opr.rps) / opr.rps * 100.0
-    } else {
-        0.0
-    };
-    let rps_indicator = if urt.rps > opr.rps { "+" } else { "" };
-    println!(
-        "{:<30} {:>17.2} {:>17.2}   ({}{:.1}%)",
-        "RPS", urt.rps, opr.rps, rps_indicator, rps_diff
-    );
-
-    let p50_diff = if opr.latency.p50_ms > 0.0 {
-        (opr.latency.p50_ms - urt.latency.p50_ms) / opr.latency.p50_ms * 100.0
-    } else {
-        0.0
-    };
-    let p50_indicator = if urt.latency.p50_ms < opr.latency.p50_ms {
-        "+"
-    } else {
-        ""
-    };
-    println!(
-        "{:<30} {:>15.2}ms {:>15.2}ms   ({}{:.1}%)",
-        "Latency p50", urt.latency.p50_ms, opr.latency.p50_ms, p50_indicator, p50_diff
-    );
-
-    let p99_diff = if opr.latency.p99_ms > 0.0 {
-        (opr.latency.p99_ms - urt.latency.p99_ms) / opr.latency.p99_ms * 100.0
-    } else {
-        0.0
-    };
-    let p99_indicator = if urt.latency.p99_ms < opr.latency.p99_ms {
-        "+"
-    } else {
-        ""
-    };
-    println!(
-        "{:<30} {:>15.2}ms {:>15.2}ms   ({}{:.1}%)",
-        "Latency p99", urt.latency.p99_ms, opr.latency.p99_ms, p99_indicator, p99_diff
-    );
-
-    let urt_success_rate = if urt.total_requests > 0 {
-        urt.successful_requests as f64 / urt.total_requests as f64 * 100.0
-    } else {
-        0.0
-    };
-    let opr_success_rate = if opr.total_requests > 0 {
-        opr.successful_requests as f64 / opr.total_requests as f64 * 100.0
-    } else {
-        0.0
-    };
-    println!(
-        "{:<30} {:>20} {:>20}",
-        "Success Rate",
-        format!("{:.2}%", urt_success_rate),
-        format!("{:.2}%", opr_success_rate)
-    );
-
-    println!("{:=<80}", "");
-}
-
 /// Cleanup Docker containers from benchmark runs
 /// Removes containers with urt.managed=true label, excluding panini and known services
 pub async fn cleanup_benchmark_containers() {
@@ -553,7 +483,6 @@ pub async fn cleanup_benchmark_containers() {
                 || name.contains("minio")
                 || name.contains("postgres")
                 || name == "urt-executor"
-                || name == "opr-executor"
             {
                 continue;
             }

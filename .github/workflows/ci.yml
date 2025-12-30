@@ -109,24 +109,34 @@ jobs:
         name: Docker Build
         runs-on: ubuntu-latest
         outputs:
-            image_tag: ${{ steps.build.outputs.image_tag }}
+            image_tag: ${{ steps.image.outputs.image_tag }}
         steps:
             - uses: actions/checkout@v4
+
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@v3
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
 
-            - name: Build Docker image
-              id: build
-              run: |
-                  IMAGE_TAG="urt-executor:ci-${{ github.sha }}"
-                  docker build -t $IMAGE_TAG -f docker/Dockerfile .
-                  echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+            - name: Set image tag
+              id: image
+              run: echo "image_tag=urt-executor:ci-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+            - name: Build Docker image (multi-arch)
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: docker/Dockerfile
+                  platforms: linux/amd64,linux/arm64
+                  tags: ${{ steps.image.outputs.image_tag }}
+                  push: false
+                  outputs: type=oci,dest=/tmp/urt-executor.tar
 
             - name: Cleanup
               if: always()
               run: |
-                  docker rmi "urt-executor:ci-${{ github.sha }}" 2>/dev/null || true
+                  rm -f /tmp/urt-executor.tar 2>/dev/null || true
                   docker system prune -f 2>/dev/null || true
 
     docker-tests:

@@ -24,7 +24,6 @@ env:
     BENCH_DURATION: ${{ github.event.inputs.duration || '30' }}
     BENCH_RUNTIME_IMAGE: ${{ github.event.inputs.runtime_image || 'openruntimes/node:v5-22' }}
     BENCH_FUNCTION: ${{ github.event.inputs.function || 'node' }}
-    BENCH_RUNTIME_TARGET: both
     BENCH_OUTPUT_JSON: benchmark_results.json
 
 jobs:
@@ -44,7 +43,6 @@ jobs:
                   docker compose -f crates/urt-executor/docker-compose.test.yml \
                     --profile test --profile bench down -v --remove-orphans 2>/dev/null || true
                   docker ps -a --filter "label=urt.managed" -q | xargs -r docker rm -f 2>/dev/null || true
-                  docker ps -a --filter "name=openruntimes-" -q | xargs -r docker rm -f 2>/dev/null || true
                   docker network rm e2e-test-network 2>/dev/null || true
 
             - name: Run Dockerized Benchmarks
@@ -62,6 +60,44 @@ jobs:
                   if [ -n "$BENCH_CONTAINER_ID" ]; then
                       docker cp "$BENCH_CONTAINER_ID:/app/${BENCH_OUTPUT_JSON}" "${BENCH_OUTPUT_JSON}" || true
                   fi
+            - name: Write Benchmark Summary
+              if: always()
+              run: |
+                  {
+                      echo "## Benchmark Summary"
+                      echo ""
+                      if [ -f benchmark_results.json ]; then
+                          echo "| Benchmark | RPS | Success % | p50 (ms) | p90 (ms) | p99 (ms) |"
+                          echo "|-----------|-----|-----------|----------|----------|----------|"
+                          jq -r '
+                              def success: if .total_requests == 0 then 0 else (.successful_requests / .total_requests * 100) end;
+                              def row($name):
+                                  if . == null then empty
+                                  else "| \($name) | \(.rps|sprintf(\"%.2f\")) | \(success|sprintf(\"%.2f\"))% | \(.latency.p50_ms|sprintf(\"%.2f\")) | \(.latency.p90_ms|sprintf(\"%.2f\")) | \(.latency.p99_ms|sprintf(\"%.2f\")) |"
+                                  end;
+                              (.urt // {}) as $u |
+                              [
+                                  $u.ping | row("Ping Endpoint"),
+                                  $u.health | row("Health Endpoint"),
+                                  $u.execution | row("Function Execution"),
+                                  $u.list_runtimes | row("List Runtimes")
+                              ] | .[]' benchmark_results.json
+                          echo ""
+                      else
+                          echo "_No benchmark_results.json found._"
+                          echo ""
+                      fi
+
+                      if [ -f benchmark_output.txt ]; then
+                          awk '
+                              /^## URT Concurrency Scaling/ {printing=1}
+                              printing {print}
+                              /^\\| Concurrency \\|/ {table=1}
+                              table && /^$/ {exit}
+                          ' benchmark_output.txt
+                          echo ""
+                      fi
+                  } >> "$GITHUB_STEP_SUMMARY"
 
             - name: Upload Results
               if: always()
@@ -79,17 +115,12 @@ jobs:
                   echo "=== URT Executor Logs ==="
                   docker compose -f crates/urt-executor/docker-compose.test.yml \
                     logs --no-color urt-executor | tail -100
-                  echo ""
-                  echo "=== OpenRuntimes Executor Logs ==="
-                  docker compose -f crates/urt-executor/docker-compose.test.yml \
-                    logs --no-color opr-executor | tail -100
 
             - name: Clean Up Resources
               if: always()
               run: |
                   docker compose -f crates/urt-executor/docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true
                   docker ps -a --filter "label=urt.managed" -q | xargs -r docker rm -f 2>/dev/null || true
-                  docker ps -a --filter "name=openruntimes-" -q | xargs -r docker rm -f 2>/dev/null || true
                   docker network rm e2e-test-network 2>/dev/null || true
                   docker system prune -f 2>/dev/null || true
                   docker volume prune -f 2>/dev/null || true
