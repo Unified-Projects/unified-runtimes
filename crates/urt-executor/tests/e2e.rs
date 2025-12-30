@@ -12,6 +12,7 @@
 
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -51,12 +52,21 @@ fn get_timeout() -> Duration {
 fn get_test_function_path() -> String {
     if let Ok(host_path) = std::env::var("TEST_FIXTURES_HOST_PATH") {
         // Running in Docker - use the HOST path so containers created via socket can mount it
-        format!("{}/node-function", host_path)
+        let candidate = format!("{}/node-function", host_path);
+        if Path::new(&candidate).exists() {
+            return candidate;
+        }
     } else {
-        // Running locally - use cargo manifest dir
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        format!("{}/tests/fixtures/node-function", manifest_dir)
+        return local_fixture_path();
     }
+
+    local_fixture_path()
+}
+
+fn local_fixture_path() -> String {
+    // Running locally - use cargo manifest dir
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    format!("{}/tests/fixtures/node-function", manifest_dir)
 }
 
 struct TestServer {

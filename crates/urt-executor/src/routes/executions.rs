@@ -18,6 +18,7 @@ use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::debug;
 
 /// Request body for execution
@@ -311,10 +312,29 @@ pub async fn create_execution(
     // Get protocol handler
     let protocol = get_protocol(&runtime.version);
 
-    // Execute
-    let response = protocol
-        .execute(&runtime, &exec_req, &state.http_client)
-        .await?;
+    // Execute with retries for transient network errors while the runtime boots.
+    let mut attempt = 0;
+    let max_attempts = state.config.retry_attempts.max(1);
+    let response = loop {
+        match protocol
+            .execute(&runtime, &exec_req, &state.http_client)
+            .await
+        {
+            Ok(response) => break response,
+            Err(ExecutorError::Network(err)) => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    return Err(ExecutorError::RuntimeTimeout);
+                }
+                debug!(
+                    "Execution network error (attempt {}/{}): {}",
+                    attempt, max_attempts, err
+                );
+                tokio::time::sleep(Duration::from_millis(state.config.retry_delay_ms)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    };
 
     // Determine response format based on Accept header
     let accept = headers

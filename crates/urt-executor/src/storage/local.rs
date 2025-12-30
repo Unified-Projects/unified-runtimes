@@ -3,7 +3,10 @@
 use super::Storage;
 use crate::error::{ExecutorError, Result};
 use async_trait::async_trait;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::path::Path;
+use tar::Builder;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -131,6 +134,25 @@ impl Storage for LocalStorage {
         let src = self.full_path(remote_path);
         let dst = local_path;
 
+        if let Ok(metadata) = fs::metadata(&src).await {
+            if metadata.is_dir() {
+                if let Some(parent) = Path::new(dst).parent() {
+                    fs::create_dir_all(parent).await.map_err(|e| {
+                        ExecutorError::Storage(format!("Failed to create dir: {}", e))
+                    })?;
+                }
+
+                let src_owned = src.clone();
+                let dst_owned = dst.to_string();
+                tokio::task::spawn_blocking(move || create_tarball(&src_owned, &dst_owned))
+                    .await
+                    .map_err(|e| {
+                        ExecutorError::Storage(format!("Failed to create tarball task: {}", e))
+                    })??;
+                return Ok(());
+            }
+        }
+
         // Ensure parent directory exists
         if let Some(parent) = Path::new(dst).parent() {
             fs::create_dir_all(parent)
@@ -162,6 +184,39 @@ impl Storage for LocalStorage {
 
         Ok(())
     }
+}
+
+fn create_tarball(src_dir: &str, dst_path: &str) -> Result<()> {
+    let file = std::fs::File::create(dst_path).map_err(|e| {
+        ExecutorError::Storage(format!("Failed to create tarball {}: {}", dst_path, e))
+    })?;
+
+    if dst_path.ends_with(".tar.gz") || dst_path.ends_with(".tgz") {
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+        builder
+            .append_dir_all(".", src_dir)
+            .map_err(|e| ExecutorError::Storage(format!("Failed to add files: {}", e)))?;
+        builder
+            .finish()
+            .map_err(|e| ExecutorError::Storage(format!("Failed to finish tar: {}", e)))?;
+        let encoder = builder
+            .into_inner()
+            .map_err(|e| ExecutorError::Storage(format!("Failed to finish tar: {}", e)))?;
+        encoder
+            .finish()
+            .map_err(|e| ExecutorError::Storage(format!("Failed to finish gzip: {}", e)))?;
+    } else {
+        let mut builder = Builder::new(file);
+        builder
+            .append_dir_all(".", src_dir)
+            .map_err(|e| ExecutorError::Storage(format!("Failed to add files: {}", e)))?;
+        builder
+            .finish()
+            .map_err(|e| ExecutorError::Storage(format!("Failed to finish tar: {}", e)))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
