@@ -66,7 +66,8 @@ async fn create_test_state() -> Option<AppState> {
 
 /// Helper to parse JSON response body
 async fn parse_json_body(body: Body) -> Value {
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    // Use a reasonable upper bound for body size (20 MiB), matching test_config().max_body_size.
+    let bytes = axum::body::to_bytes(body, 20 * 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap_or(json!({}))
 }
 
@@ -75,7 +76,8 @@ async fn parse_json_body(body: Body) -> Value {
 /// that need to inspect raw HTTP response bodies.
 #[allow(dead_code)]
 async fn body_to_string(body: Body) -> String {
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    // Use the same 20 MiB upper bound as in parse_json_body/test_config.
+    let bytes = axum::body::to_bytes(body, 20 * 1024 * 1024).await.unwrap();
     String::from_utf8_lossy(&bytes).to_string()
 }
 
