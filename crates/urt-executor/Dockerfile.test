@@ -1,0 +1,24 @@
+# Dockerfile for running all tests inside Docker
+# This allows tests to communicate with containers on the Docker network
+
+FROM rust:latest
+
+# Install Docker CLI (to communicate with host Docker daemon) and Apache Bench for benchmarks
+RUN apt-get update && apt-get install -y \
+    docker.io \
+    apache2-utils \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build tests (excluding benchmarks)
+RUN cargo build --package urt-executor --lib --tests
+
+# Default: run all tests (unit, integration, e2e) but NOT benchmarks
+# Benchmarks are run separately via the benchmark.yml workflow
+CMD ["cargo", "test", "--package", "urt-executor", "--lib", "--tests", "--", "--test-threads=1"]

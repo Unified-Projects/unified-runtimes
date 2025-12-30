@@ -1,0 +1,11 @@
+[package]
+name = "urt-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core types and shared logic for unified-runtimes"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

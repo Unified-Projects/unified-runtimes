@@ -1,0 +1,109 @@
+name: Release
+
+on:
+    push:
+        branches: ["main"]
+
+env:
+    REGISTRY: docker.io
+    IMAGE_NAME: unifiedprojects/urt-executor
+
+jobs:
+    check-version:
+        name: Check Version Tag
+        runs-on: blacksmith-2vcpu-ubuntu-2204
+        permissions:
+            contents: read
+        outputs:
+            is_release: ${{ steps.check.outputs.is_release }}
+            version: ${{ steps.check.outputs.version }}
+        steps:
+            - name: Check commit message for version
+              id: check
+              env:
+                  COMMIT_MSG: ${{ github.event.head_commit.message }}
+              run: |
+                  if [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+                      echo "is_release=true" >> "$GITHUB_OUTPUT"
+                      echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+                      echo "Release detected: v${BASH_REMATCH[1]}"
+                  else
+                      echo "is_release=false" >> "$GITHUB_OUTPUT"
+                      echo "version=" >> "$GITHUB_OUTPUT"
+                      echo "Not a release commit: $COMMIT_MSG"
+                  fi
+
+    release:
+        name: Build and Release
+        runs-on: blacksmith-4vcpu-ubuntu-2204
+        needs: check-version
+        if: needs.check-version.outputs.is_release == 'true'
+        permissions:
+            contents: write
+            packages: write
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Set up Docker with Blacksmith
+              uses: useblacksmith/setup-docker@33fed32c1ba8775f20366ec9e8d0cd9fe8fc1dd3 # v1
+
+            - name: Set up QEMU for multi-arch
+              uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - name: Extract metadata
+              id: meta
+              uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+              with:
+                  images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+                  tags: |
+                      type=raw,value=${{ needs.check-version.outputs.version }}
+                      type=raw,value=latest
+
+            - name: Build and push Docker image
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+              with:
+                  context: .
+                  file: docker/Dockerfile
+                  push: true
+                  platforms: linux/amd64,linux/arm64
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+                  provenance: false
+
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+              with:
+                  tag_name: v${{ needs.check-version.outputs.version }}
+                  name: v${{ needs.check-version.outputs.version }}
+                  generate_release_notes: true
+                  body: |
+                      ## Docker Image
+
+                      ```bash
+                      docker pull unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
+                      ```
+
+                      Or use the latest tag:
+
+                      ```bash
+                      docker pull unifiedprojects/urt-executor:latest
+                      ```
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Cleanup
+              if: always()
+              run: |
+                  docker system prune -f 2>/dev/null || true
+                  docker builder prune -f 2>/dev/null || true
