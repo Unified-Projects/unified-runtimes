@@ -66,8 +66,9 @@ pub fn default_memory() -> u64 {
 pub fn default_version() -> String {
     "v5".to_string()
 }
+const DEFAULT_RESTART_POLICY: &str = "no";
 pub fn default_restart_policy() -> String {
-    "no".to_string()
+    DEFAULT_RESTART_POLICY.to_string()
 }
 
 /// Validate runtime ID format
@@ -300,8 +301,22 @@ pub async fn create_runtime(
     // Create mount directories (Docker.php line 448)
     let src_dir = format!("{}/src", tmp_folder);
     let builds_dir = format!("{}/builds", tmp_folder);
-    tokio::fs::create_dir_all(&src_dir).await.ok();
-    tokio::fs::create_dir_all(&builds_dir).await.ok();
+    if let Err(e) = tokio::fs::create_dir_all(&src_dir).await {
+        error!("Failed to create src directory {}: {}", src_dir, e);
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::RuntimeFailed(format!(
+            "Failed to create source directory: {}",
+            e
+        )));
+    }
+    if let Err(e) = tokio::fs::create_dir_all(&builds_dir).await {
+        error!("Failed to create builds directory {}: {}", builds_dir, e);
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::RuntimeFailed(format!(
+            "Failed to create builds directory: {}",
+            e
+        )));
+    }
 
     // Copy source file from storage to local tmp (Docker.php lines 439-443)
     // This is required because Docker can only mount local paths
