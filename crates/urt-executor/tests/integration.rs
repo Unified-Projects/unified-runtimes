@@ -703,6 +703,8 @@ mod errors {
 mod validation {
     use super::*;
 
+    const VERY_LONG_RUNTIME_ID_LENGTH: usize = 1000;
+
     #[tokio::test]
     async fn empty_body_for_post() {
         require_docker!(state);
@@ -751,7 +753,7 @@ mod validation {
         require_docker!(state);
         let app = create_router(state);
 
-        let long_id = "a".repeat(1000);
+        let long_id = "a".repeat(VERY_LONG_RUNTIME_ID_LENGTH);
         let response = app
             .oneshot(
                 Request::builder()
