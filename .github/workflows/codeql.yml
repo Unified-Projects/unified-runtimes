@@ -2,12 +2,16 @@ name: CodeQL
 
 on:
     push:
-        branches: ["main", "dev"]
+        branches: ["main"]
     pull_request:
-        branches: ["main", "dev"]
+        branches: ["main"]
     schedule:
         # Run weekly on Sundays at 00:00 UTC
         - cron: "0 0 * * 0"
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
 
 jobs:
     analyze-actions:
@@ -43,6 +47,9 @@ jobs:
 
     rust-security-audit:
         name: Rust Security Audit
+        concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         permissions:
             security-events: write
@@ -96,6 +103,9 @@ jobs:
 
     license-check:
         name: License Check
+        concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         permissions:
             contents: read
