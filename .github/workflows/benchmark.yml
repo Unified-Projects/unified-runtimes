@@ -32,12 +32,13 @@ jobs:
         name: Performance Benchmark
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - name: Checkout repository
+              uses: actions/checkout@v4
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
 
-            - name: Pre-cleanup stale containers
+            - name: Pre-clean Stale Containers
               run: |
                   # Remove any stale containers and networks from previous runs
                   docker compose -f crates/urt-executor/docker-compose.test.yml \
@@ -46,12 +47,12 @@ jobs:
                   docker ps -a --filter "name=openruntimes-" -q | xargs -r docker rm -f 2>/dev/null || true
                   docker network rm e2e-test-network 2>/dev/null || true
 
-            - name: Run dockerized benchmarks
+            - name: Run Dockerized Benchmarks
               run: |
                   docker compose -f crates/urt-executor/docker-compose.test.yml \
                     --profile bench up --build --abort-on-container-exit --exit-code-from bench-runner
 
-            - name: Capture benchmark output
+            - name: Capture Benchmark Output
               if: always()
               run: |
                   docker compose -f crates/urt-executor/docker-compose.test.yml \
@@ -62,7 +63,7 @@ jobs:
                       docker cp "$BENCH_CONTAINER_ID:/app/${BENCH_OUTPUT_JSON}" "${BENCH_OUTPUT_JSON}" || true
                   fi
 
-            - name: Upload results
+            - name: Upload Results
               if: always()
               uses: actions/upload-artifact@v4
               with:
@@ -72,7 +73,7 @@ jobs:
                       benchmark_results.json
                   retention-days: 90
 
-            - name: Show executor logs on failure
+            - name: Show Executor Logs on Failure
               if: failure()
               run: |
                   echo "=== URT Executor Logs ==="
@@ -83,7 +84,7 @@ jobs:
                   docker compose -f crates/urt-executor/docker-compose.test.yml \
                     logs --no-color opr-executor | tail -100
 
-            - name: Cleanup
+            - name: Clean Up Resources
               if: always()
               run: |
                   docker compose -f crates/urt-executor/docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true

@@ -6,7 +6,7 @@ on:
 
 env:
     REGISTRY: docker.io
-    IMAGE_NAME: Unified-Projects LTD./urt-executor
+    IMAGE_NAME: unifiedprojects/urt-executor
 
 jobs:
     check-version:
@@ -88,13 +88,13 @@ jobs:
                       ## Docker Image
 
                       ```bash
-                      docker pull Unified-Projects LTD./urt-executor:${{ needs.check-version.outputs.version }}
+                      docker pull unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
                       ```
 
                       Or use the latest tag:
 
                       ```bash
-                      docker pull Unified-Projects LTD./urt-executor:latest
+                      docker pull unifiedprojects/urt-executor:latest
                       ```
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

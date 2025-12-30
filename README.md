@@ -1,6 +1,6 @@
 # Unified Runtimes (URT) Executor
 
-A high-performance drop-in replacement for the [OpenRuntimes Executor](https://github.com/open-runtimes/executor), rebuilt from the ground up in Rust.
+A high-performance drop-in replacement for the [OpenRuntimes Executor](https://github.com/open-runtimes/open-runtimes), rebuilt from the ground up in Rust.
 
 ## Overview
 
@@ -35,7 +35,7 @@ unified-runtimes/
 
 ```bash
 # Clone the repository
-git clone https://github.com/Unified-Projects LTD./unified-runtimes.git
+git clone https://github.com/Unified-Projects/unified-runtimes.git
 cd unified-runtimes
 
 # Copy environment template
