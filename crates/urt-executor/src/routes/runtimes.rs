@@ -511,11 +511,7 @@ pub async fn create_runtime(
 
     if !req.destination.is_empty() {
         // Determine build file path
-        let build_file = if req.output_directory.is_empty() {
-            "code.tar.gz"
-        } else {
-            "code.tar.gz"
-        };
+        let build_file = "code.tar.gz";
         let local_build = format!("{}/{}", builds_dir, build_file);
 
         // Check if build artifact exists

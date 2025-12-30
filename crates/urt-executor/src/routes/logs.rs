@@ -154,7 +154,7 @@ fn parse_timing(timing: &str, base_datetime: DateTime<Utc>) -> Vec<TimingEntry> 
 
         // Convert to microseconds and add to datetime
         let microseconds = (timing_secs * 1_000_000.0).ceil() as i64;
-        current_datetime = current_datetime + ChronoDuration::microseconds(microseconds);
+        current_datetime += ChronoDuration::microseconds(microseconds);
 
         // Format timestamp as ISO-8601 with milliseconds
         // Format: 2024-01-15T10:30:45.123+00:00
