@@ -244,7 +244,7 @@ pub async fn create_runtime(
                 req.entrypoint.clone(),
             );
             env.insert(
-                "INERNAL_EXECUTOR_HOSTNAME".to_string(),
+                "INTERNAL_EXECUTOR_HOSTNAME".to_string(),
                 runtime.hostname.clone(),
             );
         }
