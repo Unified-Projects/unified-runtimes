@@ -31,7 +31,7 @@ jobs:
         runs-on: ubuntu-latest
         permissions:
             contents: read
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         steps:
             - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
@@ -59,7 +59,7 @@ jobs:
         permissions:
             contents: read
         needs: lint
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         steps:
             - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
