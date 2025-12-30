@@ -824,7 +824,7 @@ mod docker_integration {
 
     /// Helper to clean up test runtime
     async fn cleanup_runtime(app: axum::Router, runtime_id: &str) {
-        let _ = app
+        let result = app
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -834,6 +834,13 @@ mod docker_integration {
                     .unwrap(),
             )
             .await;
+
+        if let Err(err) = result {
+            eprintln!(
+                "Warning: failed to clean up test runtime '{}': {}",
+                runtime_id, err
+            );
+        }
     }
 
     #[tokio::test]
