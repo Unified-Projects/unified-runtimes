@@ -50,14 +50,7 @@ jobs:
 
     release:
         name: Build and Release
-        runs-on: ${{ matrix.runner }}
-        strategy:
-            matrix:
-                include:
-                    - runner: blacksmith-2vcpu-ubuntu-2204
-                      arch: amd64
-                    - runner: blacksmith-2vcpu-ubuntu-2204-arm
-                      arch: arm64
+        runs-on: blacksmith-2vcpu-ubuntu-2204
         needs: check-version
         if: needs.check-version.outputs.version != ''
         permissions:
@@ -81,8 +74,8 @@ jobs:
                   context: .
                   file: docker/Dockerfile
                   push: true
-                  platforms: linux/${{ matrix.arch }}
-                  tags: unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+                  platforms: linux/amd64,linux/arm64
+                  tags: unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
 
             - name: Create GitHub Release
               if: needs.check-version.outputs.is_release == 'true'
@@ -105,15 +98,6 @@ jobs:
                       ```
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-            - name: Create and push Docker manifest
-              if: matrix.arch == 'amd64'
-              run: |
-                  docker manifest create unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }} \
-                    unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-amd64 \
-                    unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-arm64
-
-                  docker manifest push unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
 
             - name: Cleanup
               if: always()
