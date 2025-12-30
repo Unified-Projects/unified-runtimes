@@ -66,7 +66,8 @@ async fn create_test_state() -> Option<AppState> {
 
 /// Helper to parse JSON response body
 async fn parse_json_body(body: Body) -> Value {
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    // Use a reasonable upper bound for body size (20 MiB), matching test_config().max_body_size.
+    let bytes = axum::body::to_bytes(body, 20 * 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap_or(json!({}))
 }
 
@@ -75,7 +76,8 @@ async fn parse_json_body(body: Body) -> Value {
 /// that need to inspect raw HTTP response bodies.
 #[allow(dead_code)]
 async fn body_to_string(body: Body) -> String {
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    // Use the same 20 MiB upper bound as in parse_json_body/test_config.
+    let bytes = axum::body::to_bytes(body, 20 * 1024 * 1024).await.unwrap();
     String::from_utf8_lossy(&bytes).to_string()
 }
 
@@ -703,6 +705,8 @@ mod errors {
 mod validation {
     use super::*;
 
+    const VERY_LONG_RUNTIME_ID_LENGTH: usize = 1000;
+
     #[tokio::test]
     async fn empty_body_for_post() {
         require_docker!(state);
@@ -751,7 +755,7 @@ mod validation {
         require_docker!(state);
         let app = create_router(state);
 
-        let long_id = "a".repeat(1000);
+        let long_id = "a".repeat(VERY_LONG_RUNTIME_ID_LENGTH);
         let response = app
             .oneshot(
                 Request::builder()
@@ -824,7 +828,7 @@ mod docker_integration {
 
     /// Helper to clean up test runtime
     async fn cleanup_runtime(app: axum::Router, runtime_id: &str) {
-        let _ = app
+        let result = app
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -834,6 +838,13 @@ mod docker_integration {
                     .unwrap(),
             )
             .await;
+
+        if let Err(err) = result {
+            eprintln!(
+                "Warning: failed to clean up test runtime '{}': {}",
+                runtime_id, err
+            );
+        }
     }
 
     #[tokio::test]
