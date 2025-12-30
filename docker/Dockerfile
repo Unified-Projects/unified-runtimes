@@ -74,7 +74,7 @@ EXPOSE 80
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:80/v1/health || exit 1
+    CMD sh -c 'curl -sf "http://${URT_HOST}:${URT_PORT}/v1/health" || exit 1'
 
 # Use tini as init system for proper signal handling
 ENTRYPOINT ["/sbin/tini", "--"]
