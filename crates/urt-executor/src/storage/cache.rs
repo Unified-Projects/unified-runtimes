@@ -273,9 +273,35 @@ impl<S: Storage> BuildCache<S> {
     /// Create a compressed layer tarball
     async fn create_layer(source_dir: &str, output_path: &str) -> Result<()> {
         use std::process::Command;
+        use std::path::Path;
+
+        // Validate and normalize source and output paths before invoking external tar.
+        let source_path = Path::new(source_dir);
+        if !source_path.is_dir() {
+            return Err(ExecutorError::Storage(format!(
+                "Source directory does not exist or is not a directory: {}",
+                source_dir
+            )));
+        }
+
+        let output_path_obj = Path::new(output_path);
+        if let Some(parent) = output_path_obj.parent() {
+            // Ensure parent directory exists; do not create it implicitly.
+            if !parent.exists() {
+                return Err(ExecutorError::Storage(format!(
+                    "Output directory does not exist: {}",
+                    parent.to_string_lossy()
+                )));
+            }
+        }
 
         let output = Command::new("tar")
-            .args(["--zstd", "-cf", output_path, "-C", source_dir, "."])
+            .arg("--zstd")
+            .arg("-cf")
+            .arg(output_path_obj.to_string_lossy().to_string())
+            .arg("-C")
+            .arg(source_path.to_string_lossy().to_string())
+            .arg(".")
             .output()
             .map_err(|e| ExecutorError::Storage(format!("Failed to create tar: {}", e)))?;
 
@@ -290,11 +316,38 @@ impl<S: Storage> BuildCache<S> {
     }
 
     /// Extract a layer tarball
+        use std::path::Path;
     async fn extract_layer(layer_path: &str, target_dir: &str) -> Result<()> {
+        let layer_path_obj = Path::new(layer_path);
+        if !layer_path_obj.is_file() {
+            return Err(ExecutorError::Storage(format!(
+                "Layer path does not exist or is not a file: {}",
+                layer_path
+            )));
+        }
+
+        let target_dir_path = Path::new(target_dir);
+        // Ensure target directory exists and is a directory; do not follow arbitrary file paths.
+        if !target_dir_path.exists() {
+            fs::create_dir_all(target_dir_path)
+                .await
+                .map_err(|e| ExecutorError::Storage(format!("Failed to create target dir: {}", e)))?;
+        }
+        if !target_dir_path.is_dir() {
+            return Err(ExecutorError::Storage(format!(
+                "Target path is not a directory: {}",
+                target_dir
+            )));
+        }
+
         use std::process::Command;
 
         let output = Command::new("tar")
-            .args(["--zstd", "-xf", layer_path, "-C", target_dir])
+            .arg("--zstd")
+            .arg("-xf")
+            .arg(layer_path_obj.to_string_lossy().to_string())
+            .arg("-C")
+            .arg(target_dir_path.to_string_lossy().to_string())
             .output()
             .map_err(|e| ExecutorError::Storage(format!("Failed to extract tar: {}", e)))?;
 
