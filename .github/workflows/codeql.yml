@@ -23,16 +23,16 @@ jobs:
 
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v4
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Initialize CodeQL
-              uses: github/codeql-action/init@v3
+              uses: github/codeql-action/init@45c373516f557556c15d420e3f5e0aa3d64366bc # v3
               with:
                   languages: actions
                   queries: security-and-quality
 
             - name: Perform CodeQL Analysis
-              uses: github/codeql-action/analyze@v3
+              uses: github/codeql-action/analyze@45c373516f557556c15d420e3f5e0aa3d64366bc # v3
               with:
                   category: "/language:actions"
 
@@ -50,10 +50,10 @@ jobs:
 
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v4
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
             - name: Install cargo-audit
               run: cargo install cargo-audit --locked
@@ -102,10 +102,10 @@ jobs:
 
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v4
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
             - name: Install cargo-deny
               run: cargo install cargo-deny --locked

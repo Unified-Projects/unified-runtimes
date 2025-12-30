@@ -14,16 +14,18 @@ jobs:
     lint:
         name: Lint
         runs-on: ubuntu-latest
+        permissions:
+            contents: read
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
               with:
                   components: rustfmt, clippy
 
             - name: Cache dependencies
-              uses: Swatinem/rust-cache@v2
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
               with:
                   cache-on-failure: true
 
@@ -42,8 +44,10 @@ jobs:
     test:
         name: Unit Tests
         runs-on: ubuntu-latest
+        permissions:
+            contents: read
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Install dependencies
               run: |
@@ -51,10 +55,10 @@ jobs:
                   sudo apt-get install -y pkg-config libssl-dev
 
             - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
             - name: Cache dependencies
-              uses: Swatinem/rust-cache@v2
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
               with:
                   cache-on-failure: true
 
@@ -73,8 +77,10 @@ jobs:
     build:
         name: Build
         runs-on: ubuntu-latest
+        permissions:
+            contents: read
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Install dependencies
               run: |
@@ -82,10 +88,10 @@ jobs:
                   sudo apt-get install -y pkg-config libssl-dev
 
             - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
             - name: Cache dependencies
-              uses: Swatinem/rust-cache@v2
+              uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
               with:
                   cache-on-failure: true
 
@@ -93,7 +99,7 @@ jobs:
               run: cargo build --release --verbose
 
             - name: Upload binary
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
               with:
                   name: urt-executor
                   path: target/release/urt-executor
@@ -108,23 +114,25 @@ jobs:
     docker-build:
         name: Docker Build
         runs-on: ubuntu-latest
+        permissions:
+            contents: read
         outputs:
             image_tag: ${{ steps.image.outputs.image_tag }}
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Set up QEMU
-              uses: docker/setup-qemu-action@v3
+              uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
             - name: Set up Docker Buildx
-              uses: docker/setup-buildx-action@v3
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
             - name: Set image tag
               id: image
               run: echo "image_tag=urt-executor:ci-${{ github.sha }}" >> $GITHUB_OUTPUT
 
             - name: Build Docker image (multi-arch)
-              uses: docker/build-push-action@v6
+              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
               with:
                   context: .
                   file: docker/Dockerfile
@@ -142,14 +150,16 @@ jobs:
     docker-tests:
         name: Docker Tests (Integration + E2E)
         runs-on: ubuntu-latest
+        permissions:
+            contents: read
         env:
             E2E_RUNTIME_IMAGE: openruntimes/node:v5-22
             E2E_TIMEOUT_SECS: 300
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
             - name: Set up Docker Buildx
-              uses: docker/setup-buildx-action@v3
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
             - name: Pull runtime image
               run: docker pull $E2E_RUNTIME_IMAGE
