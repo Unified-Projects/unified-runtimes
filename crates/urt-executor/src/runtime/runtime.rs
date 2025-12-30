@@ -1,6 +1,7 @@
 //! Runtime struct representing a container instance
 
-use rand::RngCore;
+use rand::rngs::OsRng;
+use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,8 +38,11 @@ impl Runtime {
         // Generate random 16-byte secrets encoded as hex
         let mut key_bytes = [0u8; 16];
         let mut hostname_bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut key_bytes);
-        rand::rng().fill_bytes(&mut hostname_bytes);
+        let mut rng = OsRng;
+        rng.try_fill_bytes(&mut key_bytes)
+            .expect("failed to read OS randomness for runtime key");
+        rng.try_fill_bytes(&mut hostname_bytes)
+            .expect("failed to read OS randomness for runtime hostname");
 
         Self {
             version: version.to_string(),
