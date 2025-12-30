@@ -1,0 +1,1171 @@
+//! End-to-End Tests for URT Executor
+//!
+//! These tests spin up a real HTTP server and test against actual Docker containers.
+//! They require Docker to be available and will pull real runtime images.
+//!
+//! Run with: cargo test --test e2e
+//! Run specific test: cargo test --test e2e test_name
+//!
+//! Environment variables:
+//! - E2E_RUNTIME_IMAGE: Override the default runtime image (default: openruntimes/node:v5-22)
+//! - E2E_TIMEOUT_SECS: Override test timeout in seconds (default: 60)
+
+use reqwest::{Client, StatusCode};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::time::timeout;
+use urt_executor::{
+    config::ExecutorConfig,
+    docker::DockerManager,
+    routes::{create_router, AppState},
+    runtime::RuntimeRegistry,
+    storage::{self, Storage},
+};
+
+const DEFAULT_RUNTIME_IMAGE: &str = "openruntimes/node:v5-22";
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const TEST_SECRET: &str = "e2e-test-secret-key";
+const TEST_NETWORK: &str = "e2e-test-network";
+const OPENRUNTIMES_FUNCTION_PATH: &str = "/usr/local/server/src/function";
+const OPENRUNTIMES_SERVER_CMD: [&str; 2] = ["node", "/usr/local/server/src/server.js"];
+
+/// Get the runtime image to use for tests
+fn get_runtime_image() -> String {
+    std::env::var("E2E_RUNTIME_IMAGE").unwrap_or_else(|_| DEFAULT_RUNTIME_IMAGE.to_string())
+}
+
+/// Get the test timeout
+fn get_timeout() -> Duration {
+    let secs = std::env::var("E2E_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Get the path to the test function fixture
+/// Uses TEST_FIXTURES_HOST_PATH env var when running in Docker (host path for mounts),
+/// falls back to CARGO_MANIFEST_DIR for local runs
+fn get_test_function_path() -> String {
+    if let Ok(host_path) = std::env::var("TEST_FIXTURES_HOST_PATH") {
+        // Running in Docker - use the HOST path so containers created via socket can mount it
+        format!("{}/node-function", host_path)
+    } else {
+        // Running locally - use cargo manifest dir
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        format!("{}/tests/fixtures/node-function", manifest_dir)
+    }
+}
+
+struct TestServer {
+    base_url: String,
+    client: Client,
+    _handle: tokio::task::JoinHandle<()>,
+    // Keep the shutdown sender alive so the stats collector doesn't exit
+    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl TestServer {
+    fn auth_header(&self) -> (&'static str, String) {
+        ("Authorization", format!("Bearer {}", TEST_SECRET))
+    }
+}
+
+/// Create test configuration
+fn test_config(network: String) -> ExecutorConfig {
+    ExecutorConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0, // Will be overridden
+        secret: TEST_SECRET.to_string(),
+        networks: vec![network],
+        hostname: "e2e-test-executor".to_string(),
+        docker_hub_username: None,
+        docker_hub_password: None,
+        allowed_runtimes: vec![],
+        runtime_versions: vec!["v5".to_string()],
+        image_pull_enabled: true,
+        min_cpus: 0.0,
+        min_memory: 0,
+        keep_alive: true,
+        inactive_threshold: 300,
+        maintenance_interval: 3600,
+        max_body_size: 20 * 1024 * 1024,
+        connection_storage: "local://localhost".to_string(),
+        retry_attempts: 5,
+        retry_delay_ms: 500,
+    }
+}
+
+/// Ensure test network exists
+async fn ensure_test_network() {
+    let docker =
+        bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker");
+
+    // Check if network exists
+    if docker
+        .inspect_network(
+            TEST_NETWORK,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+        .is_err()
+    {
+        // Create network
+        let config = bollard::models::NetworkCreateRequest {
+            name: TEST_NETWORK.to_string(),
+            driver: Some("bridge".to_string()),
+            ..Default::default()
+        };
+        let _ = docker.create_network(config).await;
+    }
+}
+
+/// Create a new test server instance for each test
+async fn create_test_server() -> TestServer {
+    // Ensure test network exists
+    ensure_test_network().await;
+
+    // Create Docker manager
+    let config = test_config(TEST_NETWORK.to_string());
+    let docker = DockerManager::new(config.clone())
+        .await
+        .expect("Failed to connect to Docker - is Docker running?");
+
+    // Create storage from config
+    let storage: Arc<dyn Storage> =
+        Arc::from(storage::from_dsn(&config.connection_storage).expect("Failed to create storage"));
+
+    // Create app state
+    let state = AppState {
+        config,
+        docker: Arc::new(docker),
+        registry: RuntimeRegistry::new(),
+        http_client: Client::new(),
+        storage,
+    };
+
+    // Bind to random available port
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind to address");
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    // Create router and start server
+    let app = create_router(state.clone());
+
+    // Start stats collector background task
+    let docker_clone = state.docker.clone();
+    let registry_clone = state.registry.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        urt_executor::tasks::run_stats_collector(docker_clone, registry_clone, shutdown_rx).await;
+    });
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("Server failed to start");
+    });
+
+    // Wait for server to be ready
+    // Long timeout for runtime creation which may pull images
+    let client = Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .unwrap();
+
+    // Give the server a moment to start
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for i in 0..30 {
+        match client
+            .get(format!("{}/v1/health", base_url))
+            .header("Authorization", format!("Bearer {}", TEST_SECRET))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                break;
+            }
+            Ok(_) | Err(_) => {
+                if i == 29 {
+                    panic!("Test server failed to start on {}", base_url);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    TestServer {
+        base_url,
+        client,
+        _handle: handle,
+        _shutdown_tx: shutdown_tx,
+    }
+}
+
+/// Generate a unique runtime ID for each test
+fn unique_runtime_id(prefix: &str) -> String {
+    format!(
+        "{}-{}",
+        prefix,
+        uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
+    )
+}
+
+/// Clean up a runtime (best effort, doesn't fail on error)
+async fn cleanup_runtime(server: &TestServer, runtime_id: &str) {
+    let _ = server
+        .client
+        .delete(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await;
+
+    // Give Docker time to clean up
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn test_health_endpoint_returns_200() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!("{}/v1/health", server.base_url))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_health_endpoint_returns_valid_structure() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!("{}/v1/health", server.base_url))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = response.json().await.expect("Failed to parse JSON");
+
+    // Verify structure
+    assert!(body.get("usage").is_some(), "Should have 'usage' field");
+    assert!(
+        body.get("runtimes").is_some(),
+        "Should have 'runtimes' field"
+    );
+
+    let usage = &body["usage"];
+    assert!(usage.get("memory").is_some(), "Should have memory stats");
+    assert!(usage.get("cpu").is_some(), "Should have CPU stats");
+    assert!(
+        usage["memory"].get("percentage").is_some(),
+        "Should have memory percentage"
+    );
+}
+
+#[tokio::test]
+async fn test_health_is_public() {
+    let server = create_test_server().await;
+
+    // Health endpoint is public - no auth required
+    let response = server
+        .client
+        .get(format!("{}/v1/health", server.base_url))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    // Health should be accessible without auth
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_auth_required_for_runtimes() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!("{}/v1/runtimes", server.base_url))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_invalid_token_rejected() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!("{}/v1/runtimes", server.base_url))
+        .header("Authorization", "Bearer wrong-token")
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let body: Value = response.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["code"], 401);
+    assert_eq!(body["type"], "general_unauthorized");
+}
+
+#[tokio::test]
+async fn test_auth_valid_token_accepted() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!("{}/v1/runtimes", server.base_url))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_auth_bearer_prefix_required() {
+    let server = create_test_server().await;
+
+    // Token without "Bearer " prefix should fail
+    let response = server
+        .client
+        .get(format!("{}/v1/runtimes", server.base_url))
+        .header("Authorization", TEST_SECRET)
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_list_runtimes_empty() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!("{}/v1/runtimes", server.base_url))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = response.json().await.expect("Failed to parse JSON");
+    assert!(body.is_array(), "Response should be an array");
+}
+
+#[tokio::test]
+async fn test_get_runtime_not_found() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!(
+            "{}/v1/runtimes/nonexistent-runtime-12345",
+            server.base_url
+        ))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_delete_runtime_not_found() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .delete(format!(
+            "{}/v1/runtimes/nonexistent-runtime-12345",
+            server.base_url
+        ))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_create_runtime() {
+    let server = create_test_server().await;
+    let runtime_id = unique_runtime_id("create");
+
+    let result = timeout(get_timeout(), async {
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "index.js",
+            "source": get_test_function_path(),
+            "destination": OPENRUNTIMES_FUNCTION_PATH,
+            "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert!(
+            response.status().is_success(),
+            "Create runtime failed with status: {} - {:?}",
+            response.status(),
+            response.text().await
+        );
+
+        // Verify runtime exists
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let response = server
+            .client
+            .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "Runtime should exist after creation"
+        );
+
+        cleanup_runtime(&server, &runtime_id).await;
+    })
+    .await;
+
+    assert!(result.is_ok(), "Test timed out");
+}
+
+#[tokio::test]
+async fn test_runtime_full_lifecycle() {
+    let server = create_test_server().await;
+    let runtime_id = unique_runtime_id("lifecycle");
+
+    let result = timeout(get_timeout(), async {
+        // 1. Create runtime
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "index.js",
+            "source": get_test_function_path(),
+            "destination": OPENRUNTIMES_FUNCTION_PATH,
+            "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime");
+
+        assert!(
+            response.status().is_success(),
+            "Create failed: {:?}",
+            response.text().await
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // 2. List runtimes and verify it's there
+        let response = server
+            .client
+            .get(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to list runtimes");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let runtimes: Value = response.json().await.expect("Failed to parse JSON");
+        let runtimes = runtimes.as_array().expect("Should be array");
+        assert!(
+            runtimes.iter().any(|r| r["name"]
+                .as_str()
+                .map(|n| n.contains(&runtime_id))
+                .unwrap_or(false)),
+            "Runtime should be in list"
+        );
+
+        // 3. Get runtime details
+        let response = server
+            .client
+            .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to get runtime");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let runtime: Value = response.json().await.expect("Failed to parse JSON");
+        assert!(runtime.get("name").is_some(), "Should have name");
+        assert!(runtime.get("status").is_some(), "Should have status");
+
+        // 4. Delete runtime
+        let response = server
+            .client
+            .delete(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to delete runtime");
+
+        assert!(
+            response.status().is_success(),
+            "Delete failed: {}",
+            response.status()
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // 5. Verify runtime is gone
+        let response = server
+            .client
+            .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "Runtime should be gone after deletion"
+        );
+    })
+    .await;
+
+    assert!(result.is_ok(), "Test timed out");
+}
+
+#[tokio::test]
+async fn test_execute_command() {
+    let server = create_test_server().await;
+    let runtime_id = unique_runtime_id("exec-cmd");
+
+    let result = timeout(get_timeout(), async {
+        // Create runtime
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "index.js",
+            "source": get_test_function_path(),
+            "destination": OPENRUNTIMES_FUNCTION_PATH,
+            "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime");
+
+        assert!(
+            response.status().is_success(),
+            "Create failed: {:?}",
+            response.text().await
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Execute command
+        let cmd_payload = json!({
+            "command": "echo 'hello-from-e2e-test'"
+        });
+
+        let response = server
+            .client
+            .post(format!(
+                "{}/v1/runtimes/{}/commands",
+                server.base_url, runtime_id
+            ))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&cmd_payload)
+            .send()
+            .await
+            .expect("Failed to execute command");
+
+        assert!(
+            response.status().is_success(),
+            "Command failed: {} - {:?}",
+            response.status(),
+            response.text().await
+        );
+
+        cleanup_runtime(&server, &runtime_id).await;
+    })
+    .await;
+
+    assert!(result.is_ok(), "Test timed out");
+}
+
+#[tokio::test]
+async fn test_function_execution() {
+    let server = create_test_server().await;
+    let runtime_id = unique_runtime_id("exec-fn");
+
+    let result = timeout(get_timeout(), async {
+        // Create runtime
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "index.js",
+            "source": get_test_function_path(),
+            "destination": OPENRUNTIMES_FUNCTION_PATH,
+            "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime");
+
+        assert!(
+            response.status().is_success(),
+            "Create failed: {:?}",
+            response.text().await
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Execute function
+        let exec_payload = json!({
+            "body": "{\"test\": \"hello\"}",
+            "path": "/",
+            "method": "POST",
+            "headers": {
+                "content-type": "application/json"
+            }
+        });
+
+        let response = server
+            .client
+            .post(format!(
+                "{}/v1/runtimes/{}/executions",
+                server.base_url, runtime_id
+            ))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&exec_payload)
+            .send()
+            .await
+            .expect("Failed to execute function");
+
+        // Function execution might return various status codes depending on runtime state
+        // Just verify we get a response
+        let status = response.status();
+        assert!(
+            status.is_success() || status == StatusCode::BAD_REQUEST,
+            "Unexpected status: {}",
+            status
+        );
+
+        cleanup_runtime(&server, &runtime_id).await;
+    })
+    .await;
+
+    assert!(result.is_ok(), "Test timed out");
+}
+
+#[tokio::test]
+async fn test_concurrent_executions() {
+    let server = create_test_server().await;
+    let runtime_id = unique_runtime_id("concurrent");
+
+    let result = timeout(get_timeout(), async {
+        // Create runtime
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "index.js",
+            "source": get_test_function_path(),
+            "destination": OPENRUNTIMES_FUNCTION_PATH,
+            "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime");
+
+        assert!(
+            response.status().is_success(),
+            "Create failed: {:?}",
+            response.text().await
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Fire 5 concurrent requests
+        let exec_payload = json!({
+            "body": "{}",
+            "path": "/",
+            "method": "GET",
+            "headers": {}
+        });
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let client = server.client.clone();
+            let url = format!("{}/v1/runtimes/{}/executions", server.base_url, runtime_id);
+            let auth = server.auth_header().1.clone();
+            let payload = exec_payload.clone();
+
+            handles.push(tokio::spawn(async move {
+                client
+                    .post(&url)
+                    .header("Authorization", auth)
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await
+            }));
+        }
+
+        // Wait for all to complete
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        // Verify all completed (even if some failed)
+        for result in results {
+            assert!(result.is_ok(), "Request failed to complete");
+        }
+
+        cleanup_runtime(&server, &runtime_id).await;
+    })
+    .await;
+
+    assert!(result.is_ok(), "Test timed out");
+}
+
+// Use multi-threaded runtime so stats collector task actually runs
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_health_shows_runtime_stats() {
+    let server = create_test_server().await;
+    let runtime_id = unique_runtime_id("health-stats");
+
+    let result = timeout(get_timeout(), async {
+        // Create runtime
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "index.js",
+            "source": get_test_function_path(),
+            "destination": OPENRUNTIMES_FUNCTION_PATH,
+            "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime");
+
+        assert!(response.status().is_success());
+
+        // The runtime name in health includes the executor hostname prefix
+        let expected_name = format!("e2e-test-executor-{}", runtime_id);
+
+        // Poll health endpoint until the runtime appears in stats
+        // Stats collector runs every 1 second, give it up to 10 seconds
+        let mut found = false;
+        for _attempt in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let response = server
+                .client
+                .get(format!("{}/v1/health", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get health");
+
+            if response.status() != StatusCode::OK {
+                continue;
+            }
+
+            let body: Value = response.json().await.expect("Failed to parse JSON");
+            let runtimes = body["runtimes"]
+                .as_array()
+                .expect("runtimes should be array");
+
+            if runtimes.iter().any(|r| {
+                r["name"]
+                    .as_str()
+                    .map(|n| n.contains(&runtime_id) || n == expected_name)
+                    .unwrap_or(false)
+            }) {
+                found = true;
+                break;
+            }
+        }
+
+        assert!(
+            found,
+            "Health should show our runtime '{}' after 10 seconds of polling",
+            runtime_id
+        );
+
+        cleanup_runtime(&server, &runtime_id).await;
+    })
+    .await;
+
+    assert!(result.is_ok(), "Test timed out");
+}
+
+#[tokio::test]
+async fn test_execution_runtime_not_found() {
+    let server = create_test_server().await;
+
+    let payload = json!({
+        "body": "",
+        "path": "/",
+        "method": "GET",
+        "headers": {}
+    });
+
+    let response = server
+        .client
+        .post(format!(
+            "{}/v1/runtimes/nonexistent-runtime-xyz/executions",
+            server.base_url
+        ))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_command_runtime_not_found() {
+    let server = create_test_server().await;
+
+    let payload = json!({
+        "command": "echo hello"
+    });
+
+    let response = server
+        .client
+        .post(format!(
+            "{}/v1/runtimes/nonexistent-runtime-xyz/commands",
+            server.base_url
+        ))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_logs_runtime_not_found() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .get(format!(
+            "{}/v1/runtimes/nonexistent-runtime-xyz/logs",
+            server.base_url
+        ))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_invalid_json_payload() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .post(format!("{}/v1/runtimes", server.base_url))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .header("Content-Type", "application/json")
+        .body("not valid json")
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert!(
+        response.status() == StatusCode::BAD_REQUEST
+            || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+        "Expected 400 or 422, got {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn test_create_runtime_missing_image() {
+    let server = create_test_server().await;
+
+    let response = server
+        .client
+        .post(format!("{}/v1/runtimes", server.base_url))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .header("Content-Type", "application/json")
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert!(
+        response.status() == StatusCode::BAD_REQUEST
+            || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+        "Expected 400 or 422, got {}",
+        response.status()
+    );
+}
+
+/// Check if MinIO is available for testing
+async fn is_minio_available() -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    client
+        .get("http://localhost:9000/minio/health/live")
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn test_s3_storage_operations() {
+    if !is_minio_available().await {
+        eprintln!("Skipping S3 test - MinIO not available (run docker-compose -f docker-compose.test.yml up -d)");
+        return;
+    }
+
+    use urt_executor::storage::S3Storage;
+
+    // Create S3 storage connected to MinIO
+    let storage = S3Storage::from_dsn("s3://minioadmin:minioadmin@localhost:9000/test-bucket")
+        .expect("Failed to create S3 storage");
+
+    // Test write
+    let test_data = b"hello from e2e test";
+    storage
+        .write("e2e-test/test-file.txt", test_data)
+        .await
+        .expect("Failed to write to S3");
+
+    // Test exists
+    assert!(
+        storage.exists("e2e-test/test-file.txt").await.unwrap(),
+        "File should exist after write"
+    );
+
+    // Test read
+    let read_data = storage
+        .read("e2e-test/test-file.txt")
+        .await
+        .expect("Failed to read from S3");
+    assert_eq!(read_data, test_data, "Read data should match written data");
+
+    // Test size
+    let size = storage
+        .size("e2e-test/test-file.txt")
+        .await
+        .expect("Failed to get size");
+    assert_eq!(size, test_data.len() as u64, "Size should match");
+
+    // Test list
+    let files = storage
+        .list("e2e-test/")
+        .await
+        .expect("Failed to list files");
+    assert!(
+        files.iter().any(|f| f.contains("test-file.txt")),
+        "List should include our file"
+    );
+
+    // Test delete
+    storage
+        .delete("e2e-test/test-file.txt")
+        .await
+        .expect("Failed to delete from S3");
+    assert!(
+        !storage.exists("e2e-test/test-file.txt").await.unwrap(),
+        "File should not exist after delete"
+    );
+}
+
+#[tokio::test]
+async fn test_s3_storage_upload_download() {
+    if !is_minio_available().await {
+        eprintln!("Skipping S3 upload/download test - MinIO not available");
+        return;
+    }
+
+    use tempfile::tempdir;
+    use urt_executor::storage::S3Storage;
+
+    let storage = S3Storage::from_dsn("s3://minioadmin:minioadmin@localhost:9000/test-bucket")
+        .expect("Failed to create S3 storage");
+
+    let dir = tempdir().expect("Failed to create temp dir");
+
+    // Create a local file
+    let local_file = dir.path().join("upload-test.txt");
+    std::fs::write(&local_file, b"upload test content").expect("Failed to write local file");
+
+    // Upload to S3
+    storage
+        .upload(local_file.to_str().unwrap(), "e2e-test/uploaded-file.txt")
+        .await
+        .expect("Failed to upload");
+
+    // Download from S3
+    let download_file = dir.path().join("downloaded.txt");
+    storage
+        .download(
+            "e2e-test/uploaded-file.txt",
+            download_file.to_str().unwrap(),
+        )
+        .await
+        .expect("Failed to download");
+
+    // Verify content
+    let content = std::fs::read(&download_file).expect("Failed to read downloaded file");
+    assert_eq!(content, b"upload test content");
+
+    // Cleanup
+    storage
+        .delete("e2e-test/uploaded-file.txt")
+        .await
+        .expect("Failed to cleanup");
+}
+
+#[tokio::test]
+async fn test_build_cache_with_s3() {
+    if !is_minio_available().await {
+        eprintln!("Skipping build cache test - MinIO not available");
+        return;
+    }
+
+    use tempfile::tempdir;
+    use urt_executor::storage::{BuildCache, S3Storage};
+
+    let storage = S3Storage::from_dsn("s3://minioadmin:minioadmin@localhost:9000/builds")
+        .expect("Failed to create S3 storage");
+
+    let cache = BuildCache::new(storage, "test-cache");
+
+    // Create a test directory with dependency files
+    let dir = tempdir().expect("Failed to create temp dir");
+    let package_json = dir.path().join("package.json");
+    std::fs::write(&package_json, r#"{"name": "test", "version": "1.0.0"}"#)
+        .expect("Failed to write package.json");
+
+    // Hash dependencies
+    let deps_hash = cache
+        .hash_deps(&[package_json.to_str().unwrap()])
+        .await
+        .expect("Failed to hash deps");
+    assert!(!deps_hash.is_empty(), "Hash should not be empty");
+
+    // Create cache key
+    let cache_key = cache.cache_key("test-runtime", &deps_hash);
+    assert!(cache_key.contains("test-cache"));
+    assert!(cache_key.contains("test-runtime"));
+    assert!(cache_key.contains(&deps_hash));
+
+    // Initially no cache
+    assert!(
+        !cache.has_cache(&cache_key).await.unwrap(),
+        "Cache should not exist initially"
+    );
+
+    // Create a layer directory and cache it
+    let node_modules = dir.path().join("node_modules");
+    std::fs::create_dir_all(&node_modules).expect("Failed to create node_modules");
+    std::fs::write(node_modules.join("test.txt"), b"test module")
+        .expect("Failed to write test file");
+
+    cache
+        .cache_layers(&cache_key, dir.path().to_str().unwrap(), &["node_modules"])
+        .await
+        .expect("Failed to cache layers");
+
+    // Now cache should exist
+    assert!(
+        cache.has_cache(&cache_key).await.unwrap(),
+        "Cache should exist after caching"
+    );
+
+    // Get cached layers
+    let layers = cache
+        .get_cached_layers(&cache_key)
+        .await
+        .expect("Failed to get cached layers");
+    assert!(!layers.is_empty(), "Should have cached layers");
+}

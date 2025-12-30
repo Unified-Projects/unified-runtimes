@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test artifacts
+/coverage/
+*.profraw
+*.profdata
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+/logs/
+
+# Temporary files
+/tmp/
+*.tmp

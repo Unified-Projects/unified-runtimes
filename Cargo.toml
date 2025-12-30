@@ -1,0 +1,98 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/urt-core",
+    "crates/urt-executor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Unified Runtimes Contributors"]
+license = "MIT"
+repository = "https://github.com/open-runtimes/unified-runtimes"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.48", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.8", features = ["http2", "multipart"] }
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "cors"] }
+hyper = { version = "1.8", features = ["full"] }
+http-body-util = "0.1"
+
+# Serialisation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+prometheus = "0.14"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# File system and archive
+tar = "0.4"
+flate2 = "1.1"
+zstd = "0.13"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Utilities
+chrono = "0.4"
+uuid = { version = "1.19", features = ["v4"] }
+bytes = "1.11"
+url = "2.5"
+http = "1.4"
+rand = "0.9"
+hex = "0.4"
+hostname = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+urlencoding = "2.1"
+
+# Docker
+bollard = "0.19"
+
+# S3 Storage
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-native-tls"] }
+
+# Streaming
+async-stream = "0.3"
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+# Lock-free concurrency
+arc-swap = "1.7"
+dashmap = "6.1"
+
+# Performance optimizations
+smallvec = "1.13"
+memchr = "2.7"
+itoa = "1.0"
+num_cpus = "1.16"
+
+# Security
+subtle = "2.6"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Testing
+async-trait = "0.1"
+
+# Workspace crates
+urt-core = { path = "crates/urt-core" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

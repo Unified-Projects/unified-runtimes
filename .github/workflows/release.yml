@@ -1,0 +1,106 @@
+name: Release
+
+on:
+    push:
+        branches: ["main"]
+
+env:
+    REGISTRY: docker.io
+    IMAGE_NAME: Unified-Projects LTD./urt-executor
+
+jobs:
+    check-version:
+        name: Check Version Tag
+        runs-on: blacksmith-2vcpu-ubuntu-2204
+        outputs:
+            is_release: ${{ steps.check.outputs.is_release }}
+            version: ${{ steps.check.outputs.version }}
+        steps:
+            - name: Check commit message for version
+              id: check
+              run: |
+                  COMMIT_MSG="${{ github.event.head_commit.message }}"
+                  if [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+                      echo "is_release=true" >> $GITHUB_OUTPUT
+                      echo "version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+                      echo "Release detected: v${BASH_REMATCH[1]}"
+                  else
+                      echo "is_release=false" >> $GITHUB_OUTPUT
+                      echo "version=" >> $GITHUB_OUTPUT
+                      echo "Not a release commit: $COMMIT_MSG"
+                  fi
+
+    release:
+        name: Build and Release
+        runs-on: blacksmith-4vcpu-ubuntu-2204
+        needs: check-version
+        if: needs.check-version.outputs.is_release == 'true'
+        permissions:
+            contents: write
+            packages: write
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Docker with Blacksmith
+              uses: useblacksmith/setup-docker@v1
+
+            - name: Set up QEMU for multi-arch
+              uses: docker/setup-qemu-action@v3
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - name: Extract metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+                  tags: |
+                      type=raw,value=${{ needs.check-version.outputs.version }}
+                      type=raw,value=latest
+
+            - name: Build and push Docker image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: docker/Dockerfile
+                  push: true
+                  platforms: linux/amd64,linux/arm64
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+                  provenance: false
+
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: v${{ needs.check-version.outputs.version }}
+                  name: v${{ needs.check-version.outputs.version }}
+                  generate_release_notes: true
+                  body: |
+                      ## Docker Image
+
+                      ```bash
+                      docker pull Unified-Projects LTD./urt-executor:${{ needs.check-version.outputs.version }}
+                      ```
+
+                      Or use the latest tag:
+
+                      ```bash
+                      docker pull Unified-Projects LTD./urt-executor:latest
+                      ```
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Cleanup
+              if: always()
+              run: |
+                  docker system prune -f 2>/dev/null || true
+                  docker builder prune -f 2>/dev/null || true

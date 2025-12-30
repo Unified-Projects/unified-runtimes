@@ -1,0 +1,110 @@
+[package]
+name = "urt-executor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Drop-in Rust replacement for OpenRuntimes Executor"
+
+[[bin]]
+name = "urt-executor"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP server
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+http-body-util = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Docker
+bollard = { workspace = true }
+
+# S3 Storage
+rust-s3 = { workspace = true }
+
+# File system and archive
+tar = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+tokio-util = { workspace = true }
+
+# Utilities
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+http = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+hostname = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+urlencoding = { workspace = true }
+
+# Streaming
+async-stream = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+
+# Lock-free concurrency
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+
+# Performance optimizations
+smallvec = { workspace = true }
+memchr = { workspace = true }
+itoa = { workspace = true }
+num_cpus = { workspace = true }
+
+# Security
+subtle = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Temp files
+tempfile = "3"
+
+# Testing
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+tower = { workspace = true, features = ["util"] }
+hyper = { workspace = true, features = ["client"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+uuid = { workspace = true }
+futures = "0.3"
+bollard = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[[bench]]
+name = "benchmark"
+harness = false
+path = "benches/benchmark.rs"

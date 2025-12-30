@@ -1,0 +1,96 @@
+version: '3.8'
+
+services:
+  executor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: urt-executor
+    restart: unless-stopped
+    ports:
+      - "9900:80"
+    environment:
+      # Server
+      - URT_HOST=0.0.0.0
+      - URT_PORT=80
+
+      # Authentication (URT_SECRET or OPR_EXECUTOR_SECRET)
+      - URT_SECRET=${URT_SECRET:-executor-secret-key}
+
+      # Resource overrides
+      - URT_MIN_CPUS=${URT_MIN_CPUS:-0}
+      - URT_MIN_MEMORY=${URT_MIN_MEMORY:-0}
+
+      # Request limits
+      - URT_MAX_BODY_SIZE=${URT_MAX_BODY_SIZE:-20MB}
+
+      # Lifecycle
+      - URT_KEEP_ALIVE=${URT_KEEP_ALIVE:-true}
+      - URT_INACTIVE_THRESHOLD=${URT_INACTIVE_THRESHOLD:-60}
+      - URT_MAINTENANCE_INTERVAL=${URT_MAINTENANCE_INTERVAL:-3600}
+
+      # Docker
+      - URT_NETWORK=${URT_NETWORK:-executor_runtimes}
+      - URT_IMAGE_PULL=${URT_IMAGE_PULL:-enabled}
+      - URT_RUNTIMES=${URT_RUNTIMES:-}
+      - URT_RUNTIME_VERSIONS=${URT_RUNTIME_VERSIONS:-v5}
+      - URT_DOCKER_HUB_USERNAME=${URT_DOCKER_HUB_USERNAME:-}
+      - URT_DOCKER_HUB_PASSWORD=${URT_DOCKER_HUB_PASSWORD:-}
+
+      # Storage
+      - URT_CONNECTION_STORAGE=${URT_CONNECTION_STORAGE:-local://localhost}
+
+      # Logging
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      # Docker socket for container management
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+      # Build artifacts storage
+      - urt-builds:/mnt/builds
+
+      # Function source code
+      - urt-functions:/mnt/functions
+
+      # Temporary files
+      - /tmp:/tmp
+    networks:
+      - executor_runtimes
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Optional: MinIO for S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: urt-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - executor_runtimes
+    profiles:
+      - storage
+
+volumes:
+  urt-builds:
+    name: urt-builds
+  urt-functions:
+    name: urt-functions
+  minio-data:
+    name: urt-minio-data
+
+networks:
+  executor_runtimes:
+    name: executor_runtimes
+    driver: bridge
