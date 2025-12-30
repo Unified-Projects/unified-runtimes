@@ -3,6 +3,12 @@ name: Release
 on:
     push:
         branches: ["main"]
+    workflow_dispatch:
+        inputs:
+            docker_tag:
+                description: "Custom Docker tag (e.g. v0.1.0-alpha-7). Skips GitHub Release."
+                required: true
+                type: string
 
 env:
     REGISTRY: docker.io
@@ -11,19 +17,24 @@ env:
 jobs:
     check-version:
         name: Check Version Tag
-        runs-on: blacksmith-2vcpu-ubuntu-2204
+        runs-on: ubuntu-latest
         permissions:
             contents: read
         outputs:
             is_release: ${{ steps.check.outputs.is_release }}
             version: ${{ steps.check.outputs.version }}
         steps:
-            - name: Check commit message for version
+            - name: Determine version
               id: check
               env:
                   COMMIT_MSG: ${{ github.event.head_commit.message }}
+                  MANUAL_TAG: ${{ inputs.docker_tag }}
               run: |
-                  if [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+                  if [[ -n "$MANUAL_TAG" ]]; then
+                      echo "is_release=false" >> "$GITHUB_OUTPUT"
+                      echo "version=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
+                      echo "Manual Docker build with tag: $MANUAL_TAG"
+                  elif [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
                       echo "is_release=true" >> "$GITHUB_OUTPUT"
                       echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
                       echo "Release detected: v${BASH_REMATCH[1]}"
@@ -35,53 +46,42 @@ jobs:
 
     release:
         name: Build and Release
-        runs-on: blacksmith-4vcpu-ubuntu-2204
+        runs-on: ${{ matrix.runner }}
+        strategy:
+            matrix:
+                include:
+                    - runner: blacksmith-2vcpu-ubuntu-2204
+                      arch: amd64
+                    - runner: blacksmith-2vcpu-ubuntu-2204-arm
+                      arch: arm64
         needs: check-version
-        if: needs.check-version.outputs.is_release == 'true'
+        if: needs.check-version.outputs.version != ''
         permissions:
             contents: write
             packages: write
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-            - name: Set up Docker with Blacksmith
-              uses: useblacksmith/setup-docker@33fed32c1ba8775f20366ec9e8d0cd9fe8fc1dd3 # v1
-
-            - name: Set up QEMU for multi-arch
-              uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-
-            - name: Set up Docker Buildx
-              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+            - name: Set up Docker Builder (Blacksmith cache)
+              uses: useblacksmith/setup-docker-builder@v1
 
             - name: Login to Docker Hub
-              uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+              uses: docker/login-action@v3
               with:
                   username: ${{ secrets.DOCKERHUB_USERNAME }}
                   password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-            - name: Extract metadata
-              id: meta
-              uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-              with:
-                  images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-                  tags: |
-                      type=raw,value=${{ needs.check-version.outputs.version }}
-                      type=raw,value=latest
-
-            - name: Build and push Docker image
-              uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+            - name: Build and push Docker image (cached)
+              uses: useblacksmith/build-push-action@v2
               with:
                   context: .
                   file: docker/Dockerfile
                   push: true
-                  platforms: linux/amd64,linux/arm64
-                  tags: ${{ steps.meta.outputs.tags }}
-                  labels: ${{ steps.meta.outputs.labels }}
-                  cache-from: type=gha
-                  cache-to: type=gha,mode=max
-                  provenance: false
+                  platforms: linux/${{ matrix.arch }}
+                  tags: unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
 
             - name: Create GitHub Release
+              if: needs.check-version.outputs.is_release == 'true'
               uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
               with:
                   tag_name: v${{ needs.check-version.outputs.version }}
@@ -101,6 +101,15 @@ jobs:
                       ```
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Create and push Docker manifest
+              if: matrix.arch == 'amd64'
+              run: |
+                  docker manifest create unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }} \
+                    unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-amd64 \
+                    unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-arm64
+
+                  docker manifest push unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
 
             - name: Cleanup
               if: always()
