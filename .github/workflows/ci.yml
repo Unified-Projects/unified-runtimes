@@ -5,20 +5,14 @@ on:
         branches: ["main", "dev"]
         paths-ignore:
             - "**/*.md"
-            - "docs/**"
             - "LICENCE"
-            - "LICENSE"
-            - "LICENSE.*"
             - ".vscode/**"
             - ".editorconfig"
     pull_request:
         branches: ["main", "dev"]
         paths-ignore:
             - "**/*.md"
-            - "docs/**"
             - "LICENCE"
-            - "LICENSE"
-            - "LICENSE.*"
             - ".vscode/**"
             - ".editorconfig"
 
@@ -37,6 +31,7 @@ jobs:
         runs-on: ubuntu-latest
         permissions:
             contents: read
+        if: github.event_name == 'push'
         steps:
             - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
@@ -64,6 +59,7 @@ jobs:
         permissions:
             contents: read
         needs: lint
+        if: github.event_name == 'push'
         steps:
             - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
@@ -94,6 +90,7 @@ jobs:
         permissions:
             contents: read
         needs: test
+        if: github.event_name == 'pull_request'
         steps:
             - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
@@ -130,6 +127,7 @@ jobs:
         outputs:
             image_tag: ${{ steps.image.outputs.image_tag }}
         needs: build
+        if: github.event_name == 'pull_request'
         steps:
             - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
@@ -167,6 +165,7 @@ jobs:
         permissions:
             contents: read
         needs: docker-build
+        if: github.event_name == 'pull_request'
         env:
             E2E_RUNTIME_IMAGE: openruntimes/node:v5-22
             E2E_TIMEOUT_SECS: 300
