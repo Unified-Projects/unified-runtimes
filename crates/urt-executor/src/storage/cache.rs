@@ -272,8 +272,8 @@ impl<S: Storage> BuildCache<S> {
 
     /// Create a compressed layer tarball
     async fn create_layer(source_dir: &str, output_path: &str) -> Result<()> {
-        use std::process::Command;
         use std::path::Path;
+        use std::process::Command;
 
         // Validate and normalize source and output paths before invoking external tar.
         let source_path = Path::new(source_dir);
@@ -316,22 +316,20 @@ impl<S: Storage> BuildCache<S> {
     }
 
     /// Extract a layer tarball
-        use std::path::Path;
     async fn extract_layer(layer_path: &str, target_dir: &str) -> Result<()> {
-        let layer_path_obj = Path::new(layer_path);
+        let layer_path_obj = std::path::Path::new(layer_path);
         if !layer_path_obj.is_file() {
             return Err(ExecutorError::Storage(format!(
                 "Layer path does not exist or is not a file: {}",
                 layer_path
             )));
         }
-
-        let target_dir_path = Path::new(target_dir);
+        let target_dir_path = std::path::Path::new(target_dir);
         // Ensure target directory exists and is a directory; do not follow arbitrary file paths.
         if !target_dir_path.exists() {
-            fs::create_dir_all(target_dir_path)
-                .await
-                .map_err(|e| ExecutorError::Storage(format!("Failed to create target dir: {}", e)))?;
+            fs::create_dir_all(target_dir_path).await.map_err(|e| {
+                ExecutorError::Storage(format!("Failed to create target dir: {}", e))
+            })?;
         }
         if !target_dir_path.is_dir() {
             return Err(ExecutorError::Storage(format!(
