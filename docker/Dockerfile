@@ -35,7 +35,7 @@ RUN strip /app/target/release/urt-executor
 # -----------------------------------------------------------------------------
 # Stage 2: Production image
 # -----------------------------------------------------------------------------
-FROM alpine:3.21
+FROM alpine:3.23
 
 # Install runtime dependencies
 RUN apk add --no-cache \
