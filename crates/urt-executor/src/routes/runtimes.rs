@@ -66,8 +66,9 @@ pub fn default_memory() -> u64 {
 pub fn default_version() -> String {
     "v5".to_string()
 }
+const DEFAULT_RESTART_POLICY: &str = "no";
 pub fn default_restart_policy() -> String {
-    "no".to_string()
+    DEFAULT_RESTART_POLICY.to_string()
 }
 
 /// Validate runtime ID format
