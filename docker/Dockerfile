@@ -24,8 +24,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Build only urt-executor in release mode with optimizations.
-# Disable -crt-static explicitly so the binary links dynamically against musl/glibc
-# in the target Alpine environment instead of producing a fully static binary.
+# Disable -crt-static explicitly so the binary links dynamically against the
+# Alpine base image's musl libc at runtime instead of producing a fully static
+# binary. This keeps the binary compatible with the container's C runtime and
+# allows us to rely on the system-provided OpenSSL and other shared libraries.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN cargo build --release --package urt-executor
 
