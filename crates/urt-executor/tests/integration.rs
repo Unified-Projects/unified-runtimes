@@ -70,7 +70,9 @@ async fn parse_json_body(body: Body) -> Value {
     serde_json::from_slice(&bytes).unwrap_or(json!({}))
 }
 
-/// Helper to get response body as string
+/// Helper to get response body as string.
+/// Intentionally kept (and allowed as dead code) for debugging and future tests
+/// that need to inspect raw HTTP response bodies.
 #[allow(dead_code)]
 async fn body_to_string(body: Body) -> String {
     let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
