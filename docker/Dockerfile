@@ -24,8 +24,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Build only urt-executor in release mode with optimizations.
-# Disable -crt-static explicitly so the binary links dynamically against musl/glibc
-# in the target Alpine environment instead of producing a fully static binary.
+# Disable -crt-static explicitly so the binary links dynamically against the
+# Alpine base image's musl libc at runtime instead of producing a fully static
+# binary. This keeps the binary compatible with the container's C runtime and
+# allows us to rely on the system-provided OpenSSL and other shared libraries.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN cargo build --release --package urt-executor
 
@@ -74,7 +76,7 @@ EXPOSE 80
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:80/v1/health || exit 1
+    CMD sh -c 'curl -sf "http://${URT_HOST}:${URT_PORT}/v1/health" || exit 1'
 
 # Use tini as init system for proper signal handling
 ENTRYPOINT ["/sbin/tini", "--"]
