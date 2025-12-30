@@ -20,15 +20,16 @@ jobs:
         steps:
             - name: Check commit message for version
               id: check
+              env:
+                  COMMIT_MSG: ${{ github.event.head_commit.message }}
               run: |
-                  COMMIT_MSG="${{ github.event.head_commit.message }}"
                   if [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-                      echo "is_release=true" >> $GITHUB_OUTPUT
-                      echo "version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+                      echo "is_release=true" >> "$GITHUB_OUTPUT"
+                      echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
                       echo "Release detected: v${BASH_REMATCH[1]}"
                   else
-                      echo "is_release=false" >> $GITHUB_OUTPUT
-                      echo "version=" >> $GITHUB_OUTPUT
+                      echo "is_release=false" >> "$GITHUB_OUTPUT"
+                      echo "version=" >> "$GITHUB_OUTPUT"
                       echo "Not a release commit: $COMMIT_MSG"
                   fi
 
