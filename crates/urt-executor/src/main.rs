@@ -99,32 +99,32 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create runtime registry
     let registry = RuntimeRegistry::new();
 
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    // Force no compression, matches curl / Docker.php behavior
+    default_headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+
     // Create HTTP client for runtime communication
     // Aggressively tuned for maximum throughput and minimum latency
     let http_client = reqwest::Client::builder()
-        // Long timeout for execution requests
         .timeout(Duration::from_secs(600))
-        // Very large connection pool - one per runtime container + headroom
         .pool_max_idle_per_host(500)
-        // Keep connections alive indefinitely (runtimes are long-lived)
         .pool_idle_timeout(Duration::from_secs(300))
-        // Frequent keep-alive probes to detect dead connections fast
         .tcp_keepalive(Duration::from_secs(15))
-        // Enable TCP_NODELAY for lower latency (disable Nagle's algorithm)
         .tcp_nodelay(true)
-        // Force HTTP/1.1 for internal runtime communication
-        // (HAProxy can translate HTTP/2 clients to HTTP/1.1 backend if needed)
         .http1_only()
-        // Disable automatic redirect following (we don't need it for internal calls)
         .redirect(reqwest::redirect::Policy::none())
-        // Compression enabled by default (gzip, brotli, deflate) for large responses
+        // CRITICAL: disable compression at the protocol level
+        .default_headers(default_headers)
         .build()
         .expect("Failed to create HTTP client");
 
-    // Create storage backend from DSN
+    // Create storage backend from config (supports individual env vars like executor-main)
     let storage: Arc<dyn Storage> =
-        Arc::from(storage::from_dsn(&config.connection_storage).expect("Failed to create storage"));
-    info!("Storage backend initialized: {}", config.connection_storage);
+        Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"));
+    info!("Storage backend initialized: {:?}", config.storage.device);
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -230,8 +230,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Serve with graceful shutdown
+    let docker_for_shutdown = docker.clone();
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
+        .with_graceful_shutdown(async move {
+            shutdown_signal.await;
+
+            // BLOCK HERE UNTIL DOCKER FINISHES
+            docker_for_shutdown.cleanup_managed_containers().await;
+        })
         .await?;
 
     info!("Server stopped");

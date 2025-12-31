@@ -17,7 +17,7 @@ repository = "https://github.com/open-runtimes/unified-runtimes"
 tokio = { version = "1.48", features = ["full"] }
 
 # HTTP server
-axum = { version = "0.8", features = ["http2", "multipart"] }
+axum = { version = "0.8", features = ["multipart"] }
 tower = { version = "0.5", features = ["timeout", "limit"] }
 tower-http = { version = "0.6", features = ["trace", "limit", "cors"] }
 hyper = { version = "1.8", features = ["full"] }

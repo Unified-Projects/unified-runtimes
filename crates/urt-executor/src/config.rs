@@ -9,6 +9,130 @@
 
 use std::env;
 
+// ============================================================================
+// Storage Configuration
+// ============================================================================
+
+/// Storage device type - matches executor-main's STORAGE_DEVICE values
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum StorageDevice {
+    #[default]
+    Local,
+    S3,
+    DoSpaces,
+    Backblaze,
+    Linode,
+    Wasabi,
+}
+
+use std::str::FromStr;
+
+impl FromStr for StorageDevice {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
+            "s3" => StorageDevice::S3,
+            "dospaces" => StorageDevice::DoSpaces,
+            "backblaze" => StorageDevice::Backblaze,
+            "linode" => StorageDevice::Linode,
+            "wasabi" => StorageDevice::Wasabi,
+            _ => StorageDevice::Local,
+        })
+    }
+}
+
+/// S3-compatible storage configuration
+#[derive(Debug, Clone)]
+pub struct S3ProviderConfig {
+    pub access_key: String,
+    pub secret: String,
+    pub region: String,
+    pub bucket: String,
+    pub endpoint: Option<String>, // Only for S3, others have fixed endpoints
+}
+
+/// Storage configuration - supports all executor-main storage providers
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub device: StorageDevice,
+    pub s3: Option<S3ProviderConfig>,
+    pub do_spaces: Option<S3ProviderConfig>,
+    pub backblaze: Option<S3ProviderConfig>,
+    pub linode: Option<S3ProviderConfig>,
+    pub wasabi: Option<S3ProviderConfig>,
+}
+
+impl StorageConfig {
+    /// Load storage configuration from environment variables
+    /// Matches executor-main's individual env var pattern:
+    /// - STORAGE_DEVICE = "local" | "s3" | "dospaces" | "backblaze" | "linode" | "wasabi"
+    /// - STORAGE_{PROVIDER}_ACCESS_KEY, _SECRET, _REGION, _BUCKET, _ENDPOINT
+    pub fn from_env() -> Self {
+        let device = env_urt_or_opr("STORAGE_DEVICE")
+            .as_deref()
+            .unwrap_or("local")
+            .parse::<StorageDevice>()
+            .unwrap_or(StorageDevice::Local);
+
+        Self {
+            device,
+            s3: Self::load_provider_config("S3"),
+            do_spaces: Self::load_provider_config("DO_SPACES"),
+            backblaze: Self::load_provider_config("BACKBLAZE"),
+            linode: Self::load_provider_config("LINODE"),
+            wasabi: Self::load_provider_config("WASABI"),
+        }
+    }
+
+    /// Load configuration for a specific storage provider
+    fn load_provider_config(prefix: &str) -> Option<S3ProviderConfig> {
+        // Access key and secret are required - if not present, config is None
+        let access_key = env_urt_or_opr(&format!("STORAGE_{}_ACCESS_KEY", prefix))?;
+        let secret = env_urt_or_opr(&format!("STORAGE_{}_SECRET", prefix))?;
+
+        let region = env_urt_or_opr(&format!("STORAGE_{}_REGION", prefix))
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let bucket = env_urt_or_opr(&format!("STORAGE_{}_BUCKET", prefix))
+            .unwrap_or_else(|| "builds".to_string());
+        let endpoint = env_urt_or_opr(&format!("STORAGE_{}_ENDPOINT", prefix));
+
+        Some(S3ProviderConfig {
+            access_key,
+            secret,
+            region,
+            bucket,
+            endpoint,
+        })
+    }
+
+    #[allow(dead_code)]
+    /// Get the active provider configuration based on device type
+    pub fn get_active_config(&self) -> Option<&S3ProviderConfig> {
+        match self.device {
+            StorageDevice::Local => None,
+            StorageDevice::S3 => self.s3.as_ref(),
+            StorageDevice::DoSpaces => self.do_spaces.as_ref(),
+            StorageDevice::Backblaze => self.backblaze.as_ref(),
+            StorageDevice::Linode => self.linode.as_ref(),
+            StorageDevice::Wasabi => self.wasabi.as_ref(),
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            device: StorageDevice::Local,
+            s3: None,
+            do_spaces: None,
+            backblaze: None,
+            linode: None,
+            wasabi: None,
+        }
+    }
+}
+
 /// Get env var with URT_ prefix first, falling back to OPR_EXECUTOR_ prefix
 fn env_urt_or_opr(name: &str) -> Option<String> {
     env::var(format!("URT_{}", name))
@@ -56,6 +180,10 @@ pub struct ExecutorConfig {
     pub port: u16,
     pub secret: String,
 
+    // Environment mode
+    #[allow(dead_code)]
+    pub env: String, // "development" or "production"
+
     // Docker configuration
     pub networks: Vec<String>,
     pub hostname: String,
@@ -81,7 +209,11 @@ pub struct ExecutorConfig {
     pub max_body_size: usize, // bytes
 
     // Storage configuration
-    pub connection_storage: String,
+    pub storage: StorageConfig,
+
+    // Logging configuration
+    #[allow(dead_code)]
+    pub logging_config: Option<String>,
 
     // Retry configuration
     #[allow(dead_code)]
@@ -105,6 +237,9 @@ impl ExecutorConfig {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(80),
             secret: env_urt_or_opr_default("SECRET", ""),
+
+            // Environment mode
+            env: env_urt_or_opr_default("ENV", "production"),
 
             // Docker
             networks: env_urt_or_opr_default("NETWORK", "executor_runtimes")
@@ -155,8 +290,11 @@ impl ExecutorConfig {
                 .and_then(|v| parse_size(&v))
                 .unwrap_or(20 * 1024 * 1024),
 
-            // Storage
-            connection_storage: env_urt_or_opr_default("CONNECTION_STORAGE", "local://localhost"),
+            // Storage - load from individual env vars like executor-main
+            storage: StorageConfig::from_env(),
+
+            // Logging
+            logging_config: env_urt_or_opr("LOGGING_CONFIG"),
 
             // Retry
             retry_attempts: env_urt_or_opr("RETRY_ATTEMPTS")
