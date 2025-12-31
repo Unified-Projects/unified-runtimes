@@ -1,8 +1,9 @@
 //! Execution endpoint
+//!
+//! Includes TCP port readiness check (matching executor-main Docker.php:1088-1115)
 
 use super::runtimes::{
     default_cpus, default_memory, default_restart_policy, default_timeout, default_version,
-    CreateRuntimeRequest,
 };
 use super::AppState;
 use crate::error::{ExecutorError, Result};
@@ -18,7 +19,7 @@ use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Request body for execution
@@ -147,7 +148,7 @@ impl VariablesInput {
     }
 }
 
-/// JSON response format
+/// JSON response format - matches Appwrite executor format
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JsonExecutionResponse {
@@ -156,6 +157,10 @@ pub struct JsonExecutionResponse {
     pub logs: String,
     pub errors: String,
     pub headers: HashMap<String, serde_json::Value>,
+    /// Execution duration in seconds
+    pub duration: f64,
+    /// Start time as Unix timestamp
+    pub start_time: f64,
 }
 
 /// Build a multipart response from execution result
@@ -189,8 +194,8 @@ fn build_multipart_response(response: &ExecuteResponse) -> Response {
         };
     }
 
-    // Add parts using zero-copy writes
-    write_part!(b"body", b"text/plain", response.body.as_bytes());
+    // Add parts using zero-copy writes - field names match Appwrite executor format
+    write_part!(b"body", b"text/plain", &response.body);
     write_part!(b"logs", b"text/plain", response.logs.as_bytes());
     write_part!(b"errors", b"text/plain", response.errors.as_bytes());
 
@@ -199,14 +204,25 @@ fn build_multipart_response(response: &ExecuteResponse) -> Response {
     let status_str = status_buf.format(response.status_code);
     write_part!(b"statusCode", b"text/plain", status_str.as_bytes());
 
+    // Duration in seconds
+    let duration_str = format!("{:.6}", response.duration);
+    write_part!(b"duration", b"text/plain", duration_str.as_bytes());
+
+    // Start time as Unix timestamp
+    let start_time_str = format!("{:.6}", response.start_time);
+    write_part!(b"startTime", b"text/plain", start_time_str.as_bytes());
+
     // Headers as JSON - serialize directly to Vec to avoid intermediate String
     let headers_json = serde_json::to_vec(&response.headers).unwrap_or_default();
     write_part!(b"headers", b"application/json", &headers_json);
 
-    // Add closing boundary
+    // Add closing boundary (terminate with CRLF for stricter multipart parsers)
     buf.extend_from_slice(b"--");
     buf.extend_from_slice(boundary.as_bytes());
-    buf.extend_from_slice(b"--");
+    buf.extend_from_slice(b"--\r\n");
+
+    let body = buf.freeze();
+    let len = body.len();
 
     Response::builder()
         .status(200)
@@ -215,21 +231,136 @@ fn build_multipart_response(response: &ExecuteResponse) -> Response {
             HeaderValue::from_str(&format!("multipart/form-data; boundary={}", boundary)).unwrap(),
         )
         .header(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&len.to_string()).unwrap(),
+        )
+        .header(
             "x-open-runtimes-status-code",
             HeaderValue::from_str(status_str).unwrap(),
         )
-        .body(Body::from(buf.freeze()))
+        .body(Body::from(body))
         .unwrap()
 }
 
+/// Parse multipart form data into ExecutionRequest
+/// Handles the multipart/form-data format sent by PHP Appwrite executor client
+#[allow(dead_code)]
+fn parse_multipart_execution_request(body: &str, content_type: &str) -> Result<ExecutionRequest> {
+    // Extract boundary from content-type header
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .map(|b| b.trim_matches('"'))
+        .ok_or_else(|| {
+            ExecutorError::ExecutionBadRequest("Missing multipart boundary".to_string())
+        })?;
+
+    let mut fields: HashMap<String, String> = HashMap::new();
+
+    // Parse multipart parts
+    let delimiter = format!("--{}", boundary);
+    let parts: Vec<&str> = body.split(&delimiter).collect();
+
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() || part == "--" {
+            continue;
+        }
+
+        // Split headers from content
+        if let Some(header_end) = part.find("\r\n\r\n") {
+            let headers_section = &part[..header_end];
+            let content = &part[header_end + 4..];
+            let content = content.trim_end_matches("\r\n");
+
+            // Extract field name from Content-Disposition
+            if let Some(name_start) = headers_section.find("name=\"") {
+                let name_start = name_start + 6;
+                if let Some(name_end) = headers_section[name_start..].find('"') {
+                    let name = &headers_section[name_start..name_start + name_end];
+                    fields.insert(name.to_string(), content.to_string());
+                }
+            }
+        }
+    }
+
+    // Build ExecutionRequest from parsed fields
+    Ok(ExecutionRequest {
+        body: fields.get("body").cloned().unwrap_or_default(),
+        path: fields.get("path").cloned().unwrap_or_else(default_path),
+        method: fields.get("method").cloned().unwrap_or_else(default_method),
+        headers: fields
+            .get("headers")
+            .map(|s| HeadersInput::String(s.clone()))
+            .unwrap_or_default(),
+        timeout: fields
+            .get("timeout")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(default_exec_timeout),
+        image: fields.get("image").cloned().unwrap_or_default(),
+        source: fields.get("source").cloned().unwrap_or_default(),
+        entrypoint: fields.get("entrypoint").cloned().unwrap_or_default(),
+        variables: fields
+            .get("variables")
+            .map(|s| VariablesInput::String(s.clone()))
+            .unwrap_or_default(),
+        cpus: fields
+            .get("cpus")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(default_cpus),
+        memory: fields
+            .get("memory")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(default_memory),
+        version: fields
+            .get("version")
+            .cloned()
+            .unwrap_or_else(default_version),
+        runtime_entrypoint: fields.get("runtimeEntrypoint").cloned().unwrap_or_default(),
+        logging: fields
+            .get("logging")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or_else(default_logging),
+        restart_policy: fields
+            .get("restartPolicy")
+            .cloned()
+            .unwrap_or_else(default_restart_policy),
+    })
+}
+
 /// POST /v1/runtimes/:runtime_id/executions - Execute a function
+/// Note: Accepts both JSON and multipart/form-data for backwards compatibility
 pub async fn create_execution(
     State(state): State<AppState>,
     Path(runtime_id): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<ExecutionRequest>,
+    body: axum::body::Bytes,
 ) -> Result<Response> {
     debug!("Executing function in runtime: {}", runtime_id);
+
+    // Check Content-Type to determine parsing strategy
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    debug!(
+        "Execution request content-type: {}, body length: {}",
+        content_type,
+        body.len()
+    );
+
+    let req: ExecutionRequest = if content_type.contains("application/json") {
+        serde_json::from_slice(&body)
+            .map_err(|e| ExecutorError::ExecutionBadRequest(format!("Invalid JSON body: {}", e)))?
+    } else if content_type.contains("multipart/form-data") {
+        parse_multipart_execution_request_bytes(&body, content_type)?
+    } else {
+        return Err(ExecutorError::ExecutionBadRequest(format!(
+            "Unsupported Content-Type: {}",
+            content_type
+        )));
+    };
 
     // Validate execution request
     if req.timeout == 0 {
@@ -262,28 +393,32 @@ pub async fn create_execution(
 
             debug!("Creating runtime on-the-fly: {}", runtime_id);
 
-            // Create runtime request
-            let create_req = CreateRuntimeRequest {
-                runtime_id: runtime_id.clone(),
-                image: req.image.clone(),
-                entrypoint: req.entrypoint.clone(),
-                source: req.source.clone(),
-                destination: String::new(),
-                output_directory: String::new(),
-                variables: req.variables.clone(),
-                runtime_entrypoint: req.runtime_entrypoint.clone(),
-                command: String::new(),
-                timeout: default_timeout(),
-                remove: false,
-                cpus: req.cpus,
-                memory: req.memory,
-                version: req.version.clone(),
-                restart_policy: req.restart_policy.clone(),
-                docker_cmd: Vec::new(),
-            };
+            // Create runtime request as JSON for internal call
+            let create_req_json = serde_json::json!({
+                "runtimeId": runtime_id.clone(),
+                "image": req.image.clone(),
+                "entrypoint": req.entrypoint.clone(),
+                "source": req.source.clone(),
+                "destination": "",
+                "outputDirectory": "",
+                "variables": req.variables.to_map(),
+                "runtimeEntrypoint": req.runtime_entrypoint.clone(),
+                "command": "",
+                "timeout": default_timeout(),
+                "remove": false,
+                "cpus": req.cpus,
+                "memory": req.memory,
+                "version": req.version.clone(),
+                "restartPolicy": req.restart_policy.clone(),
+                "dockerCmd": []
+            });
 
             // Call create_runtime internally
-            let _ = super::runtimes::create_runtime(State(state.clone()), Json(create_req)).await?;
+            let _ = super::runtimes::create_runtime(
+                State(state.clone()),
+                serde_json::to_string(&create_req_json).unwrap_or_default(),
+            )
+            .await?;
 
             // Get the created runtime
             state
@@ -297,12 +432,35 @@ pub async fn create_execution(
     // Touch runtime to update last activity
     state.registry.touch(&full_name).await.ok();
 
+    // TCP port readiness check (matching executor-main Docker.php:1088-1115)
+    // On first execution, wait for the runtime to start listening on port 3000
+    if !runtime.is_listening() {
+        debug!(
+            "Checking if runtime {} is listening on port 3000",
+            runtime.hostname
+        );
+        let port_timeout = Duration::from_secs(req.timeout as u64);
+        wait_for_port(&runtime.hostname, 3000, port_timeout).await?;
+
+        // Mark runtime as listening so we skip this check on subsequent executions
+        if let Err(e) = state.registry.set_listening(&full_name).await {
+            debug!("Failed to mark runtime as listening: {}", e);
+        }
+        debug!("Runtime {} is now listening", runtime.hostname);
+    }
+
     // Build execution request
+    // IMPORTANT: Always force identity encoding when talking to the runtime.
+    // If we forward an incoming `accept-encoding` (e.g. gzip), different HTTP clients/proxies may
+    // transparently decode/encode which can lead to mismatched lengths / truncated bodies.
+    let mut exec_headers = req.headers.to_map();
+    exec_headers.insert("accept-encoding".to_string(), "identity".to_string());
+
     let exec_req = ExecuteRequest {
         body: req.body,
         path: req.path,
         method: req.method.to_uppercase(),
-        headers: req.headers.to_map(),
+        headers: exec_headers,
         timeout: req.timeout,
         logging: req.logging,
     };
@@ -344,12 +502,21 @@ pub async fn create_execution(
 
     if accept.contains("multipart/form-data") {
         // Return multipart response
-        Ok(build_multipart_response(&response))
-    } else if accept.contains("text/plain") {
+        return Ok(build_multipart_response(&response));
+    }
+
+    if accept.contains("text/plain") {
         // Return plain text (just body)
         let mut res = Response::builder()
             .status(200)
-            .header(header::CONTENT_TYPE, "text/plain")
+            .header(
+                header::CONTENT_TYPE,
+                response
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("text/plain"),
+            )
             .header(
                 "x-open-runtimes-status-code",
                 response.status_code.to_string(),
@@ -359,35 +526,237 @@ pub async fn create_execution(
             .body(Body::from(response.body))
             .unwrap();
 
-        // Add response headers
         for (key, value) in &response.headers {
-            if let Some(s) = value.as_str() {
-                if let Ok(hv) = HeaderValue::from_str(s) {
-                    res.headers_mut().insert(
-                        header::HeaderName::from_bytes(key.as_bytes())
-                            .unwrap_or(header::HeaderName::from_static("x-custom")),
-                        hv,
-                    );
+            if !should_forward_header(key) {
+                continue;
+            }
+
+            let name = match header::HeaderName::from_bytes(key.as_bytes()) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            match value {
+                serde_json::Value::String(s) => {
+                    if let Ok(hv) = HeaderValue::from_str(s) {
+                        res.headers_mut().insert(name, hv);
+                    }
                 }
+                serde_json::Value::Array(arr) => {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            if let Ok(hv) = HeaderValue::from_str(s) {
+                                res.headers_mut().append(name.clone(), hv);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
-        Ok(res)
-    } else {
-        // Default: JSON response
-        Ok(Json(JsonExecutionResponse {
-            status_code: response.status_code,
-            body: response.body,
-            logs: response.logs,
-            errors: response.errors,
-            headers: response.headers,
-        })
-        .into_response())
+        return Ok(res);
     }
+
+    // Default: JSON response
+    Ok(Json(JsonExecutionResponse {
+        status_code: response.status_code,
+        body: String::from_utf8_lossy(&response.body).into_owned(),
+        logs: response.logs,
+        errors: response.errors,
+        headers: response.headers,
+        duration: response.duration,
+        start_time: response.start_time,
+    })
+    .into_response())
+}
+
+fn parse_multipart_execution_request_bytes(
+    body: &[u8],
+    content_type: &str,
+) -> Result<ExecutionRequest> {
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .map(|b| b.trim_matches('"'))
+        .ok_or_else(|| {
+            ExecutorError::ExecutionBadRequest("Missing multipart boundary".to_string())
+        })?;
+
+    let boundary_bytes = format!("--{}", boundary).into_bytes();
+    let mut fields: HashMap<String, Vec<u8>> = HashMap::new();
+
+    let mut i = 0;
+    while i < body.len() {
+        if body[i..].starts_with(&boundary_bytes) {
+            i += boundary_bytes.len();
+
+            // Skip CRLF
+            if body[i..].starts_with(b"\r\n") {
+                i += 2;
+            }
+
+            // End boundary
+            if body[i..].starts_with(b"--") {
+                break;
+            }
+
+            // Headers
+            let headers_end = memchr::memmem::find(&body[i..], b"\r\n\r\n")
+                .ok_or_else(|| ExecutorError::ExecutionBadRequest("Malformed multipart".into()))?;
+            let headers = &body[i..i + headers_end];
+            i += headers_end + 4;
+
+            let headers_str = String::from_utf8_lossy(headers);
+
+            let name = headers_str
+                .split("name=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .ok_or_else(|| ExecutorError::ExecutionBadRequest("Missing field name".into()))?
+                .to_string();
+
+            let next_boundary = memchr::memmem::find(&body[i..], &boundary_bytes)
+                .ok_or_else(|| ExecutorError::ExecutionBadRequest("Malformed multipart".into()))?;
+
+            let mut value = body[i..i + next_boundary].to_vec();
+
+            // Trim trailing CRLF
+            if value.ends_with(b"\r\n") {
+                value.truncate(value.len() - 2);
+            }
+
+            fields.insert(name, value);
+            i += next_boundary;
+        } else {
+            i += 1;
+        }
+    }
+
+    Ok(ExecutionRequest {
+        body: fields
+            .get("body")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default(),
+        path: fields
+            .get("path")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_else(default_path),
+        method: fields
+            .get("method")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_else(default_method),
+        headers: fields
+            .get("headers")
+            .map(|v| HeadersInput::String(String::from_utf8_lossy(v).into_owned()))
+            .unwrap_or_default(),
+        timeout: fields
+            .get("timeout")
+            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
+            .unwrap_or_else(default_exec_timeout),
+        image: fields
+            .get("image")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default(),
+        source: fields
+            .get("source")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default(),
+        entrypoint: fields
+            .get("entrypoint")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default(),
+        variables: fields
+            .get("variables")
+            .map(|v| VariablesInput::String(String::from_utf8_lossy(v).into_owned()))
+            .unwrap_or_default(),
+        cpus: fields
+            .get("cpus")
+            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
+            .unwrap_or_else(default_cpus),
+        memory: fields
+            .get("memory")
+            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
+            .unwrap_or_else(default_memory),
+        version: fields
+            .get("version")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_else(default_version),
+        runtime_entrypoint: fields
+            .get("runtimeEntrypoint")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default(),
+        logging: fields
+            .get("logging")
+            .map(|v| v == b"true" || v == b"1")
+            .unwrap_or_else(default_logging),
+        restart_policy: fields
+            .get("restartPolicy")
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_else(default_restart_policy),
+    })
+}
+
+/// Whether an upstream header should be forwarded to the client.
+///
+/// We deliberately strip headers that can cause browser/client decoding issues when the upstream
+/// payload has already been decompressed (e.g. by reqwest) or when Axum will re-derive them.
+fn should_forward_header(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+
+    // Hop-by-hop headers (RFC 7230) + encoding/length/type headers we should not copy verbatim.
+    !matches!(
+        k.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-encoding"
+            | "content-length"
+            | "content-type"
+    )
 }
 
 /// Base64 encode a string for header transport
 fn base64_encode(s: &str) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+}
+
+/// Wait for a runtime to start listening on a TCP port
+/// (matching executor-main Docker.php:1088-1115 TCP validator)
+async fn wait_for_port(hostname: &str, port: u16, timeout: Duration) -> Result<()> {
+    let addr = format!("{}:{}", hostname, port);
+    let start = Instant::now();
+
+    debug!(
+        "Waiting for {} to be available (timeout: {:?})",
+        addr, timeout
+    );
+
+    while start.elapsed() < timeout {
+        // Try to connect using tokio's TcpStream which handles DNS resolution
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                debug!("Port {} is now available", addr);
+                return Ok(());
+            }
+            _ => {
+                // Wait 500ms before retrying (matching executor-main usleep(500000))
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    debug!("Timeout waiting for {} after {:?}", addr, timeout);
+    Err(ExecutorError::RuntimeTimeout)
 }

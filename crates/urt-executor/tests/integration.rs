@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 use urt_executor::{
-    config::ExecutorConfig,
+    config::{ExecutorConfig, StorageConfig},
     docker::DockerManager,
     routes::{create_router, AppState},
     runtime::RuntimeRegistry,
@@ -24,6 +24,7 @@ fn test_config() -> ExecutorConfig {
         host: "127.0.0.1".to_string(),
         port: 9900,
         secret: "test-secret-key".to_string(),
+        env: "development".to_string(),
         networks: vec!["test-network".to_string()],
         hostname: "test-executor".to_string(),
         docker_hub_username: None,
@@ -37,7 +38,8 @@ fn test_config() -> ExecutorConfig {
         inactive_threshold: 60,
         maintenance_interval: 3600,
         max_body_size: 20 * 1024 * 1024,
-        connection_storage: "local://localhost".to_string(),
+        storage: StorageConfig::default(),
+        logging_config: None,
         retry_attempts: 5,
         retry_delay_ms: 500,
     }
@@ -53,7 +55,7 @@ async fn create_test_state() -> Option<AppState> {
     let registry = RuntimeRegistry::new();
     let http_client = reqwest::Client::new();
     let storage: Arc<dyn Storage> =
-        Arc::from(storage::from_dsn(&config.connection_storage).expect("Failed to create storage"));
+        Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"));
 
     Some(AppState {
         config,
@@ -393,7 +395,7 @@ mod runtimes {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

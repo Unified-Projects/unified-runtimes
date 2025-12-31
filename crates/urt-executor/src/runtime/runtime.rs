@@ -93,6 +93,17 @@ impl Runtime {
         (now - self.updated).max(0.0) as u64
     }
 
+    /// Check if the runtime is listening on port 3000
+    pub fn is_listening(&self) -> bool {
+        self.listening > 0
+    }
+
+    /// Mark the runtime as listening on port 3000
+    pub fn set_listening(&mut self) {
+        self.listening = 1;
+        self.touch();
+    }
+
     fn unix_timestamp() -> f64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

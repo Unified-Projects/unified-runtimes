@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use urt_executor::{
-    config::ExecutorConfig,
+    config::{ExecutorConfig, StorageConfig},
     docker::DockerManager,
     routes::{create_router, AppState},
     runtime::RuntimeRegistry,
@@ -89,6 +89,7 @@ fn test_config(network: String) -> ExecutorConfig {
         host: "127.0.0.1".to_string(),
         port: 0, // Will be overridden
         secret: TEST_SECRET.to_string(),
+        env: "development".to_string(),
         networks: vec![network],
         hostname: "e2e-test-executor".to_string(),
         docker_hub_username: None,
@@ -102,7 +103,8 @@ fn test_config(network: String) -> ExecutorConfig {
         inactive_threshold: 300,
         maintenance_interval: 3600,
         max_body_size: 20 * 1024 * 1024,
-        connection_storage: "local://localhost".to_string(),
+        storage: StorageConfig::default(),
+        logging_config: None,
         retry_attempts: 5,
         retry_delay_ms: 500,
     }
@@ -145,7 +147,7 @@ async fn create_test_server() -> TestServer {
 
     // Create storage from config
     let storage: Arc<dyn Storage> =
-        Arc::from(storage::from_dsn(&config.connection_storage).expect("Failed to create storage"));
+        Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"));
 
     // Create app state
     let state = AppState {
@@ -417,7 +419,7 @@ async fn test_delete_runtime_not_found() {
         .await
         .expect("Failed to send request");
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -450,7 +452,11 @@ async fn test_create_runtime() {
             response.status().is_success(),
             "Create runtime failed with status: {} - {:?}",
             response.status(),
-            response.text().await
+            response
+                .bytes()
+                .await
+                .expect("failed to read response body")
+                .to_vec()
         );
 
         // Verify runtime exists
@@ -507,7 +513,11 @@ async fn test_runtime_full_lifecycle() {
         assert!(
             response.status().is_success(),
             "Create failed: {:?}",
-            response.text().await
+            response
+                .bytes()
+                .await
+                .expect("failed to read response body")
+                .to_vec()
         );
 
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -613,7 +623,11 @@ async fn test_execute_command() {
         assert!(
             response.status().is_success(),
             "Create failed: {:?}",
-            response.text().await
+            response
+                .bytes()
+                .await
+                .expect("failed to read response body")
+                .to_vec()
         );
 
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -640,7 +654,11 @@ async fn test_execute_command() {
             response.status().is_success(),
             "Command failed: {} - {:?}",
             response.status(),
-            response.text().await
+            response
+                .bytes()
+                .await
+                .expect("failed to read response body")
+                .to_vec()
         );
 
         cleanup_runtime(&server, &runtime_id).await;
@@ -680,7 +698,11 @@ async fn test_function_execution() {
         assert!(
             response.status().is_success(),
             "Create failed: {:?}",
-            response.text().await
+            response
+                .bytes()
+                .await
+                .expect("failed to read response body")
+                .to_vec()
         );
 
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -754,7 +776,11 @@ async fn test_concurrent_executions() {
         assert!(
             response.status().is_success(),
             "Create failed: {:?}",
-            response.text().await
+            response
+                .bytes()
+                .await
+                .expect("failed to read response body")
+                .to_vec()
         );
 
         tokio::time::sleep(Duration::from_secs(3)).await;

@@ -79,11 +79,16 @@ pub struct CommandResponse {
 }
 
 /// POST /v1/runtimes/:runtime_id/commands - Execute a command
+/// Note: Accepts JSON regardless of Content-Type header for backwards compatibility
 pub async fn exec_command(
     State(state): State<AppState>,
     Path(runtime_id): Path<String>,
-    Json(req): Json<CommandRequest>,
+    body: String,
 ) -> Result<Json<CommandResponse>> {
+    // Parse JSON body manually for backwards compatibility (no Content-Type requirement)
+    let req: CommandRequest = serde_json::from_str(&body)
+        .map_err(|e| ExecutorError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
     info!("Executing command in {}: {}", full_name, req.command);

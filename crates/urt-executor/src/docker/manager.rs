@@ -35,6 +35,48 @@ pub struct DockerManager {
 }
 
 impl DockerManager {
+    /// Stop and remove all containers managed by URT
+    #[allow(dead_code)]
+    pub async fn cleanup_managed_containers(&self) {
+        use tracing::{info, warn};
+
+        let containers = match self.list_containers(Some("urt.managed=true")).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to list managed containers during shutdown: {}", e);
+                return;
+            }
+        };
+
+        let mut containers = containers;
+        containers.sort_by_key(|c| c.created);
+
+        // Get executor container ID ONCE
+        let self_id = self
+            .docker
+            .info()
+            .await
+            .ok()
+            .and_then(|i| i.id)
+            .unwrap_or_default();
+
+        for container in containers {
+            // Skip executor container by ID
+            if container.id == self_id {
+                info!("Skipping executor container {}", container.name);
+                continue;
+            }
+
+            let name = &container.name;
+
+            info!("Cleaning up runtime {}", name);
+
+            if let Err(e) = self.remove_container(name, true).await {
+                warn!("Failed to remove {}: {}", name, e);
+            }
+        }
+    }
+
     /// Create a new DockerManager
     pub async fn new(config: ExecutorConfig) -> Result<Self> {
         let docker = Docker::connect_with_socket_defaults()
