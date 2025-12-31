@@ -384,7 +384,12 @@ pub async fn create_benchmark_runtime(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .bytes()
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+
         return Err(format!("Failed to create runtime: {} - {}", status, body).into());
     }
 
