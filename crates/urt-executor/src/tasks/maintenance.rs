@@ -36,8 +36,7 @@ pub async fn run_maintenance<S: Storage + 'static>(
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    info!("Shutdown signal received, running final cleanup");
-                    cleanup_all(&docker, &registry).await;
+                    info!("Shutdown signal received, stopping maintenance worker");
                     break;
                 }
             }
@@ -93,98 +92,30 @@ async fn cleanup_idle(docker: &DockerManager, registry: &RuntimeRegistry, thresh
 
     if idle_runtimes.is_empty() {
         debug!("No idle runtimes to clean up");
-    } else {
-        info!("Cleaning up {} idle runtimes", idle_runtimes.len());
-
-        for runtime in idle_runtimes {
-            info!(
-                "Removing idle runtime: {} (idle for {}s)",
-                runtime.runtime_id(),
-                runtime.idle_seconds()
-            );
-
-            // Stop container
-            if let Err(e) = docker.stop_container(&runtime.name, 10).await {
-                warn!("Failed to stop container {}: {}", runtime.runtime_id(), e);
-            }
-
-            // Remove container
-            if let Err(e) = docker.remove_container(&runtime.name, true).await {
-                warn!("Failed to remove container {}: {}", runtime.runtime_id(), e);
-            }
-
-            // Remove from registry
-            registry.remove(&runtime.name).await;
-        }
-    }
-
-    // Also clean up orphaned containers (in Docker but not in registry)
-    cleanup_orphaned_containers(docker, registry).await;
-}
-
-/// Clean up orphaned containers that exist in Docker but not in registry
-async fn cleanup_orphaned_containers(docker: &DockerManager, registry: &RuntimeRegistry) {
-    // List containers with our label
-    let containers = match docker.list_containers(Some("urt.managed=true")).await {
-        Ok(c) => c,
-        Err(e) => {
-            debug!("Failed to list containers for orphan detection: {}", e);
-            return;
-        }
-    };
-
-    for container in containers {
-        // Check if this container is in the registry
-        if !registry.exists(&container.name).await {
-            info!(
-                "Found orphaned container: {} (not in registry, removing)",
-                container.name
-            );
-
-            // Stop and remove orphaned container
-            if let Err(e) = docker.stop_container(&container.name, 5).await {
-                debug!(
-                    "Failed to stop orphaned container {}: {}",
-                    container.name, e
-                );
-            }
-
-            if let Err(e) = docker.remove_container(&container.name, true).await {
-                warn!(
-                    "Failed to remove orphaned container {}: {}",
-                    container.name, e
-                );
-            }
-        }
-    }
-}
-
-/// Clean up all runtimes (used during shutdown)
-async fn cleanup_all(docker: &DockerManager, registry: &RuntimeRegistry) {
-    let all_runtimes = registry.clear().await;
-
-    if all_runtimes.is_empty() {
-        info!("No runtimes to clean up");
         return;
     }
 
-    info!("Cleaning up {} runtimes on shutdown", all_runtimes.len());
+    info!("Cleaning up {} idle runtimes", idle_runtimes.len());
 
-    for runtime in all_runtimes {
-        info!("Removing runtime: {}", runtime.name);
+    for runtime in idle_runtimes {
+        let name = &runtime.name;
 
-        // Force stop and remove
-        if let Err(e) = docker.stop_container(&runtime.name, 5).await {
-            debug!("Failed to stop container {}: {}", runtime.name, e);
+        // Stop container (best effort)
+        if let Err(e) = docker.stop_container(name, 10).await {
+            warn!("Failed to stop idle container {}: {}", name, e);
         }
 
-        if let Err(e) = docker.remove_container(&runtime.name, true).await {
-            warn!("Failed to remove container {}: {}", runtime.name, e);
+        // Force remove container
+        if let Err(e) = docker.remove_container(name, true).await {
+            warn!("Failed to remove idle container {}: {}", name, e);
         }
+
+        // Remove from registry AFTER Docker is done
+        registry.remove(name).await;
     }
-
-    info!("Shutdown cleanup complete");
 }
+
+// Shutdown cleanup is now handled in main.rs via with_graceful_shutdown.
 
 /// Clean up temporary build directories
 async fn cleanup_temp_dirs(hostname: &str) {
