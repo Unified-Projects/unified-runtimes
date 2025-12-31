@@ -1,9 +1,18 @@
 //! Storage module for build artifacts
+//!
+//! Supports multiple storage backends:
+//! - Local filesystem
+//! - AWS S3
+//! - DigitalOcean Spaces
+//! - Backblaze B2
+//! - Linode Object Storage
+//! - Wasabi
 
 mod cache;
 mod local;
 mod s3;
 
+use crate::config::{StorageConfig, StorageDevice};
 use crate::error::Result;
 use async_trait::async_trait;
 pub use cache::BuildCache;
@@ -74,7 +83,8 @@ impl Storage for std::sync::Arc<dyn Storage> {
     }
 }
 
-/// Parse a storage DSN and create the appropriate storage backend
+/// Parse a storage DSN and create the appropriate storage backend (legacy)
+#[allow(dead_code)]
 pub fn from_dsn(dsn: &str) -> Result<Box<dyn Storage>> {
     if dsn.starts_with("s3://") {
         Ok(Box::new(S3Storage::from_dsn(dsn)?))
@@ -83,6 +93,59 @@ pub fn from_dsn(dsn: &str) -> Result<Box<dyn Storage>> {
     } else {
         // Default to local
         Ok(Box::new(LocalStorage::new()))
+    }
+}
+
+/// Create storage backend from StorageConfig (executor-main compatible)
+/// Uses STORAGE_DEVICE and individual provider env vars
+pub fn from_config(config: &StorageConfig) -> Result<Box<dyn Storage>> {
+    match config.device {
+        StorageDevice::Local => Ok(Box::new(LocalStorage::new())),
+        StorageDevice::S3 => {
+            let cfg = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| crate::error::ExecutorError::Storage(
+                    "S3 storage selected but STORAGE_S3_ACCESS_KEY and STORAGE_S3_SECRET not configured".to_string()
+                ))?;
+            Ok(Box::new(S3Storage::new_s3(cfg)?))
+        }
+        StorageDevice::DoSpaces => {
+            let cfg = config
+                .do_spaces
+                .as_ref()
+                .ok_or_else(|| crate::error::ExecutorError::Storage(
+                    "DO Spaces storage selected but STORAGE_DO_SPACES_ACCESS_KEY and STORAGE_DO_SPACES_SECRET not configured".to_string()
+                ))?;
+            Ok(Box::new(S3Storage::new_do_spaces(cfg)?))
+        }
+        StorageDevice::Backblaze => {
+            let cfg = config
+                .backblaze
+                .as_ref()
+                .ok_or_else(|| crate::error::ExecutorError::Storage(
+                    "Backblaze storage selected but STORAGE_BACKBLAZE_ACCESS_KEY and STORAGE_BACKBLAZE_SECRET not configured".to_string()
+                ))?;
+            Ok(Box::new(S3Storage::new_backblaze(cfg)?))
+        }
+        StorageDevice::Linode => {
+            let cfg = config
+                .linode
+                .as_ref()
+                .ok_or_else(|| crate::error::ExecutorError::Storage(
+                    "Linode storage selected but STORAGE_LINODE_ACCESS_KEY and STORAGE_LINODE_SECRET not configured".to_string()
+                ))?;
+            Ok(Box::new(S3Storage::new_linode(cfg)?))
+        }
+        StorageDevice::Wasabi => {
+            let cfg = config
+                .wasabi
+                .as_ref()
+                .ok_or_else(|| crate::error::ExecutorError::Storage(
+                    "Wasabi storage selected but STORAGE_WASABI_ACCESS_KEY and STORAGE_WASABI_SECRET not configured".to_string()
+                ))?;
+            Ok(Box::new(S3Storage::new_wasabi(cfg)?))
+        }
     }
 }
 
