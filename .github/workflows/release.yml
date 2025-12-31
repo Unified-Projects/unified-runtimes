@@ -9,6 +9,11 @@ on:
                 description: "Custom Docker tag (e.g. v0.1.0-alpha-7). Skips GitHub Release."
                 required: true
                 type: string
+            create_release:
+                description: "Create a GitHub Release (only applies to manual runs)"
+                required: false
+                type: boolean
+                default: false
 
 concurrency:
     group: release-${{ github.ref }}
@@ -35,7 +40,11 @@ jobs:
                   MANUAL_TAG: ${{ inputs.docker_tag }}
               run: |
                   if [[ -n "$MANUAL_TAG" ]]; then
-                      echo "is_release=false" >> "$GITHUB_OUTPUT"
+                      if [[ "${{ inputs.create_release }}" == "true" ]]; then
+                          echo "is_release=true" >> "$GITHUB_OUTPUT"
+                      else
+                          echo "is_release=false" >> "$GITHUB_OUTPUT"
+                      fi
                       echo "version=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
                       echo "Manual Docker build with tag: $MANUAL_TAG"
                   elif [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
