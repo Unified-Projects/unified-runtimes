@@ -185,12 +185,17 @@ pub struct CreateRuntimeResponse {
 // LogEntry is imported from super::logs
 
 /// POST /v1/runtimes - Create a new runtime
+/// Note: Accepts JSON regardless of Content-Type header for backwards compatibility
 pub async fn create_runtime(
     State(state): State<AppState>,
-    Json(req): Json<CreateRuntimeRequest>,
+    body: String,
 ) -> Result<(StatusCode, Json<CreateRuntimeResponse>)> {
     let start_time = std::time::Instant::now();
     let start_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+    // Parse JSON body manually for backwards compatibility (no Content-Type requirement)
+    let req: CreateRuntimeRequest = serde_json::from_str(&body)
+        .map_err(|e| ExecutorError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
     info!(
         "Creating runtime: {} with image {}",
@@ -617,7 +622,8 @@ pub async fn get_runtime(
     Ok(Json(runtime))
 }
 
-/// DELETE /v1/runtimes/:runtime_id - Delete a runtime
+/// DELETE /v1/runtimes/:runtime_id - Delete a runtime (idempotent, best-effort cleanup)
+/// DELETE /v1/runtimes/:runtime_id - Delete a runtime (label-based, no name guessing)
 pub async fn delete_runtime(
     State(state): State<AppState>,
     Path(runtime_id): Path<String>,
@@ -626,21 +632,24 @@ pub async fn delete_runtime(
 
     info!("Deleting runtime: {}", full_name);
 
-    // Check if exists
-    if !state.registry.exists(&full_name).await {
-        return Err(ExecutorError::RuntimeNotFound);
+    // DO NOT GUESS THE NAME — ASK DOCKER
+    let label = format!("urt.runtime_id={}", runtime_id);
+
+    if let Ok(containers) = state.docker.list_containers(Some(&label)).await {
+        for container in containers {
+            // Uses your existing remove_container implementation
+            let _ = state.docker.remove_container(&container.name, true).await;
+        }
     }
 
-    // Stop container
-    state.docker.stop_container(&full_name, 10).await.ok();
+    // Remove runtime-owned tmp directory
+    let tmp_folder = format!("/tmp/{}", full_name);
+    tokio::fs::remove_dir_all(&tmp_folder).await.ok();
 
-    // Remove container
-    state.docker.remove_container(&full_name, true).await.ok();
-
-    // Remove from registry
+    // Registry is metadata only; remove last (idempotent)
     state.registry.remove(&full_name).await;
 
-    info!("Deleted runtime: {}", full_name);
+    info!("Delete runtime finished: {}", full_name);
 
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
