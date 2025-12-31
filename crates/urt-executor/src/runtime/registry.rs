@@ -104,6 +104,17 @@ impl RuntimeRegistry {
         }
     }
 
+    /// Mark a runtime as listening on port 3000
+    /// Called after successful TCP port check (matching executor-main)
+    pub async fn set_listening(&self, name: &str) -> Result<()> {
+        if let Some(mut runtime) = self.runtimes.get_mut(name) {
+            runtime.set_listening();
+            Ok(())
+        } else {
+            Err(ExecutorError::RuntimeNotFound)
+        }
+    }
+
     /// Get runtimes that have been idle for more than threshold seconds
     pub async fn get_idle(&self, threshold_secs: u64) -> Vec<Runtime> {
         self.runtimes
@@ -114,6 +125,7 @@ impl RuntimeRegistry {
     }
 
     /// Clear all runtimes (used during shutdown)
+    #[allow(dead_code)]
     pub async fn clear(&self) -> Vec<Runtime> {
         let all: Vec<Runtime> = self.runtimes.iter().map(|r| r.clone()).collect();
         self.runtimes.clear();

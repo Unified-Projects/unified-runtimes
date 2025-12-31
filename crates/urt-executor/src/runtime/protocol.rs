@@ -1,4 +1,6 @@
 //! Runtime protocol handlers for v2 and v5
+//!
+//! v5 protocol reads logs from files on disk (shared /tmp volume), matching executor-main.
 
 use crate::error::{ExecutorError, Result};
 use crate::runtime::Runtime;
@@ -10,6 +12,10 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::Duration;
+use tracing::debug;
+
+/// Maximum log file size (5MB, matching executor-main)
+const MAX_LOG_SIZE: usize = 5 * 1024 * 1024;
 
 /// Request to execute a function
 #[derive(Debug, Clone)]
@@ -40,10 +46,19 @@ impl Default for ExecuteRequest {
 pub struct ExecuteResponse {
     #[serde(rename = "statusCode")]
     pub status_code: u16,
-    pub body: String,
+
+    #[serde(skip)]
+    pub body: Vec<u8>,
+
     pub logs: String,
     pub errors: String,
     pub headers: HashMap<String, serde_json::Value>,
+
+    /// Execution duration in seconds
+    pub duration: f64,
+
+    /// Start time as Unix timestamp
+    pub start_time: f64,
 }
 
 /// Trait for runtime protocol implementations
@@ -68,6 +83,14 @@ impl RuntimeProtocol for V2Protocol {
         request: &ExecuteRequest,
         client: &reqwest::Client,
     ) -> Result<ExecuteResponse> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let start_instant = std::time::Instant::now();
+
         let url = format!("http://{}:3000/", runtime.hostname);
 
         // v2 payload format
@@ -109,12 +132,16 @@ impl RuntimeProtocol for V2Protocol {
             .await
             .map_err(|e| ExecutorError::ExecutionBadJson(e.to_string()))?;
 
+        let duration = start_instant.elapsed().as_secs_f64();
+
         Ok(ExecuteResponse {
             status_code: status,
-            body: v2_resp.response.unwrap_or_default(),
+            body: v2_resp.response.unwrap_or_default().into_bytes(),
             logs: v2_resp.stdout.unwrap_or_default(),
             errors: v2_resp.stderr.unwrap_or_default(),
             headers: HashMap::new(),
+            duration,
+            start_time,
         })
     }
 }
@@ -130,6 +157,14 @@ impl RuntimeProtocol for V5Protocol {
         request: &ExecuteRequest,
         client: &reqwest::Client,
     ) -> Result<ExecuteResponse> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let start_instant = std::time::Instant::now();
+
         let url = format!("http://{}:3000{}", runtime.hostname, request.path);
 
         // Build Basic auth header
@@ -175,16 +210,11 @@ impl RuntimeProtocol for V5Protocol {
 
         let status = response.status().as_u16();
 
-        // Extract log ID and error ID from headers (used to fetch actual log content)
+        // Extract log ID from header - this is a FILE ID used to read logs from disk
+        // (matching executor-main Docker.php:1027)
         let log_id = response
             .headers()
             .get("x-open-runtimes-log-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let error_id = response
-            .headers()
-            .get("x-open-runtimes-error-id")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
@@ -223,30 +253,27 @@ impl RuntimeProtocol for V5Protocol {
             response_headers_vec.into_iter().collect();
 
         let body = response
-            .text()
+            .bytes()
             .await
-            .map_err(|e| ExecutorError::Network(e.to_string()))?;
+            .map_err(|e| ExecutorError::Network(e.to_string()))?
+            .to_vec();
 
-        // Parse logs and errors
-        // v5 logs are written to /mnt/logs/{log_id}/logs and /mnt/logs/{log_id}/errors
-        // If log_id is provided, we'd need to read from the container's filesystem
-        // For now, decode any URL-encoded log content from the IDs
-        let logs = log_id
-            .map(|id| {
-                // Log ID might be URL-encoded log content directly in some cases
-                urlencoding::decode(&id)
-                    .map(|s| parse_v5_log_format(&s))
-                    .unwrap_or_else(|_| id.clone())
-            })
-            .unwrap_or_default();
+        // Read logs and errors from FILES on disk (matching executor-main Docker.php:1027-1063)
+        // The header x-open-runtimes-log-id contains a FILE ID, not the actual logs.
+        // Logs are stored at /tmp/{hostname}/logs/{file_id}_logs.log
+        // Errors are stored at /tmp/{hostname}/logs/{file_id}_errors.log
+        let (logs, errors) = if let Some(ref file_id) = log_id {
+            // URL decode the file ID
+            let decoded_id = urlencoding::decode(file_id)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| file_id.clone());
 
-        let errors = error_id
-            .map(|id| {
-                urlencoding::decode(&id)
-                    .map(|s| parse_v5_log_format(&s))
-                    .unwrap_or_else(|_| id.clone())
-            })
-            .unwrap_or_default();
+            read_log_files(&runtime.hostname, &decoded_id).await
+        } else {
+            (String::new(), String::new())
+        };
+
+        let duration = start_instant.elapsed().as_secs_f64();
 
         Ok(ExecuteResponse {
             status_code: status,
@@ -254,12 +281,61 @@ impl RuntimeProtocol for V5Protocol {
             logs,
             errors,
             headers: response_headers,
+            duration,
+            start_time,
         })
+    }
+}
+
+/// Read log files from disk and clean up (matching executor-main behavior)
+/// Log files are stored at /tmp/{runtime_name}/logs/{file_id}_logs.log
+async fn read_log_files(runtime_name: &str, file_id: &str) -> (String, String) {
+    let log_path = format!("/tmp/{}/logs/{}_logs.log", runtime_name, file_id);
+    let error_path = format!("/tmp/{}/logs/{}_errors.log", runtime_name, file_id);
+
+    debug!("Reading log files: {} and {}", log_path, error_path);
+
+    let logs = read_and_cleanup_log(&log_path).await;
+    let errors = read_and_cleanup_log(&error_path).await;
+
+    (logs, errors)
+}
+
+/// Read a log file, truncate if too large, and delete after reading
+async fn read_and_cleanup_log(path: &str) -> String {
+    use tokio::fs;
+
+    match fs::read_to_string(path).await {
+        Ok(content) => {
+            // Truncate if too large (matching executor-main MAX_LOG_SIZE)
+            let result = if content.len() > MAX_LOG_SIZE {
+                let truncated = &content[..MAX_LOG_SIZE];
+                format!(
+                    "{}\n[Log file has been truncated. Max size: {:.2}MB]",
+                    truncated,
+                    MAX_LOG_SIZE as f64 / 1_048_576.0
+                )
+            } else {
+                content
+            };
+
+            // Delete the file after reading (matching executor-main cleanup)
+            if let Err(e) = fs::remove_file(path).await {
+                debug!("Failed to cleanup log file {}: {}", path, e);
+            }
+
+            result
+        }
+        Err(e) => {
+            debug!("Failed to read log file {}: {}", path, e);
+            String::new()
+        }
     }
 }
 
 /// Parse v5 log format - optimized with memchr and capacity pre-allocation
 /// v5 logs are JSON lines with format: {"type":"log|error","message":"...","timestamp":"..."}
+#[allow(dead_code)]
 fn parse_v5_log_format(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
