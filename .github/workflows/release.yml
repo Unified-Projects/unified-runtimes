@@ -9,6 +9,11 @@ on:
                 description: "Custom Docker tag (e.g. v0.1.0-alpha-7). Skips GitHub Release."
                 required: true
                 type: string
+            create_release:
+                description: "Create a GitHub Release (only applies to manual runs)"
+                required: false
+                type: boolean
+                default: false
 
 concurrency:
     group: release-${{ github.ref }}
@@ -35,7 +40,11 @@ jobs:
                   MANUAL_TAG: ${{ inputs.docker_tag }}
               run: |
                   if [[ -n "$MANUAL_TAG" ]]; then
-                      echo "is_release=false" >> "$GITHUB_OUTPUT"
+                      if [[ "${{ inputs.create_release }}" == "true" ]]; then
+                          echo "is_release=true" >> "$GITHUB_OUTPUT"
+                      else
+                          echo "is_release=false" >> "$GITHUB_OUTPUT"
+                      fi
                       echo "version=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
                       echo "Manual Docker build with tag: $MANUAL_TAG"
                   elif [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
@@ -50,14 +59,7 @@ jobs:
 
     release:
         name: Build and Release
-        runs-on: ${{ matrix.runner }}
-        strategy:
-            matrix:
-                include:
-                    - runner: blacksmith-2vcpu-ubuntu-2204
-                      arch: amd64
-                    - runner: blacksmith-2vcpu-ubuntu-2204-arm
-                      arch: arm64
+        runs-on: blacksmith-2vcpu-ubuntu-2204
         needs: check-version
         if: needs.check-version.outputs.version != ''
         permissions:
@@ -81,8 +83,8 @@ jobs:
                   context: .
                   file: docker/Dockerfile
                   push: true
-                  platforms: linux/${{ matrix.arch }}
-                  tags: unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+                  platforms: linux/amd64,linux/arm64
+                  tags: unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
 
             - name: Create GitHub Release
               if: needs.check-version.outputs.is_release == 'true'
@@ -105,15 +107,6 @@ jobs:
                       ```
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-            - name: Create and push Docker manifest
-              if: matrix.arch == 'amd64'
-              run: |
-                  docker manifest create unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }} \
-                    unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-amd64 \
-                    unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}-arm64
-
-                  docker manifest push unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
 
             - name: Cleanup
               if: always()
