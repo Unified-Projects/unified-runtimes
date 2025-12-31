@@ -74,6 +74,9 @@ ENV URT_KEEP_ALIVE=true
 # Expose port
 EXPOSE 80
 
+# Allow graceful shutdown (executor listens for SIGTERM)
+STOPSIGNAL SIGTERM
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD sh -c 'curl -sf "http://${URT_HOST}:${URT_PORT}/v1/health" || exit 1'
