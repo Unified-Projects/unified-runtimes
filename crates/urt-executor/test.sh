@@ -32,7 +32,7 @@ detect_os() {
 
 OS=$(detect_os)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 EXECUTOR_CRATE="$PROJECT_ROOT/crates/urt-executor"
 
 # Docker compose file path
@@ -127,7 +127,7 @@ start_test_services() {
     check_docker_compose || return 1
 
     log_info "Starting MinIO and other test services..."
-    $COMPOSE_CMD -f "$DOCKER_COMPOSE_FILE" up -d
+    $COMPOSE_CMD -f "$DOCKER_COMPOSE_FILE" --profile test up -d
 
     # Wait for MinIO to be ready
     local max_attempts=30
