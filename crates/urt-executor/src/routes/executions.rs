@@ -760,3 +760,456 @@ async fn wait_for_port(hostname: &str, port: u16, timeout: Duration) -> Result<(
     debug!("Timeout waiting for {} after {:?}", addr, timeout);
     Err(ExecutorError::RuntimeTimeout)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // HeadersInput tests
+    mod headers_input {
+        use super::*;
+
+        #[test]
+        fn test_empty() {
+            let headers = HeadersInput::Empty;
+            let map = headers.to_map();
+            assert!(map.is_empty());
+        }
+
+        #[test]
+        fn test_object() {
+            let mut map = HashMap::new();
+            map.insert("content-type".to_string(), "application/json".to_string());
+            map.insert("accept".to_string(), "*/*".to_string());
+
+            let headers = HeadersInput::Object(map.clone());
+            let result = headers.to_map();
+            assert_eq!(result.len(), 2);
+            assert_eq!(
+                result.get("content-type"),
+                Some(&"application/json".to_string())
+            );
+        }
+
+        #[test]
+        fn test_string_json() {
+            let headers = HeadersInput::String(
+                r#"{"content-type": "text/html", "x-custom": "value"}"#.to_string(),
+            );
+            let map = headers.to_map();
+            assert_eq!(map.get("content-type"), Some(&"text/html".to_string()));
+            assert_eq!(map.get("x-custom"), Some(&"value".to_string()));
+        }
+
+        #[test]
+        fn test_string_invalid_json_returns_empty() {
+            let headers = HeadersInput::String("not json".to_string());
+            let map = headers.to_map();
+            assert!(map.is_empty());
+        }
+
+        #[test]
+        fn test_string_empty_json() {
+            let headers = HeadersInput::String("{}".to_string());
+            let map = headers.to_map();
+            assert!(map.is_empty());
+        }
+
+        #[test]
+        fn test_to_map_cow_empty() {
+            let headers = HeadersInput::Empty;
+            let cow = headers.to_map_cow();
+            assert!(cow.is_empty());
+        }
+
+        #[test]
+        fn test_to_map_cow_object_borrows() {
+            let mut map = HashMap::new();
+            map.insert("key".to_string(), "value".to_string());
+            let headers = HeadersInput::Object(map.clone());
+            let cow = headers.to_map_cow();
+            // Should be borrowed, not owned
+            assert!(matches!(cow, Cow::Borrowed(_)));
+        }
+
+        #[test]
+        fn test_to_map_cow_string_owned() {
+            let headers = HeadersInput::String(r#"{"key": "value"}"#.to_string());
+            let cow = headers.to_map_cow();
+            // Should be owned since we parsed from string
+            assert!(matches!(cow, Cow::Owned(_)));
+        }
+    }
+
+    // VariablesInput tests
+    mod variables_input {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn test_empty() {
+            let vars = VariablesInput::Empty;
+            let map = vars.to_map();
+            assert!(map.is_empty());
+        }
+
+        #[test]
+        fn test_object_string_values() {
+            let mut map = HashMap::new();
+            map.insert("KEY1".to_string(), json!("value1"));
+            map.insert("KEY2".to_string(), json!("value2"));
+
+            let vars = VariablesInput::Object(map);
+            let result = vars.to_map();
+            assert_eq!(result.get("KEY1"), Some(&"value1".to_string()));
+            assert_eq!(result.get("KEY2"), Some(&"value2".to_string()));
+        }
+
+        #[test]
+        fn test_object_number_values() {
+            let mut map = HashMap::new();
+            map.insert("PORT".to_string(), json!(8080));
+            map.insert("RATIO".to_string(), json!(std::f64::consts::PI));
+
+            let vars = VariablesInput::Object(map);
+            let result = vars.to_map();
+            assert_eq!(result.get("PORT"), Some(&"8080".to_string()));
+            assert_eq!(result.get("RATIO"), Some(&"3.141592653589793".to_string()));
+        }
+
+        #[test]
+        fn test_object_bool_values() {
+            let mut map = HashMap::new();
+            map.insert("DEBUG".to_string(), json!(true));
+            map.insert("VERBOSE".to_string(), json!(false));
+
+            let vars = VariablesInput::Object(map);
+            let result = vars.to_map();
+            assert_eq!(result.get("DEBUG"), Some(&"true".to_string()));
+            assert_eq!(result.get("VERBOSE"), Some(&"false".to_string()));
+        }
+
+        #[test]
+        fn test_object_null_values() {
+            let mut map = HashMap::new();
+            map.insert("NULL_VAR".to_string(), json!(null));
+
+            let vars = VariablesInput::Object(map);
+            let result = vars.to_map();
+            assert_eq!(result.get("NULL_VAR"), Some(&"".to_string()));
+        }
+
+        #[test]
+        fn test_object_array_values() {
+            let mut map = HashMap::new();
+            map.insert("ARRAY".to_string(), json!(["a", "b", "c"]));
+
+            let vars = VariablesInput::Object(map);
+            let result = vars.to_map();
+            assert_eq!(
+                result.get("ARRAY"),
+                Some(&"[\"a\",\"b\",\"c\"]".to_string())
+            );
+        }
+
+        #[test]
+        fn test_object_nested_object() {
+            let mut map = HashMap::new();
+            map.insert("NESTED".to_string(), json!({"inner": "value"}));
+
+            let vars = VariablesInput::Object(map);
+            let result = vars.to_map();
+            assert!(result.get("NESTED").unwrap().contains("inner"));
+        }
+
+        #[test]
+        fn test_string_json() {
+            let vars = VariablesInput::String(r#"{"KEY": "value", "NUM": 42}"#.to_string());
+            let result = vars.to_map();
+            assert_eq!(result.get("KEY"), Some(&"value".to_string()));
+            assert_eq!(result.get("NUM"), Some(&"42".to_string()));
+        }
+
+        #[test]
+        fn test_string_invalid_json_returns_empty() {
+            let vars = VariablesInput::String("not json".to_string());
+            let result = vars.to_map();
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn test_value_to_string_string() {
+            assert_eq!(VariablesInput::value_to_string(&json!("test")), "test");
+        }
+
+        #[test]
+        fn test_value_to_string_number() {
+            assert_eq!(VariablesInput::value_to_string(&json!(42)), "42");
+            assert_eq!(
+                VariablesInput::value_to_string(&json!(std::f64::consts::PI)),
+                "3.141592653589793"
+            );
+        }
+
+        #[test]
+        fn test_value_to_string_bool() {
+            assert_eq!(VariablesInput::value_to_string(&json!(true)), "true");
+            assert_eq!(VariablesInput::value_to_string(&json!(false)), "false");
+        }
+
+        #[test]
+        fn test_value_to_string_null() {
+            assert_eq!(VariablesInput::value_to_string(&json!(null)), "");
+        }
+    }
+
+    // Multipart parsing tests
+    mod multipart_parsing {
+        use super::*;
+
+        #[test]
+        fn test_parse_multipart_basic() {
+            // Use \r\n format as expected by implementation
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\ntest body\r\n--boundary\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/api/test\r\n--boundary\r\nContent-Disposition: form-data; name=\"method\"\r\n\r\nPOST\r\n--boundary--";
+            let result =
+                parse_multipart_execution_request(body, "multipart/form-data; boundary=boundary");
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            assert_eq!(req.body, "test body");
+            assert_eq!(req.path, "/api/test");
+            assert_eq!(req.method, "POST");
+        }
+
+        #[test]
+        fn test_parse_multipart_with_headers() {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\n{\"key\":\"value\"}\r\n--boundary\r\nContent-Disposition: form-data; name=\"headers\"\r\n\r\n{\"content-type\": \"application/json\"}\r\n--boundary--";
+            let result =
+                parse_multipart_execution_request(body, "multipart/form-data; boundary=boundary");
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            assert_eq!(req.body, r#"{"key":"value"}"#);
+            let headers = req.headers.to_map();
+            assert_eq!(
+                headers.get("content-type"),
+                Some(&"application/json".to_string())
+            );
+        }
+
+        #[test]
+        fn test_parse_multipart_with_variables() {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\ntest\r\n--boundary\r\nContent-Disposition: form-data; name=\"variables\"\r\n\r\n{\"DATABASE_URL\": \"postgres://localhost/db\", \"POOL_SIZE\": 10}\r\n--boundary--";
+            let result =
+                parse_multipart_execution_request(body, "multipart/form-data; boundary=boundary");
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            let vars = req.variables.to_map();
+            assert_eq!(
+                vars.get("DATABASE_URL"),
+                Some(&"postgres://localhost/db".to_string())
+            );
+            assert_eq!(vars.get("POOL_SIZE"), Some(&"10".to_string()));
+        }
+
+        #[test]
+        fn test_parse_multipart_with_numeric_fields() {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\ntest\r\n--boundary\r\nContent-Disposition: form-data; name=\"timeout\"\r\n\r\n30\r\n--boundary\r\nContent-Disposition: form-data; name=\"cpus\"\r\n\r\n2.5\r\n--boundary\r\nContent-Disposition: form-data; name=\"memory\"\r\n\r\n512\r\n--boundary--";
+            let result =
+                parse_multipart_execution_request(body, "multipart/form-data; boundary=boundary");
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            assert_eq!(req.timeout, 30);
+            assert_eq!(req.cpus, 2.5);
+            assert_eq!(req.memory, 512);
+        }
+
+        #[test]
+        fn test_parse_multipart_invalid_boundary() {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\ntest\r\n--boundary--";
+            let result = parse_multipart_execution_request(body, "multipart/form-data");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_parse_multipart_empty_body() {
+            let body = "--boundary--";
+            let result =
+                parse_multipart_execution_request(body, "multipart/form-data; boundary=boundary");
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            assert!(req.body.is_empty());
+            assert_eq!(req.path, "/"); // default
+            assert_eq!(req.method, "GET"); // default
+        }
+
+        #[test]
+        fn test_parse_multipart_bytes_basic() {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\ntest body\r\n--boundary\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/test\r\n--boundary--".to_string();
+            let result = parse_multipart_execution_request_bytes(
+                body.as_bytes(),
+                "multipart/form-data; boundary=boundary",
+            );
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            assert_eq!(req.body, "test body");
+            assert_eq!(req.path, "/test");
+        }
+
+        #[test]
+        fn test_parse_multipart_bytes_with_binary_body() {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"; filename=\"test.txt\"\r\n\r\n\x00\x01\x02\x03\r\n--boundary--".to_string();
+            let result = parse_multipart_execution_request_bytes(
+                body.as_bytes(),
+                "multipart/form-data; boundary=boundary",
+            );
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            // Binary content should be preserved
+            assert_eq!(req.body.as_bytes(), vec![0, 1, 2, 3]);
+        }
+
+        #[test]
+        fn test_parse_multipart_quoted_boundary() {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\ntest\r\n--boundary--";
+            let result = parse_multipart_execution_request(
+                body,
+                r#"multipart/form-data; boundary="boundary""#,
+            );
+            assert!(result.is_ok());
+            let req = result.unwrap();
+            assert_eq!(req.body, "test");
+        }
+
+        #[test]
+        fn test_parse_multipart_missing_content_disposition() {
+            let body = "--boundary\r\nContent-Type: text/plain\r\n\r\ntest\r\n--boundary--";
+            let result =
+                parse_multipart_execution_request(body, "multipart/form-data; boundary=boundary");
+            assert!(result.is_ok()); // Should still parse, just skip this part
+            let req = result.unwrap();
+            assert!(req.body.is_empty()); // Body part was skipped
+        }
+    }
+
+    // JSON response format tests
+    mod json_response_format {
+        use super::*;
+
+        #[test]
+        fn test_json_execution_response_serialization() {
+            let response = JsonExecutionResponse {
+                status_code: 200,
+                body: "response body".to_string(),
+                logs: "info: started\ninfo: done".to_string(),
+                errors: "".to_string(),
+                headers: HashMap::from([
+                    ("content-type".to_string(), json!("application/json")),
+                    ("x-request-id".to_string(), json!("abc123")),
+                ]),
+                duration: 0.123456,
+                start_time: 1699999999.123456,
+            };
+
+            let json = serde_json::to_string(&response).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(parsed["statusCode"], 200);
+            assert_eq!(parsed["body"], "response body");
+            assert_eq!(parsed["logs"], "info: started\ninfo: done");
+            assert_eq!(parsed["errors"], "");
+            assert_eq!(parsed["duration"], 0.123456);
+            assert!(parsed["startTime"].is_number());
+        }
+    }
+
+    // Default values tests
+    mod default_values {
+        use super::*;
+
+        #[test]
+        fn test_default_path() {
+            assert_eq!(default_path(), "/");
+        }
+
+        #[test]
+        fn test_default_method() {
+            assert_eq!(default_method(), "GET");
+        }
+
+        #[test]
+        fn test_default_exec_timeout() {
+            assert_eq!(default_exec_timeout(), 15);
+        }
+
+        #[test]
+        fn test_default_logging() {
+            assert!(default_logging());
+        }
+    }
+
+    // ExecutionRequest parsing tests
+    mod execution_request_parsing {
+        use super::*;
+
+        #[test]
+        fn test_execution_request_from_json() {
+            let json = r#"{
+                "body": "test body",
+                "path": "/api/endpoint",
+                "method": "POST",
+                "headers": {"content-type": "application/json"},
+                "timeout": 30,
+                "variables": {"KEY": "value"}
+            }"#;
+
+            let req: ExecutionRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(req.body, "test body");
+            assert_eq!(req.path, "/api/endpoint");
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.timeout, 30);
+            assert_eq!(
+                req.headers.to_map().get("content-type"),
+                Some(&"application/json".to_string())
+            );
+            assert_eq!(
+                req.variables.to_map().get("KEY"),
+                Some(&"value".to_string())
+            );
+        }
+
+        #[test]
+        fn test_execution_request_defaults() {
+            let req: ExecutionRequest = serde_json::from_str("{}").unwrap();
+            assert!(req.body.is_empty());
+            assert_eq!(req.path, "/");
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.timeout, 15); // default_exec_timeout
+            assert!(req.logging); // default_logging
+        }
+
+        #[test]
+        fn test_execution_request_headers_as_string() {
+            let json = r#"{
+                "headers": "{\"content-type\": \"text/html\"}"
+            }"#;
+
+            let req: ExecutionRequest = serde_json::from_str(json).unwrap();
+            let headers = req.headers.to_map();
+            assert_eq!(headers.get("content-type"), Some(&"text/html".to_string()));
+        }
+
+        #[test]
+        fn test_execution_request_variables_as_string() {
+            let json = r#"{
+                "variables": "{\"DATABASE_URL\": \"postgres://localhost\"}"
+            }"#;
+
+            let req: ExecutionRequest = serde_json::from_str(json).unwrap();
+            let vars = req.variables.to_map();
+            assert_eq!(
+                vars.get("DATABASE_URL"),
+                Some(&"postgres://localhost".to_string())
+            );
+        }
+    }
+}
