@@ -8,7 +8,8 @@
 //!
 //! Environment variables:
 //! - E2E_RUNTIME_IMAGE: Override the default runtime image (default: openruntimes/node:v5-22)
-//! - E2E_TIMEOUT_SECS: Override test timeout in seconds (default: 60)
+//! - E2E_TIMEOUT_SECS: Override test timeout in seconds (default: 120)
+//! - E2E_HTTP_TIMEOUT_SECS: Override HTTP client timeout in seconds (default: 120)
 
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
@@ -27,6 +28,7 @@ use urt_executor::{
 
 const DEFAULT_RUNTIME_IMAGE: &str = "openruntimes/node:v5-22";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
 const TEST_SECRET: &str = "e2e-test-secret-key";
 const TEST_NETWORK: &str = "e2e-test-network";
 const OPENRUNTIMES_FUNCTION_PATH: &str = "/usr/local/server/src/function";
@@ -45,6 +47,16 @@ fn get_timeout() -> Duration {
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     Duration::from_secs(secs)
 }
+
+/// Get the HTTP client timeout
+fn get_http_timeout() -> Duration {
+    let secs = std::env::var("E2E_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 
 /// Get the path to the test function fixture
 /// Uses TEST_FIXTURES_HOST_PATH env var when running in Docker (host path for mounts),
@@ -185,7 +197,7 @@ async fn create_test_server() -> TestServer {
     // Wait for server to be ready
     // Long timeout for runtime creation which may pull images
     let client = Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(get_http_timeout())
         .build()
         .unwrap();
 
@@ -1966,8 +1978,11 @@ mod concurrent_load {
                 let runtime_id = format!("rapid-create-{}", i);
                 let payload = json!({
                     "runtimeId": runtime_id,
-                    "image": "alpine:latest",
-                    "entrypoint": "",
+                    "image": get_runtime_image(),
+                    "entrypoint": "index.js",
+                    "source": get_test_function_path(),
+                    "destination": OPENRUNTIMES_FUNCTION_PATH,
+                    "dockerCmd": OPENRUNTIMES_SERVER_CMD,
                     "variables": {}
                 });
 

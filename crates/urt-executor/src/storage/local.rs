@@ -25,7 +25,7 @@ impl LocalStorage {
     }
 
     /// Create a new local storage with a specific base path
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn with_base_path(base_path: &str) -> Self {
         Self {
             base_path: base_path.to_string(),
