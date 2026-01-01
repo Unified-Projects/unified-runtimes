@@ -1989,7 +1989,9 @@ mod concurrent_load {
                 if !status.is_success() {
                     tracing::warn!(
                         "Runtime create failed for {}: {} - {}",
-                        runtime_id, status, body
+                        runtime_id,
+                        status,
+                        body
                     );
                 } else {
                     tracing::info!("Successfully created runtime: {}", runtime_id);
