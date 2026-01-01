@@ -62,7 +62,7 @@ urlencoding = "2.1"
 bollard = "0.19"
 
 # S3 Storage
-rust-s3 = { version = "0.37", default-features = false, features = ["tokio-native-tls"] }
+rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-native-tls"] }
 
 # Streaming
 async-stream = "0.3"
