@@ -1964,9 +1964,10 @@ mod concurrent_load {
 
             for i in 0..num_runtimes {
                 let runtime_id = format!("rapid-create-{}", i);
+                let image = get_runtime_image();
                 let payload = json!({
                     "runtimeId": runtime_id,
-                    "image": "alpine:latest",
+                    "image": image,
                     "entrypoint": "",
                     "variables": {}
                 });
@@ -1981,8 +1982,17 @@ mod concurrent_load {
                     .await
                     .expect("Failed to create runtime");
 
-                // Some may succeed, some may conflict - that's okay for this test
-                if response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_else(|_| "".to_string());
+
+                // Log for debugging
+                if !status.is_success() {
+                    tracing::warn!(
+                        "Runtime create failed for {}: {} - {}",
+                        runtime_id, status, body
+                    );
+                } else {
+                    tracing::info!("Successfully created runtime: {}", runtime_id);
                     runtime_ids.push(runtime_id);
                 }
 
