@@ -343,6 +343,11 @@ pub async fn create_runtime(
                 e
             )));
         }
+
+        // Verify download and log file size
+        if let Ok(metadata) = tokio::fs::metadata(&local_source).await {
+            info!("Source downloaded successfully: {} bytes", metadata.len());
+        }
     }
 
     // Add standard mounts (Docker.php lines 471-474)
