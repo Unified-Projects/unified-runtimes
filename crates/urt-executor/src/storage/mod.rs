@@ -7,8 +7,11 @@
 //! - Backblaze B2
 //! - Linode Object Storage
 //! - Wasabi
+//!
+//! Also provides a local file cache for speeding up cold starts.
 
 mod cache;
+mod file_cache;
 mod local;
 mod s3;
 
@@ -16,6 +19,7 @@ use crate::config::{StorageConfig, StorageDevice};
 use crate::error::Result;
 use async_trait::async_trait;
 pub use cache::BuildCache;
+pub use file_cache::StorageFileCache;
 pub use local::LocalStorage;
 pub use s3::S3Storage;
 
