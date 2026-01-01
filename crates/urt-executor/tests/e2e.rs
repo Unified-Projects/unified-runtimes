@@ -1975,7 +1975,6 @@ mod concurrent_load {
 
             for i in 0..num_runtimes {
                 let runtime_id = format!("rapid-create-{}", i);
-                let image = get_runtime_image();
                 let payload = json!({
                     "runtimeId": runtime_id,
                     "image": get_runtime_image(),
