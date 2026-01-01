@@ -28,6 +28,7 @@ impl<S: Storage> BuildCache<S> {
     /// This is a convenience wrapper around `hash_files` that accepts string paths.
     ///
     /// Note: Public for use in integration and e2e tests.
+    #[allow(dead_code)]
     #[doc(hidden)]
     pub async fn hash_deps(&self, dep_files: &[&str]) -> Result<String> {
         let paths: Vec<PathBuf> = dep_files.iter().map(PathBuf::from).collect();

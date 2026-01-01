@@ -33,7 +33,8 @@ impl LocalStorage {
     }
 
     fn full_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
+        // Treat platform absolute paths (including Windows drive/UNC) as already rooted
+        if Path::new(path).is_absolute() {
             path.to_string()
         } else {
             format!("{}/{}", self.base_path, path)
