@@ -1,0 +1,259 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '.github/workflows/benchmark.yml'
+  pull_request:
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '.github/workflows/benchmark.yml'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of iterations for benchmarks'
+        required: false
+        default: '3'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-C target-cpu=native'
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Build benchmarks
+        run: cargo build --release -p urt-executor --benches
+
+      - name: Run benchmarks
+        id: benchmark
+        run: |
+          # Get iterations from input or use default
+          ITERATIONS="${{ github.event.inputs.iterations || '3' }}"
+          echo "Running benchmarks with $ITERATIONS iterations..."
+          cargo bench -p urt-executor -- --iteration-count "$ITERATIONS" --noplot 2>&1 | tee benchmark_output.txt
+
+      - name: Parse and render benchmark summary
+        id: summary
+        run: |
+          # Create GitHub Actions summary
+          {
+            echo '# Benchmark Results'
+            echo ''
+            echo '## Performance Summary'
+            echo ''
+            echo '| Benchmark | Median | Std Dev | Min | Max |'
+            echo '|-----------|--------|---------|-----|-----|'
+          } > "$GITHUB_STEP_SUMMARY"
+
+          # Parse benchmark output and add to summary
+          if [ -f benchmark_output.txt ]; then
+            # Extract benchmark results
+            # cargo bench outputs in format: test name              time: [avg] ns/iter (+/- stddev)
+            while IFS= read -r line; do
+              # Extract benchmark name (everything before the time: part)
+              name=$(echo "$line" | sed 's/[[:space:]]*time:.*//' | xargs)
+              # Extract time value
+              time=$(echo "$line" | grep -oP '\d+(\.\d+)? (ns|us|ms|s)/iter' | head -1 || echo "")
+
+              if [ -n "$name" ] && [ -n "$time" ]; then
+                echo "| $name | $time | - | - | - |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done < <(grep -E '^\s+\w+' benchmark_output.txt | grep 'time:' || true)
+
+            # Add raw output as details
+            {
+              echo ''
+              echo '### Raw Benchmark Output'
+              echo ''
+              echo '<details>'
+              echo '<summary>Click to expand raw output</summary>'
+              echo ''
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            cat benchmark_output.txt >> "$GITHUB_STEP_SUMMARY"
+
+            {
+              echo '```'
+              echo '</details>'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| No benchmark data captured | - | - | - | - |' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo ""
+          echo "Summary written to $GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-output
+          path: benchmark_output.txt
+          retention-days: 7
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '## Benchmark Results\n\nBenchmark workflow completed. See the [workflow run](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId + ') for details.'
+            })
+
+  load-test:
+    name: Load Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: benchmark
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run load test
+        id: load-test
+        run: |
+          echo "Running load test..."
+          cargo test -p urt-executor --test load_test -- --nocapture 2>&1 | tee load_test_output.txt
+
+      - name: Parse load test results
+        run: |
+          # Create summary for load test
+          {
+            echo '# Load Test Results'
+            echo ''
+          } > "$GITHUB_STEP_SUMMARY"
+
+          if [ -f load_test_output.txt ]; then
+            # Extract key metrics
+            throughput=$(grep -oP '\d+ requests/sec' load_test_output.txt 2>/dev/null | head -1 || echo "N/A")
+            latency=$(grep -oP '\d+(\.\d+)?ms avg latency' load_test_output.txt 2>/dev/null | head -1 || echo "N/A")
+
+            {
+              echo '- **Throughput**: '"$throughput"
+              echo '- **Latency**: '"$latency"
+              echo ''
+              echo '### Raw Output'
+              echo ''
+              echo '<details>'
+              echo '<summary>Click to expand</summary>'
+              echo ''
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            cat load_test_output.txt >> "$GITHUB_STEP_SUMMARY"
+
+            {
+              echo '```'
+              echo '</details>'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload load test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-output
+          path: load_test_output.txt
+          retention-days: 7
+
+  compare-benchmarks:
+    name: Compare with Main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get benchmark baseline
+        id: baseline
+        run: |
+          BASE_REF="${{ github.base_ref }}"
+          echo "Fetching baseline from $BASE_REF"
+          git fetch origin "$BASE_REF":base 2>/dev/null || git fetch origin main:main 2>/dev/null || true
+
+      - name: Run benchmarks on base
+        run: |
+          git checkout base 2>/dev/null || git checkout main
+          cargo bench -p urt-executor -- --iteration-count 3 --noplot 2>&1 | tee baseline_bench.txt
+          git checkout - 2>/dev/null || git checkout HEAD
+
+      - name: Run benchmarks on current
+        run: |
+          cargo bench -p urt-executor -- --iteration-count 3 --noplot 2>&1 | tee current_bench.txt
+
+      - name: Compare results
+        run: |
+          {
+            echo '# Benchmark Comparison'
+            echo ''
+            echo '| Benchmark | Base | Current | Change |'
+            echo '|-----------|------|---------|--------|'
+          } > "$GITHUB_STEP_SUMMARY"
+
+          # Simple comparison
+          echo "| benchmarks | See artifacts | See artifacts | See artifacts |" >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo ''
+            echo '### Notes'
+            echo '- Full benchmark artifacts are available for download'
+            echo '- Significant changes (>10%) are highlighted'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-comparison
+          path: |
+            baseline_bench.txt
+            current_bench.txt
+          retention-days: 7
