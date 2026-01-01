@@ -86,7 +86,7 @@ impl StorageFileCache {
     }
 
     /// Get the full cache file path for a remote path
-    fn get_cache_path(&self, remote_path: &str) -> (PathBuf, PathBuf) {
+    pub(crate) fn get_cache_path(&self, remote_path: &str) -> (PathBuf, PathBuf) {
         let key = Self::get_cache_key(remote_path);
         let hash = Sha256::digest(remote_path.as_bytes());
         let hash_hex = hex::encode(hash);
@@ -147,7 +147,7 @@ impl StorageFileCache {
     }
 
     /// Write metadata to file
-    async fn write_metadata(&self, path: &Path, meta: &CacheMetadata) -> Result<()> {
+    pub(crate) async fn write_metadata(&self, path: &Path, meta: &CacheMetadata) -> Result<()> {
         let mut file = File::create(path).await.map_err(|e| {
             ExecutorError::Storage(format!("Failed to create cache metadata: {}", e))
         })?;
@@ -170,6 +170,7 @@ impl StorageFileCache {
     /// * `fetch_fn` - Async function to fetch the file content from remote
     ///
     /// Returns the local path to the cached file
+    #[allow(dead_code)]
     pub async fn get_or_fetch<F, Fut>(&self, remote_path: &str, fetch_fn: F) -> Result<PathBuf>
     where
         F: FnOnce() -> Fut,
@@ -497,10 +498,10 @@ impl StorageFileCache {
 
 /// Cache metadata stored alongside each cached file
 #[derive(serde::Serialize, serde::Deserialize)]
-struct CacheMetadata {
-    remote_path: String,
-    created: SystemTime,
-    size: u64,
+pub(crate) struct CacheMetadata {
+    pub remote_path: String,
+    pub created: SystemTime,
+    pub size: u64,
 }
 
 /// Statistics about the cache

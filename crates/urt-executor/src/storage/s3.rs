@@ -1,4 +1,4 @@
-//! S3/MinIO storage backend
+//! S3-compatible storage backend using rust-s3 library
 //!
 //! Supports multiple S3-compatible providers:
 //! - AWS S3
@@ -6,6 +6,7 @@
 //! - Backblaze B2
 //! - Linode Object Storage
 //! - Wasabi
+//! - MinIO
 //!
 //! Features local file caching to speed up cold starts.
 
@@ -15,37 +16,72 @@ use crate::config::S3ProviderConfig;
 use crate::error::{ExecutorError, Result};
 use async_trait::async_trait;
 use s3::creds::Credentials;
-use s3::{Bucket, Region};
+use s3::region::Region;
+use s3::Bucket;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::AsyncReadExt;
-use tracing::debug;
-use url::Url;
+
+/// Check if an error indicates the object was not found
+fn is_not_found_error(err: &s3::error::S3Error) -> bool {
+    matches!(err, s3::error::S3Error::HttpFailWithBody(404, _))
+}
 
 /// S3-compatible storage backend with optional local file caching
 pub struct S3Storage {
-    bucket: Box<Bucket>,
+    bucket: Bucket,
+    /// Bucket name (stored to strip from paths if needed for virtual-hosted style)
+    bucket_name: String,
+    /// Whether using path-style addressing
+    use_path_style: bool,
     /// Optional file cache for faster cold starts
     file_cache: Option<Arc<StorageFileCache>>,
 }
 
 impl S3Storage {
-    // ========================================================================
-    // Provider-specific factory methods (matching executor-main endpoints)
-    // ========================================================================
+    /// Helper to get the S3 key for a path
+    /// With virtual-hosted style, we need to strip the bucket prefix from the path
+    fn get_s3_key<'a>(&self, path: &'a str) -> &'a str {
+        if !self.use_path_style {
+            // Virtual-hosted style: bucket is subdomain, path shouldn't include bucket
+            // AppWrite paths include bucket prefix (e.g., "appwrite/storage/sites/...")
+            // We need to strip it for virtual-hosted style
+            let bucket_prefix = format!("{}/", self.bucket_name);
+            if path.starts_with(&bucket_prefix) {
+                return &path[bucket_prefix.len()..];
+            }
+            // Also handle path without trailing slash
+            if path == self.bucket_name {
+                return "";
+            }
+        }
+        path
+    }
 
+    /// Create S3 storage with custom endpoint
     #[allow(dead_code)]
-    /// Create S3 storage with custom endpoint (for AWS S3 or custom S3-compatible)
-    /// with optional file caching for faster cold starts
     pub fn new_with_endpoint(
         access_key: &str,
         secret: &str,
         region: &str,
-        bucket: &str,
+        bucket_name: &str,
         endpoint: &str,
     ) -> Result<Self> {
-        Self::new_with_endpoint_and_cache(access_key, secret, region, bucket, endpoint, None)
+        Self::new_with_endpoint_and_cache(access_key, secret, region, bucket_name, endpoint, None)
+    }
+
+    /// Check if endpoint looks like a container name (for Docker networking)
+    fn is_container_endpoint(endpoint: &str) -> bool {
+        // Check if endpoint is a Docker service name (no dots, or .docker.internal)
+        let clean_endpoint = endpoint
+            .strip_prefix("http://")
+            .or_else(|| endpoint.strip_prefix("https://"))
+            .unwrap_or(endpoint);
+
+        // Container names typically don't have dots or are .internal domains
+        // e.g., "appwrite-minio", "minio", "minio:9000"
+        clean_endpoint.contains("docker.internal")
+            || (!clean_endpoint.contains('.') && !clean_endpoint.contains(':'))
     }
 
     /// Create S3 storage with custom endpoint and file cache
@@ -53,7 +89,7 @@ impl S3Storage {
         access_key: &str,
         secret: &str,
         region: &str,
-        bucket: &str,
+        bucket_name: &str,
         endpoint: &str,
         file_cache: Option<Arc<StorageFileCache>>,
     ) -> Result<Self> {
@@ -65,30 +101,62 @@ impl S3Storage {
         let credentials = Credentials::new(Some(access_key), Some(secret), None, None, None)
             .map_err(|e| ExecutorError::Storage(format!("Invalid S3 credentials: {}", e)))?;
 
-        let bucket = Bucket::new(bucket, region, credentials)
+        // Detect if we're connecting to a container endpoint (Docker networking)
+        // In Docker, service names like "appwrite-minio" resolve, but subdomains like
+        // "appwrite.appwrite-minio" don't. So we use path-style for container endpoints.
+        let use_path_style = Self::is_container_endpoint(endpoint);
+
+        if use_path_style {
+            tracing::debug!(
+                "Using path-style addressing for container endpoint '{}'",
+                endpoint
+            );
+        }
+
+        let bucket = *Bucket::new(bucket_name, region, credentials)
             .map_err(|e| {
                 ExecutorError::Storage(format!(
                     "Failed to create S3 bucket '{}' at {}: {}",
-                    bucket, endpoint, e
+                    bucket_name, endpoint, e
                 ))
             })?
             .with_path_style();
 
-        debug!(
-            "Created S3 storage for bucket '{}' at {}",
-            bucket.name(),
-            endpoint
+        tracing::debug!(
+            "Created S3 storage for bucket '{}' at {} (path_style: {})",
+            bucket_name,
+            endpoint,
+            use_path_style
         );
 
-        Ok(Self { bucket, file_cache })
+        Ok(Self {
+            bucket,
+            bucket_name: bucket_name.to_string(),
+            use_path_style, // For container endpoints, use path-style
+            file_cache,
+        })
     }
 
     /// Create AWS S3 storage from config
     pub fn new_s3(config: &S3ProviderConfig) -> Result<Self> {
-        Self::new_s3_with_cache(config, None)
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", config.region));
+
+        Self::new_with_endpoint_and_cache(
+            &config.access_key,
+            &config.secret,
+            &config.region,
+            &config.bucket,
+            &endpoint,
+            None,
+        )
     }
 
     /// Create AWS S3 storage from config with file cache
+    #[allow(dead_code)]
     pub fn new_s3_with_cache(
         config: &S3ProviderConfig,
         file_cache: Option<Arc<StorageFileCache>>,
@@ -110,339 +178,158 @@ impl S3Storage {
     }
 
     /// Create DigitalOcean Spaces storage from config
-    /// Endpoint: https://{region}.digitaloceanspaces.com
+    #[allow(dead_code)]
     pub fn new_do_spaces(config: &S3ProviderConfig) -> Result<Self> {
-        Self::new_do_spaces_with_cache(config, None)
-    }
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .or(Some("https://nyc3.digitaloceanspaces.com"))
+            .map(|e| e.to_string())
+            .unwrap();
 
-    /// Create DigitalOcean Spaces with file cache
-    pub fn new_do_spaces_with_cache(
-        config: &S3ProviderConfig,
-        file_cache: Option<Arc<StorageFileCache>>,
-    ) -> Result<Self> {
-        let endpoint = format!("https://{}.digitaloceanspaces.com", config.region);
         Self::new_with_endpoint_and_cache(
             &config.access_key,
             &config.secret,
             &config.region,
             &config.bucket,
             &endpoint,
-            file_cache,
+            None,
         )
     }
 
     /// Create Backblaze B2 storage from config
-    /// Endpoint: https://s3.{region}.backblazeb2.com
+    #[allow(dead_code)]
     pub fn new_backblaze(config: &S3ProviderConfig) -> Result<Self> {
-        Self::new_backblaze_with_cache(config, None)
-    }
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .or(Some("https://s3.us-west-004.backblazeb2.com"))
+            .map(|e| e.to_string())
+            .unwrap();
 
-    /// Create Backblaze with file cache
-    pub fn new_backblaze_with_cache(
-        config: &S3ProviderConfig,
-        file_cache: Option<Arc<StorageFileCache>>,
-    ) -> Result<Self> {
-        let endpoint = format!("https://s3.{}.backblazeb2.com", config.region);
         Self::new_with_endpoint_and_cache(
             &config.access_key,
             &config.secret,
             &config.region,
             &config.bucket,
             &endpoint,
-            file_cache,
+            None,
         )
     }
 
     /// Create Linode Object Storage from config
-    /// Endpoint: https://{region}.linodeobjects.com
+    #[allow(dead_code)]
     pub fn new_linode(config: &S3ProviderConfig) -> Result<Self> {
-        Self::new_linode_with_cache(config, None)
-    }
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .or(Some("https://linode.com"))
+            .map(|e| e.to_string())
+            .unwrap();
 
-    /// Create Linode with file cache
-    pub fn new_linode_with_cache(
-        config: &S3ProviderConfig,
-        file_cache: Option<Arc<StorageFileCache>>,
-    ) -> Result<Self> {
-        let endpoint = format!("https://{}.linodeobjects.com", config.region);
         Self::new_with_endpoint_and_cache(
             &config.access_key,
             &config.secret,
             &config.region,
             &config.bucket,
             &endpoint,
-            file_cache,
+            None,
         )
     }
 
     /// Create Wasabi storage from config
-    /// Endpoint: https://s3.{region}.wasabisys.com
+    #[allow(dead_code)]
     pub fn new_wasabi(config: &S3ProviderConfig) -> Result<Self> {
-        Self::new_wasabi_with_cache(config, None)
-    }
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .or(Some("https://s3.wasabisys.com"))
+            .map(|e| e.to_string())
+            .unwrap();
 
-    /// Create Wasabi with file cache
-    pub fn new_wasabi_with_cache(
-        config: &S3ProviderConfig,
-        file_cache: Option<Arc<StorageFileCache>>,
-    ) -> Result<Self> {
-        let endpoint = format!("https://s3.{}.wasabisys.com", config.region);
         Self::new_with_endpoint_and_cache(
             &config.access_key,
             &config.secret,
             &config.region,
             &config.bucket,
             &endpoint,
-            file_cache,
+            None,
         )
     }
 
-    // ========================================================================
-    // DSN-based factory method (legacy support)
-    // ========================================================================
-
-    /// Create from S3 DSN: s3://key:secret@host:port/bucket?region=us-east-1&insecure=true
-    ///
-    /// Supports the following query parameters:
-    /// - region: AWS region (default: us-east-1)
-    /// - insecure: Use HTTP instead of HTTPS (default: false)
-    /// - url: Custom endpoint URL (overrides host/port)
-    pub fn from_dsn(dsn: &str) -> Result<Self> {
-        Self::from_dsn_with_cache(dsn, None)
-    }
-
-    /// Create from S3 DSN with file cache
-    pub fn from_dsn_with_cache(
-        dsn: &str,
-        file_cache: Option<Arc<StorageFileCache>>,
-    ) -> Result<Self> {
-        let url = Url::parse(dsn)
-            .map_err(|e| ExecutorError::Storage(format!("Invalid S3 DSN: {}", e)))?;
-
-        let access_key = url.username();
-        let secret_key = url.password().unwrap_or("");
-        let host = url
-            .host_str()
-            .ok_or_else(|| ExecutorError::Storage("S3 DSN missing host".to_string()))?;
-        let port = url.port().unwrap_or(443);
-
-        // Extract bucket name from path (first segment)
-        let bucket_name = url
-            .path_segments()
-            .and_then(|mut s| s.next())
-            .ok_or_else(|| ExecutorError::Storage("S3 DSN missing bucket name".to_string()))?;
-
-        // Extract query parameters
-        let mut region_name = "us-east-1".to_string();
-        let mut insecure = false;
-        let mut custom_url = None;
-
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "region" => region_name = value.to_string(),
-                "insecure" => insecure = value.eq_ignore_ascii_case("true"),
-                "url" => custom_url = Some(value.to_string()),
-                _ => {} // Ignore unknown parameters
-            }
-        }
-
-        // Determine endpoint
-        let endpoint = if let Some(url) = custom_url {
-            url
-        } else {
-            let scheme = if insecure { "http" } else { "https" };
-            format!("{}://{}:{}", scheme, host, port)
-        };
-
-        let region = Region::Custom {
-            region: region_name,
-            endpoint: endpoint.clone(),
-        };
-
-        let credentials = Credentials::new(Some(access_key), Some(secret_key), None, None, None)
-            .map_err(|e| ExecutorError::Storage(format!("Invalid S3 credentials: {}", e)))?;
-
-        let bucket = Bucket::new(bucket_name, region, credentials)
-            .map_err(|e| {
-                ExecutorError::Storage(format!(
-                    "Failed to create S3 bucket '{}' at {}: {}",
-                    bucket_name, endpoint, e
-                ))
-            })?
-            .with_path_style();
-
-        debug!(
-            "Created S3 storage for bucket '{}' at {} (insecure: {})",
-            bucket_name, endpoint, insecure
-        );
-
-        Ok(Self { bucket, file_cache })
-    }
-
-    /// Get the underlying bucket (for testing/debugging)
+    /// Parse S3 DSN and create storage
     #[allow(dead_code)]
-    pub fn bucket(&self) -> &Bucket {
-        &self.bucket
-    }
-}
+    pub fn from_dsn(dsn: &str) -> Result<Self> {
+        // Format: s3://access_key:secret@endpoint/bucket
+        let without_prefix = dsn.strip_prefix("s3://").unwrap_or(dsn);
 
-/// Check if an S3 error indicates the object doesn't exist
-fn is_not_found_error(err: &s3::error::S3Error) -> bool {
-    // S3 errors that indicate the object doesn't exist
-    // HttpFailWithBody contains (status_code, body)
-    if let s3::error::S3Error::HttpFailWithBody(status, _) = err {
-        return *status == 404;
+        // Split at @ to get credentials and rest
+        let (creds_part, rest) = without_prefix
+            .split_once('@')
+            .ok_or_else(|| ExecutorError::Storage("Invalid S3 DSN format".to_string()))?;
+
+        let (access_key, secret) = creds_part
+            .split_once(':')
+            .ok_or_else(|| ExecutorError::Storage("Invalid S3 credentials format".to_string()))?;
+
+        // Parse endpoint and bucket from rest
+        // Format: endpoint/bucket or endpoint:port/bucket
+        let (endpoint, bucket) = rest
+            .split_once('/')
+            .ok_or_else(|| ExecutorError::Storage("Invalid S3 bucket format".to_string()))?;
+
+        Self::new_with_endpoint_and_cache(access_key, secret, "us-east-1", bucket, endpoint, None)
     }
-    false
 }
 
 #[async_trait]
 impl Storage for S3Storage {
+    async fn read(&self, path: &str) -> Result<Vec<u8>> {
+        let s3_key = self.get_s3_key(path);
+        self.bucket
+            .get_object(s3_key)
+            .await
+            .map_err(|e| {
+                ExecutorError::Storage(format!("S3 get_object failed for '{}': {}", path, e))
+            })
+            .map(|response| response.to_vec())
+    }
+
+    async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        let s3_key = self.get_s3_key(path);
+        self.bucket.put_object(s3_key, data).await.map_err(|e| {
+            ExecutorError::Storage(format!("S3 put_object failed for '{}': {}", path, e))
+        })?;
+        Ok(())
+    }
+
     async fn exists(&self, path: &str) -> Result<bool> {
-        match self.bucket.head_object(path).await {
+        let s3_key = self.get_s3_key(path);
+        match self.bucket.head_object(s3_key).await {
             Ok(_) => Ok(true),
-            Err(ref e) if is_not_found_error(e) => Ok(false),
+            Err(e) if is_not_found_error(&e) => Ok(false),
             Err(e) => Err(ExecutorError::Storage(format!(
-                "S3 head_object failed for '{}': {}",
+                "Failed to check if object exists '{}': {}",
                 path, e
             ))),
         }
     }
 
-    async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let response = self.bucket.get_object(path).await.map_err(|e| {
-            ExecutorError::Storage(format!("S3 get_object failed for '{}': {}", path, e))
+    async fn upload(&self, local_path: &str, remote_path: &str) -> Result<()> {
+        let data = fs::read(local_path).await.map_err(|e| {
+            ExecutorError::Storage(format!("Failed to read local file '{}': {}", local_path, e))
         })?;
 
-        Ok(response.to_vec())
-    }
-
-    async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
-        self.bucket.put_object(path, data).await.map_err(|e| {
-            ExecutorError::Storage(format!("S3 put_object failed for '{}': {}", path, e))
+        let s3_key = self.get_s3_key(remote_path);
+        self.bucket.put_object(s3_key, &data).await.map_err(|e| {
+            ExecutorError::Storage(format!("S3 put_object failed for '{}': {}", remote_path, e))
         })?;
 
         Ok(())
-    }
-
-    async fn delete(&self, path: &str) -> Result<()> {
-        self.bucket.delete_object(path).await.map_err(|e| {
-            ExecutorError::Storage(format!("S3 delete_object failed for '{}': {}", path, e))
-        })?;
-
-        Ok(())
-    }
-
-    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let results = self
-            .bucket
-            .list(prefix.to_string(), None)
-            .await
-            .map_err(|e| {
-                ExecutorError::Storage(format!("S3 list failed for prefix '{}': {}", prefix, e))
-            })?;
-
-        let mut keys = Vec::new();
-        for result in results {
-            for object in result.contents {
-                keys.push(object.key);
-            }
-        }
-
-        Ok(keys)
-    }
-
-    async fn size(&self, path: &str) -> Result<u64> {
-        let (head, _) = self.bucket.head_object(path).await.map_err(|e| {
-            ExecutorError::Storage(format!("S3 head_object failed for '{}': {}", path, e))
-        })?;
-
-        Ok(head.content_length.unwrap_or(0) as u64)
     }
 
     async fn download(&self, remote_path: &str, local_path: &str) -> Result<()> {
-        // If file cache is enabled, try to use it
-        if let Some(ref cache) = self.file_cache {
-            // Check if we have a cached version
-            if cache.exists(remote_path).await {
-                debug!("Using cached file for: {}", remote_path);
-
-                let remote_path_clone = remote_path.to_string();
-                let bucket = self.bucket.clone();
-                let cache_path = cache
-                    .get_or_fetch(remote_path, move || {
-                        let remote_path = remote_path_clone.clone();
-                        let bucket = bucket.clone();
-                        async move {
-                            bucket
-                                .get_object(&remote_path)
-                                .await
-                                .map_err(|e| {
-                                    ExecutorError::Storage(format!(
-                                        "S3 get_object failed for '{}': {}",
-                                        remote_path, e
-                                    ))
-                                })
-                                .map(|r| r.to_vec())
-                        }
-                    })
-                    .await?;
-
-                // Copy from cache to local path
-                fs::copy(&cache_path, local_path).await.map_err(|e| {
-                    ExecutorError::Storage(format!(
-                        "Failed to copy cached file to '{}': {}",
-                        local_path, e
-                    ))
-                })?;
-
-                return Ok(());
-            }
-
-            // Not cached, fetch and cache
-            debug!("Fetching and caching: {}", remote_path);
-
-            let data = self
-                .bucket
-                .get_object(remote_path)
-                .await
-                .map_err(|e| {
-                    ExecutorError::Storage(format!(
-                        "S3 get_object failed for '{}': {}",
-                        remote_path, e
-                    ))
-                })?
-                .to_vec();
-
-            // Cache the data
-            cache.put(remote_path, &data).await?;
-
-            // Write to local path
-            if let Some(parent) = Path::new(local_path).parent() {
-                fs::create_dir_all(parent).await.map_err(|e| {
-                    ExecutorError::Storage(format!("Failed to create local directory: {}", e))
-                })?;
-            }
-
-            fs::write(local_path, &data).await.map_err(|e| {
-                ExecutorError::Storage(format!(
-                    "Failed to write local file '{}': {}",
-                    local_path, e
-                ))
-            })?;
-
-            return Ok(());
-        }
-
-        // No cache - direct download
-        let data = self
-            .bucket
-            .get_object(remote_path)
-            .await
-            .map_err(|e| {
-                ExecutorError::Storage(format!("S3 get_object failed for '{}': {}", remote_path, e))
-            })?
-            .to_vec();
+        tracing::info!("Downloading from S3: {}", remote_path);
 
         if let Some(parent) = Path::new(local_path).parent() {
             fs::create_dir_all(parent).await.map_err(|e| {
@@ -450,33 +337,116 @@ impl Storage for S3Storage {
             })?;
         }
 
+        // First try to use cache if available
+        if let Some(ref cache) = self.file_cache {
+            if cache.exists(remote_path).await {
+                tracing::info!("Cache hit for {}, using cached file", remote_path);
+                // Copy from cache to local path
+                let (cache_file, _) = cache.get_cache_path(remote_path);
+                if cache_file.exists() {
+                    fs::copy(&cache_file, local_path).await.map_err(|e| {
+                        ExecutorError::Storage(format!(
+                            "Failed to copy cached file to '{}': {}",
+                            local_path, e
+                        ))
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Direct download from S3
+        tracing::info!("Direct download from S3: {}", remote_path);
+
+        let s3_key = self.get_s3_key(remote_path);
+        tracing::debug!("S3 key after stripping bucket prefix: '{}'", s3_key);
+
+        // Use get_object and write bytes manually to avoid issues with get_object_to_writer
+        let data = self
+            .bucket
+            .get_object(s3_key)
+            .await
+            .map_err(|e| {
+                ExecutorError::Storage(format!(
+                    "S3 get_object failed for '{}' (original: '{}'): {}",
+                    s3_key, remote_path, e
+                ))
+            })?
+            .to_vec();
+
+        // Debug: log first bytes if response is small (likely error XML)
+        if data.len() < 1024 {
+            let preview = String::from_utf8_lossy(&data);
+            tracing::warn!(
+                "S3 response small ({} bytes), possible error: {}",
+                data.len(),
+                preview
+            );
+        }
+
         fs::write(local_path, &data).await.map_err(|e| {
             ExecutorError::Storage(format!(
-                "Failed to write local file '{}': {}",
+                "Failed to write downloaded file to '{}': {}",
                 local_path, e
             ))
+        })?;
+
+        tracing::info!(
+            "Download completed for {} ({} bytes)",
+            remote_path,
+            data.len()
+        );
+
+        // If cache is configured, cache the file
+        if let Some(ref cache) = self.file_cache {
+            let data = fs::read(local_path).await.map_err(|e| {
+                ExecutorError::Storage(format!("Failed to read local file for caching: {}", e))
+            })?;
+            cache.put(remote_path, &data).await.ok();
+        }
+
+        Ok(())
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        let s3_key = self.get_s3_key(path);
+        self.bucket.delete_object(s3_key).await.map_err(|e| {
+            ExecutorError::Storage(format!("S3 delete_object failed for '{}': {}", path, e))
         })?;
 
         Ok(())
     }
 
-    async fn upload(&self, local_path: &str, remote_path: &str) -> Result<()> {
-        let mut file = fs::File::open(local_path).await.map_err(|e| {
-            ExecutorError::Storage(format!("Failed to open local file '{}': {}", local_path, e))
-        })?;
-
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).await.map_err(|e| {
-            ExecutorError::Storage(format!("Failed to read local file '{}': {}", local_path, e))
-        })?;
-
-        self.bucket
-            .put_object(remote_path, &data)
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let s3_key = self.get_s3_key(prefix);
+        let response = self
+            .bucket
+            .list(s3_key.to_string(), Some("/".to_string()))
             .await
             .map_err(|e| {
-                ExecutorError::Storage(format!("S3 put_object failed for '{}': {}", remote_path, e))
+                ExecutorError::Storage(format!("S3 list_objects failed for '{}': {}", prefix, e))
             })?;
 
-        Ok(())
+        let mut keys = Vec::new();
+        for result in response {
+            for object in result.contents {
+                keys.push(object.key.clone());
+            }
+        }
+
+        Ok(keys)
+    }
+
+    async fn size(&self, path: &str) -> Result<u64> {
+        let s3_key = self.get_s3_key(path);
+        let response = self.bucket.head_object(s3_key).await.map_err(|e| {
+            ExecutorError::Storage(format!("S3 head_object failed for '{}': {}", path, e))
+        })?;
+
+        let content_length = response.0.content_length.ok_or_else(|| {
+            ExecutorError::Storage(format!("S3 object '{}' has no content length", path))
+        })?;
+
+        Ok(content_length as u64)
     }
 }
