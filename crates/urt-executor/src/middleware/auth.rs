@@ -82,4 +82,68 @@ mod tests {
         assert!(!constant_time_compare("abc", "abd"));
         assert!(!constant_time_compare("a", "b"));
     }
+
+    // Additional tests for edge cases
+    #[test]
+    fn test_extract_bearer_token_edge_cases() {
+        // Empty token (space after Bearer)
+        assert_eq!(extract_bearer_token(Some("Bearer ")), Some(""));
+
+        // Multiple spaces between Bearer and token
+        assert_eq!(extract_bearer_token(Some("Bearer   token")), Some("token"));
+
+        // Case sensitive "Bearer" prefix
+        assert_eq!(extract_bearer_token(Some("bearer token")), None);
+        assert_eq!(extract_bearer_token(Some("BEARER token")), None);
+
+        // No space after Bearer (must have at least one space)
+        assert_eq!(extract_bearer_token(Some("Bearertoken")), None);
+
+        // Just "Bearer" (no space after) - doesn't start with "Bearer " so None
+        assert_eq!(extract_bearer_token(Some("Bearer")), None);
+
+        // Empty header
+        assert_eq!(extract_bearer_token(Some("")), None);
+
+        // Whitespace only
+        assert_eq!(extract_bearer_token(Some("   ")), None);
+    }
+
+    #[test]
+    fn test_constant_time_compare_edge_cases() {
+        // Same length, all different
+        assert!(!constant_time_compare("abcd", "efgh"));
+
+        // Same prefix, different suffix
+        assert!(!constant_time_compare("test123", "test456"));
+
+        // Numbers
+        assert!(constant_time_compare("12345", "12345"));
+        assert!(!constant_time_compare("12345", "12346"));
+
+        // Special characters
+        assert!(constant_time_compare("a!@#$%", "a!@#$%"));
+        assert!(!constant_time_compare("a!@#$%", "b!@#$%"));
+
+        // Unicode
+        assert!(constant_time_compare("hello", "hello"));
+        assert!(!constant_time_compare("hello", "hellö"));
+
+        // Very long strings
+        let long1 = "a".repeat(1000);
+        let long2 = "a".repeat(1000);
+        let long3 = "a".repeat(999);
+        assert!(constant_time_compare(&long1, &long2));
+        assert!(!constant_time_compare(&long1, &long3));
+    }
+
+    #[test]
+    fn test_constant_time_compare_same_length_check() {
+        // Verify that different length strings are rejected immediately
+        // This is important for timing attack prevention
+        let short = "short";
+        let long = "this_is_longer";
+        assert!(!constant_time_compare(short, long));
+        assert!(!constant_time_compare(long, short));
+    }
 }
