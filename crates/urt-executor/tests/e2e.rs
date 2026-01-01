@@ -57,7 +57,6 @@ fn get_http_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-
 /// Get the path to the test function fixture
 /// Uses TEST_FIXTURES_HOST_PATH env var when running in Docker (host path for mounts),
 /// falls back to CARGO_MANIFEST_DIR for local runs
