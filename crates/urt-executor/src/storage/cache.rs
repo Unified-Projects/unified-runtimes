@@ -359,3 +359,118 @@ impl<S: Storage> BuildCache<S> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::LocalStorage;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_cache_key_format() {
+        let storage = LocalStorage::new();
+        let cache = BuildCache::new(storage, "builds");
+
+        let key = cache.cache_key("node-22", "abc123");
+        assert_eq!(key, "builds/node-22/abc123");
+    }
+
+    #[tokio::test]
+    async fn test_has_cache_empty() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage, "test-cache");
+
+        let has_cache = cache.has_cache("nonexistent/key").await.unwrap();
+        assert!(!has_cache);
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_layers_empty() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage, "test-cache");
+
+        let layers = cache.get_cached_layers("nonexistent/key").await.unwrap();
+        assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cache_key_with_special_chars() {
+        let storage = LocalStorage::new();
+        let cache = BuildCache::new(storage, "builds");
+
+        // Test with various characters
+        let key = cache.cache_key("python-v3.12", "hash-with-dashes");
+        assert!(key.starts_with("builds/python-v3.12/"));
+    }
+
+    #[tokio::test]
+    async fn test_list_runtimes_empty() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage, "test-cache");
+
+        let runtimes = cache.list_runtimes().await.unwrap();
+        assert!(runtimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_runtime_cache_nonexistent() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage, "test-cache");
+
+        let deleted = cache.delete_runtime_cache("nonexistent").await.unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_empty_cache() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage, "test-cache");
+
+        let cleaned = cache.cleanup(1024 * 1024).await.unwrap();
+        assert_eq!(cleaned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_total_size_empty() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage, "test-cache");
+
+        let size = cache.total_size().await.unwrap();
+        assert_eq!(size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_write_and_read() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage.clone(), "test-cache");
+
+        let key = "runtime-1/hash123";
+
+        // Simulate writing a manifest (like cache_layers would do)
+        let manifest = serde_json::json!({
+            "layers": ["layer1.tar.zst", "layer2.tar.zst"],
+            "created": "2024-01-01T00:00:00Z",
+        });
+        let manifest_data = serde_json::to_vec(&manifest).unwrap();
+        storage
+            .write(&format!("{}/manifest.json", key), &manifest_data)
+            .await
+            .unwrap();
+
+        // Now test has_cache and get_cached_layers
+        let has_cache = cache.has_cache(key).await.unwrap();
+        assert!(has_cache);
+
+        let layers = cache.get_cached_layers(key).await.unwrap();
+        assert_eq!(layers.len(), 2);
+        assert!(layers[0].contains("layer1.tar.zst"));
+        assert!(layers[1].contains("layer2.tar.zst"));
+    }
+}

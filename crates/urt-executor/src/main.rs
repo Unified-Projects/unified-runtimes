@@ -24,7 +24,7 @@ use config::ExecutorConfig;
 use docker::DockerManager;
 use routes::{create_router, AppState};
 use runtime::RuntimeRegistry;
-use storage::Storage;
+use storage::{Storage, StorageFileCache};
 
 /// Track active executions for graceful shutdown
 static ACTIVE_EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -125,6 +125,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let storage: Arc<dyn Storage> =
         Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"));
     info!("Storage backend initialized: {:?}", config.storage.device);
+
+    // Initialize file cache for faster cold starts (30 day TTL, 1GB max size)
+    let file_cache = Arc::new(StorageFileCache::new(None, None, None));
+    file_cache
+        .initialize()
+        .await
+        .inspect_err(|e| warn!("Failed to initialize file cache: {}", e))
+        .ok();
+    info!(
+        "Storage file cache initialized at {}",
+        file_cache.cache_dir.display()
+    );
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -231,6 +243,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Serve with graceful shutdown
     let docker_for_shutdown = docker.clone();
+    let file_cache_for_shutdown = file_cache.clone();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -238,12 +251,26 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
             // BLOCK HERE UNTIL DOCKER FINISHES
             docker_for_shutdown.cleanup_managed_containers().await;
+
+            // Clean up file cache on shutdown
+            info!("Cleaning up file cache...");
+            file_cache_for_shutdown
+                .cleanup_all()
+                .await
+                .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))
+                .ok();
         })
         .await?;
 
     info!("Server stopped");
 
-    // Final cleanup is handled by maintenance task
+    // Final cleanup
+    info!("Performing final cleanup...");
+    file_cache
+        .cleanup_all()
+        .await
+        .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))
+        .ok();
 
     Ok(())
 }

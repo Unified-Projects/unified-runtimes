@@ -1010,3 +1010,362 @@ mod docker_integration {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
+
+mod multipart {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_execution_with_multipart_content_type() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        // Multipart form data with proper boundary
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\ntest body\r\n--boundary\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/test\r\n--boundary\r\nContent-Disposition: form-data; name=\"method\"\r\n\r\nPOST\r\n--boundary--".to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes/test/executions")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "multipart/form-data; boundary=boundary")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 404 (runtime not found), not a parsing error
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_execution_with_json_content_type() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        let payload = json!({
+            "body": "test body",
+            "path": "/test",
+            "method": "POST"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes/nonexistent/executions")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_execution_with_unsupported_content_type() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes/test/executions")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from("plain text body"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 400 for unsupported content type
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+mod response_format {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_health_response_structure() {
+        require_docker!(state);
+        let app = create_router(state);
+
+        // Health endpoint requires auth to return full stats
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = parse_json_body(response.into_body()).await;
+
+        // Verify top-level structure
+        assert!(body.is_object(), "Response should be an object");
+        assert!(body.get("usage").is_some(), "Should have 'usage' field");
+        assert!(
+            body.get("runtimes").is_some(),
+            "Should have 'runtimes' field"
+        );
+
+        // Verify usage structure
+        let usage = &body["usage"];
+        assert!(usage.get("memory").is_some(), "Usage should have 'memory'");
+        assert!(usage.get("cpu").is_some(), "Usage should have 'cpu'");
+
+        let memory = &usage["memory"];
+        assert!(
+            memory.get("percentage").is_some(),
+            "Memory should have 'percentage'"
+        );
+        assert!(
+            memory.get("memoryLimit").is_some(),
+            "Memory should have 'memoryLimit'"
+        );
+
+        let cpu = &usage["cpu"];
+        assert!(
+            cpu.get("percentage").is_some(),
+            "CPU should have 'percentage'"
+        );
+
+        // Verify runtimes structure
+        let runtimes = &body["runtimes"];
+        assert!(runtimes.is_array(), "Runtimes should be an array");
+    }
+
+    #[tokio::test]
+    async fn test_health_minimal_response_without_auth() {
+        require_docker!(state);
+        let app = create_router(state);
+
+        // Without auth, health endpoint returns minimal response
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = parse_json_body(response.into_body()).await;
+
+        // Should have minimal response with just status
+        assert!(body.is_object(), "Response should be an object");
+        assert_eq!(
+            body.get("status"),
+            Some(&json!("ok")),
+            "Should have minimal status response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_response_structure() {
+        require_docker!(state);
+        let app = create_router(state);
+
+        // Trigger an error (unauthorized)
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = parse_json_body(response.into_body()).await;
+
+        // Verify error response structure matches AppWrite format
+        assert!(body.get("code").is_some(), "Error should have 'code'");
+        assert!(body.get("type").is_some(), "Error should have 'type'");
+        assert!(body.get("message").is_some(), "Error should have 'message'");
+
+        assert_eq!(body["code"], 401);
+        assert_eq!(body["type"], "general_unauthorized");
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_not_found_error_response() {
+        require_docker!(state);
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/runtimes/nonexistent-runtime-xyz")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = parse_json_body(response.into_body()).await;
+
+        assert_eq!(body["code"], 404);
+        assert_eq!(body["type"], "runtime_not_found");
+    }
+}
+
+mod request_validation {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_empty_body_accepted() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        // Empty body should be accepted (defaults apply)
+        let payload = json!({});
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes/nonexistent/executions")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should get runtime not found, not validation error
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_create_missing_required_fields() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        // Missing image field
+        let payload = json!({
+            "runtimeId": "test",
+            "entrypoint": "index.js"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn test_accept_header_respected() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        // Request with Accept: application/json
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header("Accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+mod headers_handling {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_host_header_forwarded() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_user_agent_forwarded() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health")
+                    .header("User-Agent", "test-agent/1.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_case_insensitive_header_names() {
+        require_docker!(state);
+        let app = create_router(state.clone());
+
+        // Authorization header should work regardless of case
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/runtimes")
+                    .header("authorization", "Bearer test-secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

@@ -243,4 +243,168 @@ mod tests {
         storage.write("exists.txt", b"data").await.unwrap();
         assert!(storage.exists("exists.txt").await.unwrap());
     }
+
+    #[tokio::test]
+    async fn test_delete_file() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        storage.write("to_delete.txt", b"data").await.unwrap();
+        assert!(storage.exists("to_delete.txt").await.unwrap());
+
+        storage.delete("to_delete.txt").await.unwrap();
+        assert!(!storage.exists("to_delete.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        storage.write("subdir/file1.txt", b"data1").await.unwrap();
+        storage.write("subdir/file2.txt", b"data2").await.unwrap();
+        assert!(storage.exists("subdir").await.unwrap());
+        assert!(storage.exists("subdir/file1.txt").await.unwrap());
+
+        storage.delete("subdir").await.unwrap();
+        assert!(!storage.exists("subdir").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_list() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        storage.write("file1.txt", b"data1").await.unwrap();
+        storage.write("file2.txt", b"data2").await.unwrap();
+        storage.write("subdir/file3.txt", b"data3").await.unwrap();
+
+        let files = storage.list("").await.unwrap();
+        assert!(files.contains(&"file1.txt".to_string()));
+        assert!(files.contains(&"file2.txt".to_string()));
+        // Note: list with empty prefix may or may not include subdir entries depending on implementation
+    }
+
+    #[tokio::test]
+    async fn test_list_empty_directory() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        let files = storage.list("nonexistent").await.unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_size() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        let data = b"hello world";
+        storage.write("data.bin", data).await.unwrap();
+
+        // Verify file exists first
+        assert!(storage.exists("data.bin").await.unwrap());
+
+        let size = storage.size("data.bin").await.unwrap();
+        // "hello world" is 11 bytes
+        assert_eq!(
+            size,
+            data.len() as u64,
+            "File size should match data length"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_creates_parent_dirs() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        storage
+            .write("deep/nested/path/file.txt", b"data")
+            .await
+            .unwrap();
+        assert!(storage.exists("deep/nested/path/file.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_upload_download() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        // Create a local file in a temporary location
+        let temp_dir = tempdir().unwrap();
+        let local_file = temp_dir.path().join("upload_me.txt");
+        std::fs::write(&local_file, b"upload test content").unwrap();
+
+        // Upload to storage
+        storage
+            .upload(local_file.to_str().unwrap(), "uploaded.txt")
+            .await
+            .unwrap();
+
+        // Verify it's there
+        assert!(storage.exists("uploaded.txt").await.unwrap());
+
+        // Download to another location
+        let download_path = temp_dir.path().join("downloaded.txt");
+        storage
+            .download("uploaded.txt", download_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Verify content
+        let content = std::fs::read(&download_path).unwrap();
+        assert_eq!(content, b"upload test content");
+    }
+
+    #[tokio::test]
+    async fn test_full_path_absolute() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        // Absolute paths should not be prefixed
+        let absolute_path = dir
+            .path()
+            .join("absolute.txt")
+            .to_str()
+            .unwrap()
+            .to_string();
+        storage.write(&absolute_path, b"data").await.unwrap();
+        assert!(storage.exists(&absolute_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_read_nonexistent_file() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        let result = storage.read("nonexistent.txt").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_read_binary() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        // Test binary data with null bytes
+        let binary_data = b"\x00\x01\x02\xff\xfe\xfd";
+        storage.write("binary.bin", binary_data).await.unwrap();
+        let read_data = storage.read("binary.bin").await.unwrap();
+        assert_eq!(read_data, binary_data);
+    }
+
+    #[tokio::test]
+    async fn test_write_large_data() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        // Create 1MB of data
+        let large_data: Vec<u8> = (0..=255u8).cycle().take(1024 * 1024).collect();
+        storage.write("large.bin", &large_data).await.unwrap();
+
+        let read_data = storage.read("large.bin").await.unwrap();
+        assert_eq!(read_data.len(), 1024 * 1024);
+        assert_eq!(read_data, large_data);
+    }
 }

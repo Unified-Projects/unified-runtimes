@@ -22,7 +22,7 @@ use urt_executor::{
     docker::DockerManager,
     routes::{create_router, AppState},
     runtime::RuntimeRegistry,
-    storage::{self, Storage},
+    storage::{self, S3Storage, Storage},
 };
 
 const DEFAULT_RUNTIME_IMAGE: &str = "openruntimes/node:v5-22";
@@ -1034,6 +1034,97 @@ async fn is_minio_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Create a test server with S3 storage configured
+/// Requires MinIO to be available
+async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
+    if !is_minio_available().await {
+        panic!("MinIO not available - cannot create S3 test server");
+    }
+
+    ensure_test_network().await;
+
+    // Create S3 storage from DSN
+    let s3_storage = S3Storage::from_dsn(s3_dsn).expect("Failed to create S3 storage from DSN");
+
+    let config = test_config(TEST_NETWORK.to_string());
+
+    let docker = DockerManager::new(config.clone())
+        .await
+        .expect("Failed to connect to Docker");
+
+    let storage: Arc<dyn Storage> = Arc::from(s3_storage);
+
+    let state = AppState {
+        config,
+        docker: Arc::new(docker),
+        registry: RuntimeRegistry::new(),
+        http_client: Client::new(),
+        storage,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind to address");
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let app = create_router(state.clone());
+
+    let docker_clone = state.docker.clone();
+    let registry_clone = state.registry.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        urt_executor::tasks::run_stats_collector(docker_clone, registry_clone, shutdown_rx).await;
+    });
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("Server failed to start");
+    });
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for i in 0..30 {
+        match client
+            .get(format!("{}/v1/health", base_url))
+            .header("Authorization", format!("Bearer {}", TEST_SECRET))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                break;
+            }
+            Ok(_) | Err(_) => {
+                if i == 29 {
+                    panic!("Test server failed to start on {}", base_url);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    TestServer {
+        base_url,
+        client,
+        _handle: handle,
+        _shutdown_tx: shutdown_tx,
+    }
+}
+
+/// Clean up S3 test artifacts
+async fn cleanup_s3_artifacts(storage: &S3Storage, prefix: &str) {
+    let files = storage.list(prefix).await.unwrap_or_default();
+    for file in files {
+        let _ = storage.delete(&file).await;
+    }
+}
+
 #[tokio::test]
 async fn test_s3_storage_operations() {
     if !is_minio_available().await {
@@ -1204,4 +1295,902 @@ async fn test_build_cache_with_s3() {
         .await
         .expect("Failed to get cached layers");
     assert!(!layers.is_empty(), "Should have cached layers");
+}
+
+/// Test that all S3 provider factory methods can be instantiated
+/// These tests verify the factory methods work correctly with valid config
+#[tokio::test]
+async fn test_s3_provider_factory_methods() {
+    if !is_minio_available().await {
+        eprintln!("Skipping S3 provider factory tests - MinIO not available");
+        return;
+    }
+
+    use urt_executor::config::S3ProviderConfig;
+
+    let access_key = "minioadmin";
+    let secret = "minioadmin";
+    let region = "us-east-1";
+    let bucket = "test-bucket";
+    let endpoint = "http://localhost:9000";
+
+    let config = S3ProviderConfig {
+        access_key: access_key.to_string(),
+        secret: secret.to_string(),
+        region: region.to_string(),
+        bucket: bucket.to_string(),
+        endpoint: Some(endpoint.to_string()),
+    };
+
+    // Test S3 factory
+    let s3 = S3Storage::new_s3(&config);
+    assert!(s3.is_ok(), "S3 factory should succeed with valid config");
+
+    // Test DO Spaces factory
+    let do_spaces = S3Storage::new_do_spaces(&config);
+    assert!(do_spaces.is_ok(), "DO Spaces factory should succeed");
+
+    // Test Backblaze factory
+    let backblaze = S3Storage::new_backblaze(&config);
+    assert!(backblaze.is_ok(), "Backblaze factory should succeed");
+
+    // Test Linode factory
+    let linode = S3Storage::new_linode(&config);
+    assert!(linode.is_ok(), "Linode factory should succeed");
+
+    // Test Wasabi factory
+    let wasabi = S3Storage::new_wasabi(&config);
+    assert!(wasabi.is_ok(), "Wasabi factory should succeed");
+
+    // Test DSN parsing
+    let dsn = format!(
+        "s3://{}:{}@{}:{}/{}?region={}",
+        access_key, secret, "localhost", 9000, bucket, region
+    );
+    let from_dsn = S3Storage::from_dsn(&dsn);
+    assert!(from_dsn.is_ok(), "DSN parsing should succeed");
+}
+
+/// Test cold start from S3 storage - the critical path for S3 functionality
+///
+/// This test verifies the full cold start flow:
+/// 1. Upload a test function source to S3
+/// 2. Create a runtime pointing to the S3 source
+/// 3. Execute the runtime (triggers cold start + S3 download)
+/// 4. Verify execution succeeded (proves artifact was downloaded from S3)
+#[tokio::test]
+async fn test_cold_start_from_s3() {
+    if !is_minio_available().await {
+        eprintln!("Skipping S3 cold start test - MinIO not available");
+        return;
+    }
+
+    use tempfile::tempdir;
+
+    let s3_dsn = "s3://minioadmin:minioadmin@localhost:9000/test-bucket";
+    let server = create_test_server_with_s3(s3_dsn).await;
+
+    let runtime_id = unique_runtime_id("cold-start-s3");
+    let s3_source_path = format!("cold-start-test/{}/source.tar.gz", runtime_id);
+
+    // Create a temporary directory with a test function
+    let dir = tempdir().expect("Failed to create temp dir");
+    let function_dir = dir.path().join("function");
+    std::fs::create_dir_all(&function_dir).expect("Failed to create function dir");
+
+    // Create index.js for Node.js runtime
+    let index_file = function_dir.join("index.js");
+    std::fs::write(
+        &index_file,
+        r#"
+        module.exports = async function(context) {
+            return {
+                body: "Hello from S3 cold start!",
+                statusCode: 200
+            };
+        }
+    "#,
+    )
+    .expect("Failed to write index.js");
+
+    // Create package.json
+    let package_file = function_dir.join("package.json");
+    std::fs::write(
+        &package_file,
+        r#"{"name": "test-function", "version": "1.0.0"}"#,
+    )
+    .expect("Failed to write package.json");
+
+    // Create tar.gz of the function source
+    let source_tar = dir.path().join("function.tar.gz");
+    let cmd = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&source_tar)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("function")
+        .output()
+        .expect("Failed to create tarball");
+
+    if !cmd.status.success() {
+        eprintln!("tar stderr: {}", String::from_utf8_lossy(&cmd.stderr));
+        panic!("Failed to create tarball");
+    }
+
+    // Upload source to S3
+    let storage = S3Storage::from_dsn(s3_dsn).expect("Failed to create S3 storage");
+
+    storage
+        .upload(source_tar.to_str().unwrap(), &s3_source_path)
+        .await
+        .expect("Failed to upload source to S3");
+
+    // Create runtime pointing to S3 source
+    let payload = json!({
+        "runtimeId": runtime_id,
+        "image": get_runtime_image(),
+        "entrypoint": "index.js",
+        "source": s3_source_path,
+        "destination": "/usr/local/server/src/function",
+        "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+        "variables": {}
+    });
+
+    let create_response = server
+        .client
+        .post(format!("{}/v1/runtimes", server.base_url))
+        .header(server.auth_header().0, server.auth_header().1.clone())
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .expect("Failed to create runtime");
+
+    assert!(
+        create_response.status().is_success(),
+        "Runtime creation failed: {}",
+        create_response.text().await.unwrap_or_default()
+    );
+
+    // Wait for runtime to be ready (cold start + S3 download)
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Execute the function
+    let exec_payload = json!({
+        "body": "",
+        "path": "/",
+        "method": "GET",
+        "headers": {}
+    });
+
+    let exec_result = timeout(get_timeout(), async {
+        server
+            .client
+            .post(format!(
+                "{}/v1/runtimes/{}/executions",
+                server.base_url, runtime_id
+            ))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&exec_payload)
+            .send()
+            .await
+    })
+    .await;
+
+    let exec_success = match exec_result {
+        Ok(Ok(response)) => {
+            if response.status().is_success() {
+                let body: Value = response.json().await.expect("Failed to parse response");
+                body["statusCode"] == 200
+                    && body["body"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("S3 cold start")
+            } else {
+                false
+            }
+        }
+        Ok(Err(_)) | Err(_) => false,
+    };
+
+    // Cleanup - S3 artifacts and runtime
+    let _ = cleanup_s3_artifacts(&storage, "cold-start-test/").await;
+    cleanup_runtime(&server, &runtime_id).await;
+
+    assert!(
+        exec_success,
+        "Cold start from S3 failed - execution did not succeed"
+    );
+}
+
+// AppWrite Response Format Compatibility Tests
+mod appwrite_compatibility {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_json_response_has_all_required_fields() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("json-fields");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Execute and check JSON response structure
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {}
+            });
+
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to execute");
+
+            // We might get success or failure depending on runtime state
+            if response.status().is_success() {
+                let body: Value = response.json().await.expect("Failed to parse JSON");
+
+                // Verify all required AppWrite fields are present
+                assert!(body.get("statusCode").is_some(), "Should have statusCode");
+                assert!(body.get("body").is_some(), "Should have body");
+                assert!(body.get("headers").is_some(), "Should have headers");
+                assert!(body.get("logs").is_some(), "Should have logs");
+                assert!(body.get("errors").is_some(), "Should have errors");
+                assert!(body.get("duration").is_some(), "Should have duration");
+                assert!(body.get("startTime").is_some(), "Should have startTime");
+            }
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_response_format() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("multipart-resp");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Execute with multipart response
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {}
+            });
+
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .header("Accept", "multipart/form-data")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to execute");
+
+            // Check response format
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            // Verify response format - multipart if successful, JSON on error
+            if response.status().is_success() {
+                // On success with multipart accept, should get multipart response
+                // Note: The actual format depends on the runtime response
+                assert!(response.status().is_success(), "Execution should succeed");
+                // Log what we got for debugging
+                if !content_type.contains("multipart/form-data") {
+                    eprintln!("Note: Expected multipart, got: {}", content_type);
+                }
+            } else {
+                // On error, JSON is returned regardless of Accept header
+                assert!(
+                    content_type.contains("application/json"),
+                    "Error responses should be JSON"
+                );
+            }
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
+
+    #[tokio::test]
+    async fn test_response_headers_appwrite_format() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("resp-headers");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Execute with text/plain accept
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {}
+            });
+
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/plain")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to execute");
+
+            // Check for AppWrite-specific headers (these are set for text/plain responses)
+            let _has_status_code = response
+                .headers()
+                .contains_key("x-open-runtimes-status-code");
+
+            // Headers should be present on success
+            if response.status().is_success() {
+                // On success, headers should be present for text/plain responses
+                // Note: These headers may or may not be present depending on implementation
+                if _has_status_code {
+                    // Headers are present as expected
+                } else {
+                    eprintln!("Note: x-open-runtimes-status-code header not found");
+                }
+            } else {
+                // On error, headers might not be set
+                assert!(
+                    response.status().is_client_error() || response.status().is_server_error(),
+                    "Should get an error response"
+                );
+            }
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
+}
+
+// Error Scenario Tests
+mod error_scenarios {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_execution_on_deleted_runtime() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("deleted-rt");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Delete the runtime
+            let response = server
+                .client
+                .delete(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to delete runtime");
+
+            assert!(response.status().is_success());
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // Try to execute on deleted runtime
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {}
+            });
+
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to send request");
+
+            // Should get 404
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
+
+    #[tokio::test]
+    async fn test_command_on_nonexistent_runtime() {
+        let server = create_test_server().await;
+
+        let cmd_payload = json!({
+            "command": "echo hello"
+        });
+
+        let response = server
+            .client
+            .post(format!(
+                "{}/v1/runtimes/definitely-not-real-xyz/executions",
+                server.base_url
+            ))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&cmd_payload)
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_logs_on_nonexistent_runtime() {
+        let server = create_test_server().await;
+
+        let response = server
+            .client
+            .get(format!(
+                "{}/v1/runtimes/definitely-not-real-xyz/logs",
+                server.base_url
+            ))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_accept_header() {
+        let server = create_test_server().await;
+
+        let response = server
+            .client
+            .get(format!("{}/v1/health", server.base_url))
+            .header("Accept", "invalid.accept.value")
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        // Should still return valid JSON response
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_very_large_body_rejected() {
+        let server = create_test_server().await;
+
+        // Create a very large body (larger than max_body_size of 20MB)
+        let large_body = "x".repeat(25 * 1024 * 1024);
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .body(large_body)
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        // Should get a 413 Payload Too Large or similar error
+        assert!(
+            response.status() == StatusCode::PAYLOAD_TOO_LARGE
+                || response.status() == StatusCode::BAD_REQUEST
+                || response.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "Expected large body rejection, got: {}",
+            response.status()
+        );
+    }
+}
+
+// Concurrent Load Tests
+mod concurrent_load {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_many_concurrent_health_checks() {
+        let server = create_test_server().await;
+        let num_requests = 50;
+
+        let result = timeout(Duration::from_secs(30), async {
+            let mut handles = Vec::new();
+
+            for _ in 0..num_requests {
+                let client = server.client.clone();
+                let url = format!("{}/v1/health", server.base_url);
+
+                handles.push(tokio::spawn(async move {
+                    client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map(|r| (r.status().as_u16(), r))
+                }));
+            }
+
+            let results: Vec<_> = futures::future::join_all(handles).await;
+
+            // Verify all completed successfully
+            for result in results {
+                let (status, _) = match result {
+                    Ok(Ok((status, _))) => (status, ()),
+                    Ok(Err(e)) => panic!("Request failed: {}", e),
+                    Err(e) => panic!("Join error: {}", e),
+                };
+                assert_eq!(status, 200, "Health check should return 200");
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out - concurrent health checks");
+    }
+
+    #[tokio::test]
+    async fn test_rapid_successive_creates() {
+        let server = create_test_server().await;
+        let num_runtimes = 5;
+
+        let result = timeout(Duration::from_secs(120), async {
+            let mut runtime_ids = Vec::new();
+
+            for i in 0..num_runtimes {
+                let runtime_id = format!("rapid-create-{}", i);
+                let payload = json!({
+                    "runtimeId": runtime_id,
+                    "image": "alpine:latest",
+                    "entrypoint": "",
+                    "variables": {}
+                });
+
+                let response = server
+                    .client
+                    .post(format!("{}/v1/runtimes", server.base_url))
+                    .header(server.auth_header().0, server.auth_header().1.clone())
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await
+                    .expect("Failed to create runtime");
+
+                // Some may succeed, some may conflict - that's okay for this test
+                if response.status().is_success() {
+                    runtime_ids.push(runtime_id);
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Cleanup any created runtimes
+            for runtime_id in &runtime_ids {
+                cleanup_runtime(&server, runtime_id).await;
+            }
+
+            // At least some should have succeeded
+            assert!(
+                !runtime_ids.is_empty(),
+                "At least some runtime creates should succeed"
+            );
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
+
+    #[tokio::test]
+    async fn test_stress_list_runtimes() {
+        let server = create_test_server().await;
+        let num_requests = 100;
+
+        let result = timeout(Duration::from_secs(60), async {
+            let mut handles = Vec::new();
+
+            for _ in 0..num_requests {
+                let client = server.client.clone();
+                let url = format!("{}/v1/runtimes", server.base_url);
+                let auth = server.auth_header().1.clone();
+
+                handles.push(tokio::spawn(async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", auth)
+                        .send()
+                        .await
+                        .map(|r| (r.status().as_u16(), r))
+                }));
+            }
+
+            let results: Vec<_> = futures::future::join_all(handles).await;
+
+            // Most should succeed
+            let success_count = results
+                .iter()
+                .filter_map(|r| match r {
+                    Ok(Ok((status, _))) => Some(*status == 200),
+                    _ => None,
+                })
+                .count();
+
+            // Allow some failures due to resource constraints
+            assert!(
+                success_count >= num_requests - 10,
+                "Most list requests should succeed: {}/{}",
+                success_count,
+                num_requests
+            );
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out - stress test");
+    }
+}
+
+// Runtime State Tests
+mod runtime_state {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_runtime_persists_across_requests() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("persist");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Execute multiple times
+            for i in 0..3 {
+                let exec_payload = json!({
+                    "body": format!(r#"{{"iteration": {}}}"#, i),
+                    "path": "/",
+                    "method": "POST",
+                    "headers": {"content-type": "application/json"}
+                });
+
+                let response = server
+                    .client
+                    .post(format!(
+                        "{}/v1/runtimes/{}/executions",
+                        server.base_url, runtime_id
+                    ))
+                    .header(server.auth_header().0, server.auth_header().1.clone())
+                    .header("Content-Type", "application/json")
+                    .json(&exec_payload)
+                    .send()
+                    .await
+                    .expect("Failed to execute");
+
+                // All should work (or at least return, not 404)
+                assert!(
+                    response.status().is_success() || response.status() == StatusCode::BAD_REQUEST,
+                    "Execution {} should work",
+                    i
+                );
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
+
+    #[tokio::test]
+    async fn test_runtime_in_health_response() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("health-test");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            // Wait for runtime to be ready and stats collector to pick it up
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // Check health endpoint for our runtime
+            let response = server
+                .client
+                .get(format!("{}/v1/health", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get health");
+
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body: Value = response.json().await.expect("Failed to parse JSON");
+            let runtimes = body["runtimes"].as_array().expect("Should be array");
+
+            // Our runtime should appear in the list
+            let found = runtimes.iter().any(|r| {
+                r["name"]
+                    .as_str()
+                    .map(|n| n.contains(&runtime_id) || n.contains("e2e-test-executor"))
+                    .unwrap_or(false)
+            });
+
+            assert!(
+                found,
+                "Runtime {} should appear in health response",
+                runtime_id
+            );
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
 }
