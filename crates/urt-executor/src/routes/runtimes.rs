@@ -50,6 +50,12 @@ pub struct CreateRuntimeRequest {
     /// Docker CMD to run in the container (e.g., ["node", "/usr/local/server/src/server.js"])
     #[serde(default)]
     pub docker_cmd: Vec<String>,
+    /// Optional keep-alive ID for cleanup protection.
+    /// When set, this runtime is protected from cleanup until a newer
+    /// runtime starts with the same keep_alive_id.
+    /// Fallback: reads URT_KEEP_ALIVE from container's env if not provided.
+    #[serde(default)]
+    pub keep_alive_id: Option<String>,
 }
 
 pub fn default_timeout() -> u32 {
@@ -227,16 +233,40 @@ pub async fn create_runtime(
         req.cpus, req.memory, cpus, memory
     );
 
+    // Determine keep_alive_id: prefer request field, fallback to URT_KEEP_ALIVE env var
+    let keep_alive_id = req.keep_alive_id.clone().or_else(|| {
+        req.variables
+            .to_map()
+            .get("URT_KEEP_ALIVE")
+            .cloned()
+            .filter(|s| !s.is_empty())
+    });
+
     // Create runtime entry
     let runtime = Runtime::new(
         &req.runtime_id,
         &state.config.hostname,
         &req.image,
         &req.version,
+        keep_alive_id.clone(),
     );
 
     // Register as pending
     state.registry.insert(runtime.clone()).await?;
+
+    // Register keep-alive ownership (if applicable)
+    // This also revokes protection from any previous owner with the same ID
+    if let Some(ref ka_id) = keep_alive_id {
+        let previous_owner = state.keep_alive_registry.register(ka_id, &runtime.name);
+        if let Some(prev) = previous_owner {
+            info!(
+                "Keep-alive ID '{}' transferred from {} to {}",
+                ka_id, prev, runtime.name
+            );
+        } else {
+            info!("Keep-alive ID '{}' registered for {}", ka_id, runtime.name);
+        }
+    }
 
     // Build environment variables (convert any JSON values to strings)
     let mut env = req.variables.to_map();
@@ -637,6 +667,9 @@ pub async fn delete_runtime(
 
     info!("Deleting runtime: {}", full_name);
 
+    // Get runtime info before deletion to check keep_alive_id
+    let runtime_info = state.registry.get(&full_name).await;
+
     // DO NOT GUESS THE NAME — ASK DOCKER
     let label = format!("urt.runtime_id={}", runtime_id);
 
@@ -650,6 +683,17 @@ pub async fn delete_runtime(
     // Remove runtime-owned tmp directory
     let tmp_folder = format!("/tmp/{}", full_name);
     tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+
+    // Unregister keep-alive ownership if this runtime had one
+    if let Some(runtime) = runtime_info {
+        if let Some(ref ka_id) = runtime.keep_alive_id {
+            state.keep_alive_registry.unregister(ka_id, &full_name);
+            info!(
+                "Keep-alive ID '{}' unregistered for deleted runtime {}",
+                ka_id, full_name
+            );
+        }
+    }
 
     // Registry is metadata only; remove last (idempotent)
     state.registry.remove(&full_name).await;

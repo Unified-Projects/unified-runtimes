@@ -14,7 +14,7 @@ use urt_executor::{
     config::{ExecutorConfig, StorageConfig},
     docker::DockerManager,
     routes::{create_router, AppState},
-    runtime::RuntimeRegistry,
+    runtime::{KeepAliveRegistry, RuntimeRegistry},
     storage::{self, Storage},
 };
 
@@ -53,6 +53,7 @@ async fn create_test_state() -> Option<AppState> {
         Err(_) => return None,
     };
     let registry = RuntimeRegistry::new();
+    let keep_alive_registry = KeepAliveRegistry::new();
     let http_client = reqwest::Client::new();
     let storage: Arc<dyn Storage> =
         Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"));
@@ -61,6 +62,7 @@ async fn create_test_state() -> Option<AppState> {
         config,
         docker,
         registry,
+        keep_alive_registry,
         http_client,
         storage,
     })

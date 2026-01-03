@@ -28,11 +28,22 @@ pub struct Runtime {
     pub image: String,
     /// Initialization counter
     pub initialised: u8,
+    /// Optional keep-alive ID for cleanup protection.
+    /// When set, this runtime is protected from cleanup as long as it
+    /// owns this ID (i.e., is the newest runtime with this ID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive_id: Option<String>,
 }
 
 impl Runtime {
     /// Create a new runtime in pending state
-    pub fn new(runtime_id: &str, executor_hostname: &str, image: &str, version: &str) -> Self {
+    pub fn new(
+        runtime_id: &str,
+        executor_hostname: &str,
+        image: &str,
+        version: &str,
+        keep_alive_id: Option<String>,
+    ) -> Self {
         let now = Self::unix_timestamp();
 
         // Generate random 16-byte secrets encoded as hex
@@ -55,6 +66,7 @@ impl Runtime {
             listening: 0,
             image: image.to_string(),
             initialised: 0,
+            keep_alive_id,
         }
     }
 
@@ -118,7 +130,7 @@ mod tests {
 
     #[test]
     fn test_new_runtime() {
-        let rt = Runtime::new("test-123", "executor", "node-18", "v5");
+        let rt = Runtime::new("test-123", "executor", "node-18", "v5", None);
 
         assert_eq!(rt.name, "executor-test-123");
         assert_eq!(rt.version, "v5");
@@ -127,11 +139,26 @@ mod tests {
         assert!(!rt.is_running());
         assert_eq!(rt.key.len(), 32); // 16 bytes = 32 hex chars
         assert_eq!(rt.hostname.len(), 32);
+        assert!(rt.keep_alive_id.is_none());
+    }
+
+    #[test]
+    fn test_new_runtime_with_keep_alive() {
+        let rt = Runtime::new(
+            "test-123",
+            "executor",
+            "node-18",
+            "v5",
+            Some("my-service".to_string()),
+        );
+
+        assert_eq!(rt.name, "executor-test-123");
+        assert_eq!(rt.keep_alive_id, Some("my-service".to_string()));
     }
 
     #[test]
     fn test_mark_running() {
-        let mut rt = Runtime::new("test", "exec", "img", "v5");
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
         // Docker inspect returns "running" as the status
         rt.mark_running("running");
 
@@ -142,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_runtime_id() {
-        let rt = Runtime::new("my-func-123", "executor", "img", "v5");
+        let rt = Runtime::new("my-func-123", "executor", "img", "v5", None);
         assert_eq!(rt.runtime_id(), "123");
     }
 }

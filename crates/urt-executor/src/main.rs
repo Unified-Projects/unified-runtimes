@@ -23,7 +23,7 @@ mod tasks;
 use config::ExecutorConfig;
 use docker::DockerManager;
 use routes::{create_router, AppState};
-use runtime::RuntimeRegistry;
+use runtime::{KeepAliveRegistry, RuntimeRegistry};
 use storage::{Storage, StorageFileCache};
 
 /// Track active executions for graceful shutdown
@@ -99,6 +99,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create runtime registry
     let registry = RuntimeRegistry::new();
 
+    // Create keep-alive registry for per-runtime cleanup protection
+    let keep_alive_registry = KeepAliveRegistry::new();
+
     let mut default_headers = reqwest::header::HeaderMap::new();
     // Force no compression, matches curl / Docker.php behavior
     default_headers.insert(
@@ -150,6 +153,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let maintenance_docker = docker.clone();
     let maintenance_registry = registry.clone();
+    let maintenance_keep_alive = keep_alive_registry.clone();
     let maintenance_config = config.clone();
     let maintenance_storage = storage.clone();
     let maintenance_shutdown = shutdown_rx.clone();
@@ -157,6 +161,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         tasks::run_maintenance(
             maintenance_docker,
             maintenance_registry,
+            maintenance_keep_alive,
             maintenance_config,
             maintenance_storage,
             maintenance_shutdown,
@@ -176,6 +181,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         docker: docker.clone(),
         registry: registry.clone(),
+        keep_alive_registry,
         http_client,
         storage,
     };
