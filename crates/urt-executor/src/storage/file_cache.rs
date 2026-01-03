@@ -579,7 +579,7 @@ mod tests {
 
         let cache = StorageFileCache::new(
             Some(&cache_dir),
-            Some(Duration::from_millis(10)), // Very short TTL
+            Some(Duration::from_millis(200)), // Short TTL but long enough to survive initial writes
             Some(1024 * 1024),
         );
         cache.initialize().await.unwrap();
@@ -592,7 +592,8 @@ mod tests {
         assert!(cache.exists(remote_path).await);
 
         // Wait for expiry
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Give enough time for coarse timers (e.g., Windows) to advance past TTL
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Should be expired now
         assert!(!cache.exists(remote_path).await);

@@ -25,7 +25,7 @@ impl LocalStorage {
     }
 
     /// Create a new local storage with a specific base path
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn with_base_path(base_path: &str) -> Self {
         Self {
             base_path: base_path.to_string(),
@@ -33,7 +33,8 @@ impl LocalStorage {
     }
 
     fn full_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
+        // Treat platform absolute paths (including Windows drive/UNC) as already rooted
+        if Path::new(path).is_absolute() {
             path.to_string()
         } else {
             format!("{}/{}", self.base_path, path)
