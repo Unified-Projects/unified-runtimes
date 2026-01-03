@@ -190,20 +190,33 @@ run_integration_tests() {
 }
 
 # Run E2E tests (requires Docker + MinIO)
+# E2E tests MUST run inside Docker for proper network connectivity between containers
 run_e2e_tests() {
-    header "Running E2E Tests"
+    header "Running E2E Tests (Dockerized)"
 
     if ! check_docker; then
         log_skip "Skipping E2E tests (Docker not available)"
         return 0
     fi
 
-    cd "$PROJECT_ROOT"
+    check_docker_compose || {
+        log_skip "Skipping E2E tests (docker-compose not available)"
+        return 0
+    }
 
-    if cargo test -p urt-executor --test e2e -- --test-threads=1 2>&1; then
+    cd "$EXECUTOR_CRATE"
+
+    log_info "Building and running E2E tests inside Docker..."
+    log_info "This ensures proper Docker DNS resolution between containers"
+
+    # Run tests inside Docker using docker-compose
+    # The test-runner container has access to the Docker socket and is on the same network
+    if $COMPOSE_CMD -f "$DOCKER_COMPOSE_FILE" --profile test up --build --abort-on-container-exit --exit-code-from test-runner 2>&1; then
         log_success "All E2E tests passed"
+        $COMPOSE_CMD -f "$DOCKER_COMPOSE_FILE" --profile test down >/dev/null 2>&1 || true
     else
         log_fail "Some E2E tests failed"
+        $COMPOSE_CMD -f "$DOCKER_COMPOSE_FILE" --profile test down >/dev/null 2>&1 || true
         return 1
     fi
 }

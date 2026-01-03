@@ -103,6 +103,8 @@ services:
 
 networks:
   # Use explicit name so tests can reference it without compose prefix
+  # external: true allows reusing an existing network if it was created by a previous run
   e2e-test-network:
     name: e2e-test-network
     driver: bridge
+    external: false

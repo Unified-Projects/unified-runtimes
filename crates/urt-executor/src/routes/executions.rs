@@ -434,13 +434,15 @@ pub async fn create_execution(
 
     // TCP port readiness check (matching executor-main Docker.php:1088-1115)
     // On first execution, wait for the runtime to start listening on port 3000
+    // NOTE: We use runtime.name (container name) for DNS resolution, not runtime.hostname
+    // Docker DNS resolves containers by name, not by internal hostname
     if !runtime.is_listening() {
         debug!(
             "Checking if runtime {} is listening on port 3000",
-            runtime.hostname
+            runtime.name
         );
         let port_timeout = Duration::from_secs(req.timeout as u64);
-        wait_for_port(&runtime.hostname, 3000, port_timeout).await?;
+        wait_for_port(&runtime.name, 3000, port_timeout).await?;
 
         // Mark runtime as listening so we skip this check on subsequent executions
         if let Err(e) = state.registry.set_listening(&full_name).await {
