@@ -2645,10 +2645,7 @@ mod docker_dns_resolution {
 
                     let runtime: Value = runtime_response.json().await.unwrap();
                     let listening = runtime["listening"].as_u64().unwrap_or(0);
-                    assert_eq!(
-                        listening, 1,
-                        "After first execution, listening should be 1"
-                    );
+                    assert_eq!(listening, 1, "After first execution, listening should be 1");
                 }
 
                 tokio::time::sleep(Duration::from_millis(200)).await;

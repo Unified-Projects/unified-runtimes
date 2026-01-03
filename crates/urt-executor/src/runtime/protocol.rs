@@ -404,23 +404,21 @@ pub fn get_protocol(version: &str) -> Box<dyn RuntimeProtocol> {
     }
 }
 
-/// Build the runtime URL for HTTP requests
-/// IMPORTANT: Uses runtime.name (container name) for Docker DNS resolution, NOT runtime.hostname
-#[inline]
-pub fn build_runtime_url(runtime_name: &str, port: u16, path: &str) -> String {
-    format!("http://{}:{}{}", runtime_name, port, path)
-}
-
-/// Build the log file path for a runtime
-/// IMPORTANT: Uses runtime.name (container name) to match the volume mount at /tmp/{name}/
-#[inline]
-pub fn build_log_path(runtime_name: &str, file_id: &str, log_type: &str) -> String {
-    format!("/tmp/{}/logs/{}_{}.log", runtime_name, file_id, log_type)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    /// Build the runtime URL for HTTP requests
+    /// IMPORTANT: Uses runtime.name (container name) for Docker DNS resolution, NOT runtime.hostname
+    #[inline]
+    fn build_runtime_url(runtime_name: &str, port: u16, path: &str) -> String {
+        format!("http://{}:{}{}", runtime_name, port, path)
+    }
+
+    /// Build the log file path for a runtime
+    /// IMPORTANT: Uses runtime.name (container name) to match the volume mount at /tmp/{name}/
+    #[inline]
+    fn build_log_path(runtime_name: &str, file_id: &str, log_type: &str) -> String {
+        format!("/tmp/{}/logs/{}_{}.log", runtime_name, file_id, log_type)
+    }
 
     #[test]
     fn test_build_runtime_url_uses_container_name() {
