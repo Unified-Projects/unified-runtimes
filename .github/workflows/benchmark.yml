@@ -94,14 +94,15 @@ jobs:
                       logs --no-color bench-runner > benchmark_output.txt || true
 
                   # Prefer docker compose cp (works even if the container has exited)
+                  # Note: cargo bench runs with cwd=package root, so file is in /app/crates/urt-executor/
                   docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
-                      cp bench-runner:"/app/${BENCH_OUTPUT_JSON}" "${BENCH_OUTPUT_JSON}" 2>/dev/null || true
+                      cp bench-runner:"/app/crates/urt-executor/${BENCH_OUTPUT_JSON}" "${BENCH_OUTPUT_JSON}" 2>/dev/null || true
 
                   # Fallback: try docker cp via container id
                   if [ ! -f "${BENCH_OUTPUT_JSON}" ]; then
                       BENCH_CONTAINER_ID=$(docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml ps -q bench-runner)
                       if [ -n "$BENCH_CONTAINER_ID" ]; then
-                          docker cp "$BENCH_CONTAINER_ID:/app/${BENCH_OUTPUT_JSON}" "${BENCH_OUTPUT_JSON}" 2>/dev/null || true
+                          docker cp "$BENCH_CONTAINER_ID:/app/crates/urt-executor/${BENCH_OUTPUT_JSON}" "${BENCH_OUTPUT_JSON}" 2>/dev/null || true
                       fi
                   fi
 
