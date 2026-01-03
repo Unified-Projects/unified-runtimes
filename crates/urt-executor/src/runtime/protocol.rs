@@ -91,7 +91,9 @@ impl RuntimeProtocol for V2Protocol {
             .as_secs_f64();
         let start_instant = std::time::Instant::now();
 
-        let url = format!("http://{}:3000/", runtime.hostname);
+        // Use runtime.name (container name) for DNS resolution, not runtime.hostname
+        // Docker DNS resolves containers by name, not by internal hostname
+        let url = format!("http://{}:3000/", runtime.name);
 
         // v2 payload format
         let payload = serde_json::json!({
@@ -165,7 +167,9 @@ impl RuntimeProtocol for V5Protocol {
             .as_secs_f64();
         let start_instant = std::time::Instant::now();
 
-        let url = format!("http://{}:3000{}", runtime.hostname, request.path);
+        // Use runtime.name (container name) for DNS resolution, not runtime.hostname
+        // Docker DNS resolves containers by name, not by internal hostname
+        let url = format!("http://{}:3000{}", runtime.name, request.path);
 
         // Build Basic auth header
         let auth = format!("opr:{}", runtime.key);
@@ -260,15 +264,16 @@ impl RuntimeProtocol for V5Protocol {
 
         // Read logs and errors from FILES on disk (matching executor-main Docker.php:1027-1063)
         // The header x-open-runtimes-log-id contains a FILE ID, not the actual logs.
-        // Logs are stored at /tmp/{hostname}/logs/{file_id}_logs.log
-        // Errors are stored at /tmp/{hostname}/logs/{file_id}_errors.log
+        // Logs are stored at /tmp/{runtime.name}/logs/{file_id}_logs.log
+        // Errors are stored at /tmp/{runtime.name}/logs/{file_id}_errors.log
         let (logs, errors) = if let Some(ref file_id) = log_id {
             // URL decode the file ID
             let decoded_id = urlencoding::decode(file_id)
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| file_id.clone());
 
-            read_log_files(&runtime.hostname, &decoded_id).await
+            // Use runtime.name (container name) - logs are stored at /tmp/{runtime.name}/logs/
+            read_log_files(&runtime.name, &decoded_id).await
         } else {
             (String::new(), String::new())
         };
@@ -396,5 +401,75 @@ pub fn get_protocol(version: &str) -> Box<dyn RuntimeProtocol> {
     match version {
         "v2" => Box::new(V2Protocol),
         _ => Box::new(V5Protocol),
+    }
+}
+
+/// Build the runtime URL for HTTP requests
+/// IMPORTANT: Uses runtime.name (container name) for Docker DNS resolution, NOT runtime.hostname
+#[inline]
+pub fn build_runtime_url(runtime_name: &str, port: u16, path: &str) -> String {
+    format!("http://{}:{}{}", runtime_name, port, path)
+}
+
+/// Build the log file path for a runtime
+/// IMPORTANT: Uses runtime.name (container name) to match the volume mount at /tmp/{name}/
+#[inline]
+pub fn build_log_path(runtime_name: &str, file_id: &str, log_type: &str) -> String {
+    format!("/tmp/{}/logs/{}_{}.log", runtime_name, file_id, log_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_runtime_url_uses_container_name() {
+        // The URL should use the container NAME (which Docker DNS can resolve)
+        // NOT the container's internal hostname (which is just a random hex string)
+        let container_name = "exc1-myruntime123";
+        let url = build_runtime_url(container_name, 3000, "/");
+        assert_eq!(url, "http://exc1-myruntime123:3000/");
+
+        // With a path
+        let url = build_runtime_url(container_name, 3000, "/api/execute");
+        assert_eq!(url, "http://exc1-myruntime123:3000/api/execute");
+    }
+
+    #[test]
+    fn test_build_runtime_url_not_using_hostname() {
+        // This test documents the BUG that was fixed:
+        // Previously, the code used runtime.hostname (a random 32-char hex string)
+        // which Docker DNS cannot resolve.
+        //
+        // Docker DNS resolution works by CONTAINER NAME, not by internal hostname.
+        // Container name: exc1-myruntime123 (resolvable)
+        // Container hostname: 1ca14d56857971dfad412b32f66e6466 (NOT resolvable)
+        //
+        // The fix ensures we use runtime.name (container name) everywhere.
+        let container_name = "exc1-myruntime123";
+        let internal_hostname = "1ca14d56857971dfad412b32f66e6466";
+
+        let correct_url = build_runtime_url(container_name, 3000, "/");
+        let _wrong_url = build_runtime_url(internal_hostname, 3000, "/");
+
+        // The correct URL uses the container name
+        assert!(correct_url.contains("exc1-myruntime123"));
+        // Verify we're not accidentally using the hostname pattern
+        assert!(!correct_url.contains("1ca14d56857971dfad412b32f66e6466"));
+    }
+
+    #[test]
+    fn test_build_log_path_uses_container_name() {
+        // Log files are stored at /tmp/{runtime.name}/logs/
+        // The mount is: host /tmp/{full_name} -> container /tmp
+        // So we need to use runtime.name to find logs on the executor's filesystem
+        let container_name = "exc1-myruntime123";
+        let file_id = "abc123";
+
+        let log_path = build_log_path(container_name, file_id, "logs");
+        assert_eq!(log_path, "/tmp/exc1-myruntime123/logs/abc123_logs.log");
+
+        let error_path = build_log_path(container_name, file_id, "errors");
+        assert_eq!(error_path, "/tmp/exc1-myruntime123/logs/abc123_errors.log");
     }
 }

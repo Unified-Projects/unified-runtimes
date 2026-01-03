@@ -1,5 +1,6 @@
 # Dockerfile for running all tests inside Docker
 # This allows tests to communicate with containers on the Docker network
+# IMPORTANT: E2E tests MUST run inside Docker for proper DNS resolution between containers
 
 FROM rust:latest
 
@@ -16,9 +17,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build tests (excluding benchmarks)
-RUN cargo build --package urt-executor --lib --tests
+# Build all tests including e2e
+RUN cargo build --package urt-executor --tests
 
 # Default: run all tests (unit, integration, e2e) but NOT benchmarks
-# Benchmarks are run separately via the benchmark.yml workflow
-CMD ["cargo", "test", "--package", "urt-executor", "--lib", "--tests", "--", "--test-threads=1"]
+# E2E tests require Docker socket access and network connectivity
+# The test-runner container is on the same Docker network as runtime containers
+CMD ["cargo", "test", "--package", "urt-executor", "--", "--test-threads=1"]

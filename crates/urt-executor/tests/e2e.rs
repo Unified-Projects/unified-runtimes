@@ -2208,3 +2208,701 @@ mod runtime_state {
         assert!(result.is_ok(), "Test timed out");
     }
 }
+
+// Docker DNS Resolution Tests
+// These tests verify that the executor correctly uses container NAMES for DNS resolution,
+// NOT container hostnames. Docker DNS only resolves by container name on user-defined networks.
+mod docker_dns_resolution {
+    use super::*;
+
+    /// Test that execution works via Docker DNS resolution using container NAME.
+    ///
+    /// This test verifies the fix for a critical bug where the executor was using
+    /// `runtime.hostname` (a random 32-char hex string like "1ca14d56857971dfad412b32f66e6466")
+    /// instead of `runtime.name` (the actual container name) for network communication.
+    ///
+    /// Docker DNS only resolves containers by their NAME, not by their internal hostname.
+    /// The hostname is what the container sees as its own hostname, but other containers
+    /// cannot resolve it via DNS.
+    ///
+    /// This test would hang indefinitely with the old broken code because:
+    /// 1. wait_for_port tried to connect to "hostname:3000"
+    /// 2. Docker DNS couldn't resolve the hostname
+    /// 3. TCP connect attempts would fail but keep retrying
+    ///
+    /// With the fix, it uses the container name which Docker DNS can resolve.
+    #[tokio::test]
+    async fn test_execution_uses_container_name_for_dns() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("dns-resolution");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(
+                response.status().is_success(),
+                "Create failed: {:?}",
+                response
+                    .bytes()
+                    .await
+                    .expect("failed to read response body")
+                    .to_vec()
+            );
+
+            // Wait for runtime to be ready
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Get runtime info to verify name vs hostname
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get runtime");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let runtime: Value = response.json().await.expect("Failed to parse JSON");
+
+            // Verify runtime has both name and hostname, and they're DIFFERENT
+            let name = runtime["name"].as_str().expect("Should have name");
+            let hostname = runtime["hostname"].as_str().expect("Should have hostname");
+
+            assert!(
+                name.contains(&runtime_id),
+                "Name should contain runtime_id: {} vs {}",
+                name,
+                runtime_id
+            );
+            assert_ne!(
+                name, hostname,
+                "Name and hostname should be different: name={}, hostname={}",
+                name, hostname
+            );
+            assert_eq!(
+                hostname.len(),
+                32,
+                "Hostname should be a 32-char hex string: {}",
+                hostname
+            );
+
+            // Execute function - this would hang with the old broken code
+            // because Docker DNS can't resolve the hostname, only the name
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {},
+                "timeout": 30
+            });
+
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to execute function");
+
+            // With the fix, execution should complete (success or known error)
+            // Without the fix, this would hang forever waiting for DNS resolution
+            let status = response.status();
+            assert!(
+                status.is_success() || status == StatusCode::BAD_REQUEST,
+                "Execution should complete (not hang): status={}",
+                status
+            );
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Test timed out - this likely means DNS resolution is using hostname instead of name"
+        );
+    }
+
+    /// Test that the timeout parameter is respected during execution.
+    ///
+    /// This test verifies that if a runtime doesn't respond, the request properly
+    /// times out according to the specified timeout parameter.
+    #[tokio::test]
+    async fn test_execution_timeout_is_respected() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("timeout-test");
+
+        let result = timeout(Duration::from_secs(45), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            // Wait for runtime
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Execute with short timeout
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {},
+                "timeout": 10
+            });
+
+            let start = std::time::Instant::now();
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to execute function");
+
+            let elapsed = start.elapsed();
+
+            // Request should complete within timeout + some buffer
+            // If DNS resolution was broken, this would hang forever
+            assert!(
+                elapsed.as_secs() < 30,
+                "Execution should complete within timeout, took {:?}",
+                elapsed
+            );
+
+            // Response received (success or timeout error)
+            let _status = response.status();
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Test timed out - timeout parameter not respected"
+        );
+    }
+
+    /// Test that the `listening` field correctly reflects runtime port availability.
+    ///
+    /// This test verifies:
+    /// 1. Initially `listening` is 0 (runtime not yet listening on port 3000)
+    /// 2. After first successful execution, `listening` becomes 1
+    /// 3. When `listening` is 1, subsequent executions work correctly
+    ///
+    /// The `listening` flag is used to skip the TCP port check on subsequent requests,
+    /// which is an important optimization for warm starts.
+    #[tokio::test]
+    async fn test_listening_flag_reflects_runtime_state() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("listening-flag");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+
+            // Wait for runtime to start
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Check initial listening state - should be 0 before first execution
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get runtime");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let runtime: Value = response.json().await.expect("Failed to parse JSON");
+            let initial_listening = runtime["listening"].as_u64().unwrap_or(99);
+
+            // Initial state should be 0 (not yet verified as listening)
+            assert_eq!(
+                initial_listening, 0,
+                "Runtime should initially have listening=0, got {}",
+                initial_listening
+            );
+
+            // Execute function (this triggers the TCP port check and sets listening=1)
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {},
+                "timeout": 30
+            });
+
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to execute function");
+
+            // Execution should succeed (or at least complete)
+            let first_exec_status = response.status();
+            assert!(
+                first_exec_status.is_success() || first_exec_status == StatusCode::BAD_REQUEST,
+                "First execution should complete: status={}",
+                first_exec_status
+            );
+
+            // Check listening state after first execution - should now be 1
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get runtime");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let runtime: Value = response.json().await.expect("Failed to parse JSON");
+            let after_exec_listening = runtime["listening"].as_u64().unwrap_or(99);
+
+            // After successful execution, listening should be 1
+            assert_eq!(
+                after_exec_listening, 1,
+                "Runtime should have listening=1 after execution, got {}",
+                after_exec_listening
+            );
+
+            // Second execution should also work (using the listening=1 fast path)
+            let response = server
+                .client
+                .post(format!(
+                    "{}/v1/runtimes/{}/executions",
+                    server.base_url, runtime_id
+                ))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&exec_payload)
+                .send()
+                .await
+                .expect("Failed to execute second function");
+
+            let second_exec_status = response.status();
+            assert!(
+                second_exec_status.is_success() || second_exec_status == StatusCode::BAD_REQUEST,
+                "Second execution should complete: status={}",
+                second_exec_status
+            );
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Test timed out - listening flag test failed"
+        );
+    }
+
+    /// Test that when listening=1, we can actually communicate with the runtime.
+    ///
+    /// This is a regression test to ensure that the listening flag is only set
+    /// when the runtime is actually reachable via TCP.
+    #[tokio::test]
+    async fn test_listening_true_means_runtime_is_reachable() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("reachable");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Execute multiple times to ensure consistent behavior
+            let exec_payload = json!({
+                "body": r#"{"test": "data"}"#,
+                "path": "/",
+                "method": "POST",
+                "headers": {"content-type": "application/json"},
+                "timeout": 30
+            });
+
+            let mut successful_executions = 0;
+            for i in 0..5 {
+                let response = server
+                    .client
+                    .post(format!(
+                        "{}/v1/runtimes/{}/executions",
+                        server.base_url, runtime_id
+                    ))
+                    .header(server.auth_header().0, server.auth_header().1.clone())
+                    .header("Content-Type", "application/json")
+                    .json(&exec_payload)
+                    .send()
+                    .await
+                    .expect("Failed to execute function");
+
+                if response.status().is_success() {
+                    successful_executions += 1;
+                }
+
+                // After first execution, listening should be 1
+                if i == 0 {
+                    let runtime_response = server
+                        .client
+                        .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                        .header(server.auth_header().0, server.auth_header().1.clone())
+                        .send()
+                        .await
+                        .expect("Failed to get runtime");
+
+                    let runtime: Value = runtime_response.json().await.unwrap();
+                    let listening = runtime["listening"].as_u64().unwrap_or(0);
+                    assert_eq!(
+                        listening, 1,
+                        "After first execution, listening should be 1"
+                    );
+                }
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            // At least some executions should succeed when runtime is listening
+            assert!(
+                successful_executions >= 1,
+                "At least one execution should succeed when listening=1"
+            );
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out");
+    }
+
+    /// Test execution with keep-alive enabled.
+    ///
+    /// This test verifies that:
+    /// 1. Runtimes with keep-alive work correctly
+    /// 2. DNS resolution uses container name (not hostname) with keep-alive
+    /// 3. The listening flag is correctly maintained across keep-alive executions
+    #[tokio::test]
+    async fn test_execution_with_keepalive() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("keepalive");
+        let keep_alive_id = "test-keepalive-service";
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime with keep-alive
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {},
+                "keepAliveId": keep_alive_id
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(
+                response.status().is_success(),
+                "Create failed: {:?}",
+                response.bytes().await.unwrap_or_default()
+            );
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Verify keep-alive is set on runtime
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get runtime");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let runtime: Value = response.json().await.expect("Failed to parse JSON");
+
+            // Verify name vs hostname are different
+            let name = runtime["name"].as_str().expect("Should have name");
+            let hostname = runtime["hostname"].as_str().expect("Should have hostname");
+            assert_ne!(
+                name, hostname,
+                "Name and hostname should be different for keep-alive runtime"
+            );
+
+            // Verify keep-alive is present (may or may not be exposed in API)
+            let initial_listening = runtime["listening"].as_u64().unwrap_or(99);
+            assert_eq!(initial_listening, 0, "Should start with listening=0");
+
+            // Execute multiple times to test keep-alive behavior
+            let exec_payload = json!({
+                "body": r#"{"keepalive": true}"#,
+                "path": "/",
+                "method": "POST",
+                "headers": {"content-type": "application/json"},
+                "timeout": 30
+            });
+
+            for i in 0..3 {
+                let response = server
+                    .client
+                    .post(format!(
+                        "{}/v1/runtimes/{}/executions",
+                        server.base_url, runtime_id
+                    ))
+                    .header(server.auth_header().0, server.auth_header().1.clone())
+                    .header("Content-Type", "application/json")
+                    .json(&exec_payload)
+                    .send()
+                    .await
+                    .expect("Failed to execute function");
+
+                let status = response.status();
+                assert!(
+                    status.is_success() || status == StatusCode::BAD_REQUEST,
+                    "Keep-alive execution {} should complete: status={}",
+                    i,
+                    status
+                );
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            // Verify listening is now 1
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get runtime");
+
+            let runtime: Value = response.json().await.expect("Failed to parse JSON");
+            let final_listening = runtime["listening"].as_u64().unwrap_or(0);
+            assert_eq!(
+                final_listening, 1,
+                "After executions, listening should be 1"
+            );
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Test timed out - keep-alive execution failed"
+        );
+    }
+
+    /// Test that keep-alive runtimes can be re-used across multiple execution batches.
+    ///
+    /// This simulates real-world usage where a keep-alive runtime is used for multiple
+    /// separate function invocations over time.
+    #[tokio::test]
+    async fn test_keepalive_runtime_reuse() {
+        let server = create_test_server().await;
+        let runtime_id = unique_runtime_id("keepalive-reuse");
+
+        let result = timeout(get_timeout(), async {
+            // Create runtime with keep-alive
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "index.js",
+                "source": get_test_function_path(),
+                "destination": OPENRUNTIMES_FUNCTION_PATH,
+                "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+                "variables": {},
+                "keepAliveId": "reuse-test-service"
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime");
+
+            assert!(response.status().is_success());
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // First batch of executions
+            let exec_payload = json!({
+                "body": "{}",
+                "path": "/",
+                "method": "GET",
+                "headers": {},
+                "timeout": 30
+            });
+
+            for _ in 0..2 {
+                let response = server
+                    .client
+                    .post(format!(
+                        "{}/v1/runtimes/{}/executions",
+                        server.base_url, runtime_id
+                    ))
+                    .header(server.auth_header().0, server.auth_header().1.clone())
+                    .header("Content-Type", "application/json")
+                    .json(&exec_payload)
+                    .send()
+                    .await
+                    .expect("Failed to execute");
+
+                assert!(
+                    response.status().is_success() || response.status() == StatusCode::BAD_REQUEST
+                );
+            }
+
+            // Simulate idle time
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Verify runtime still exists and listening is still 1
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to get runtime");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "Runtime should still exist"
+            );
+            let runtime: Value = response.json().await.expect("Failed to parse JSON");
+            let listening = runtime["listening"].as_u64().unwrap_or(0);
+            assert_eq!(listening, 1, "Listening should still be 1 after idle time");
+
+            // Second batch of executions - should work without re-checking port
+            for _ in 0..2 {
+                let response = server
+                    .client
+                    .post(format!(
+                        "{}/v1/runtimes/{}/executions",
+                        server.base_url, runtime_id
+                    ))
+                    .header(server.auth_header().0, server.auth_header().1.clone())
+                    .header("Content-Type", "application/json")
+                    .json(&exec_payload)
+                    .send()
+                    .await
+                    .expect("Failed to execute second batch");
+
+                assert!(
+                    response.status().is_success() || response.status() == StatusCode::BAD_REQUEST,
+                    "Second batch execution should complete"
+                );
+            }
+
+            cleanup_runtime(&server, &runtime_id).await;
+        })
+        .await;
+
+        assert!(result.is_ok(), "Test timed out - keep-alive reuse failed");
+    }
+}
