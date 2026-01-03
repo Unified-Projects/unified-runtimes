@@ -11,7 +11,7 @@ use crate::config::ExecutorConfig;
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;
 use crate::middleware::{auth::auth_middleware, security_headers_middleware};
-use crate::runtime::RuntimeRegistry;
+use crate::runtime::{KeepAliveRegistry, RuntimeRegistry};
 use crate::storage::Storage;
 use axum::{
     extract::DefaultBodyLimit,
@@ -27,6 +27,7 @@ pub struct AppState {
     pub config: ExecutorConfig,
     pub docker: Arc<DockerManager>,
     pub registry: RuntimeRegistry,
+    pub keep_alive_registry: KeepAliveRegistry,
     pub http_client: reqwest::Client,
     pub storage: Arc<dyn Storage>,
 }

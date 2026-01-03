@@ -146,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_get() {
         let registry = RuntimeRegistry::new();
-        let rt = Runtime::new("test", "exec", "img", "v5");
+        let rt = Runtime::new("test", "exec", "img", "v5", None);
         let name = rt.name.clone();
 
         registry.insert(rt).await.unwrap();
@@ -159,8 +159,8 @@ mod tests {
     #[tokio::test]
     async fn test_conflict() {
         let registry = RuntimeRegistry::new();
-        let rt1 = Runtime::new("test", "exec", "img", "v5");
-        let rt2 = Runtime::new("test", "exec", "img", "v5");
+        let rt1 = Runtime::new("test", "exec", "img", "v5", None);
+        let rt2 = Runtime::new("test", "exec", "img", "v5", None);
 
         registry.insert(rt1).await.unwrap();
         let result = registry.insert(rt2).await;
@@ -172,11 +172,11 @@ mod tests {
     async fn test_list() {
         let registry = RuntimeRegistry::new();
         registry
-            .insert(Runtime::new("a", "e", "i", "v5"))
+            .insert(Runtime::new("a", "e", "i", "v5", None))
             .await
             .unwrap();
         registry
-            .insert(Runtime::new("b", "e", "i", "v5"))
+            .insert(Runtime::new("b", "e", "i", "v5", None))
             .await
             .unwrap();
 
@@ -187,7 +187,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove() {
         let registry = RuntimeRegistry::new();
-        let rt = Runtime::new("test", "exec", "img", "v5");
+        let rt = Runtime::new("test", "exec", "img", "v5", None);
         let name = rt.name.clone();
 
         registry.insert(rt).await.unwrap();
@@ -200,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn test_touch() {
         let registry = RuntimeRegistry::new();
-        let rt = Runtime::new("test", "exec", "img", "v5");
+        let rt = Runtime::new("test", "exec", "img", "v5", None);
         let name = rt.name.clone();
         let original_updated = rt.updated;
 
@@ -226,7 +226,7 @@ mod tests {
         for i in 0..10 {
             let reg = registry.clone();
             handles.push(tokio::spawn(async move {
-                let rt = Runtime::new(&format!("rt-{}", i), "exec", "img", "v5");
+                let rt = Runtime::new(&format!("rt-{}", i), "exec", "img", "v5", None);
                 reg.insert(rt).await
             }));
         }

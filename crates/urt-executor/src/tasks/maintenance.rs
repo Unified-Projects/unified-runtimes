@@ -2,7 +2,7 @@
 
 use crate::config::ExecutorConfig;
 use crate::docker::DockerManager;
-use crate::runtime::RuntimeRegistry;
+use crate::runtime::{KeepAliveRegistry, RuntimeRegistry};
 use crate::storage::{BuildCache, Storage};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +20,7 @@ const MAX_BUILD_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 pub async fn run_maintenance<S: Storage + 'static>(
     docker: Arc<DockerManager>,
     registry: RuntimeRegistry,
+    keep_alive_registry: KeepAliveRegistry,
     config: ExecutorConfig,
     storage: S,
     mut shutdown: watch::Receiver<bool>,
@@ -46,8 +47,8 @@ pub async fn run_maintenance<S: Storage + 'static>(
                     let count = registry.count().await;
                     debug!("Maintenance check: {} active runtimes (keep_alive=true, no cleanup)", count);
                 } else {
-                    // Normal mode: clean up idle runtimes
-                    cleanup_idle(&docker, &registry, config.inactive_threshold).await;
+                    // Normal mode: clean up idle runtimes (respects per-runtime keep-alive IDs)
+                    cleanup_idle(&docker, &registry, &keep_alive_registry, config.inactive_threshold).await;
                 }
 
                 // Always clean up temporary build directories
@@ -87,7 +88,13 @@ async fn cleanup_build_cache<S: Storage>(cache: &BuildCache<S>) {
 }
 
 /// Clean up runtimes that have been idle longer than threshold
-async fn cleanup_idle(docker: &DockerManager, registry: &RuntimeRegistry, threshold: u64) {
+/// Runtimes with a keep_alive_id that they currently own are protected from cleanup.
+async fn cleanup_idle(
+    docker: &DockerManager,
+    registry: &RuntimeRegistry,
+    keep_alive_registry: &KeepAliveRegistry,
+    threshold: u64,
+) {
     let idle_runtimes = registry.get_idle(threshold).await;
 
     if idle_runtimes.is_empty() {
@@ -95,9 +102,32 @@ async fn cleanup_idle(docker: &DockerManager, registry: &RuntimeRegistry, thresh
         return;
     }
 
-    info!("Cleaning up {} idle runtimes", idle_runtimes.len());
+    // Filter out runtimes that are protected by keep-alive ownership
+    let runtimes_to_cleanup: Vec<_> = idle_runtimes
+        .into_iter()
+        .filter(|runtime| {
+            // If runtime has a keep_alive_id AND owns it, skip cleanup
+            if let Some(ref ka_id) = runtime.keep_alive_id {
+                if keep_alive_registry.is_owner(ka_id, &runtime.name) {
+                    debug!(
+                        "Skipping cleanup of {} - protected by keep-alive ID '{}'",
+                        runtime.name, ka_id
+                    );
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
 
-    for runtime in idle_runtimes {
+    if runtimes_to_cleanup.is_empty() {
+        debug!("No idle runtimes to clean up (all protected or none idle)");
+        return;
+    }
+
+    info!("Cleaning up {} idle runtimes", runtimes_to_cleanup.len());
+
+    for runtime in runtimes_to_cleanup {
         let name = &runtime.name;
 
         // Stop container (best effort)
@@ -108,6 +138,12 @@ async fn cleanup_idle(docker: &DockerManager, registry: &RuntimeRegistry, thresh
         // Force remove container
         if let Err(e) = docker.remove_container(name, true).await {
             warn!("Failed to remove idle container {}: {}", name, e);
+        }
+
+        // Unregister keep-alive ownership if this runtime had one
+        // (even if not owner, calling unregister is safe - it only removes if owner)
+        if let Some(ref ka_id) = runtime.keep_alive_id {
+            keep_alive_registry.unregister(ka_id, name);
         }
 
         // Remove from registry AFTER Docker is done

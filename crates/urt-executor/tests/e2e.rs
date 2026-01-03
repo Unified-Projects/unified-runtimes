@@ -21,7 +21,7 @@ use urt_executor::{
     config::{ExecutorConfig, StorageConfig},
     docker::DockerManager,
     routes::{create_router, AppState},
-    runtime::RuntimeRegistry,
+    runtime::{KeepAliveRegistry, RuntimeRegistry},
     storage::{self, S3Storage, Storage},
 };
 
@@ -154,6 +154,7 @@ async fn create_test_server() -> TestServer {
         config,
         docker: Arc::new(docker),
         registry: RuntimeRegistry::new(),
+        keep_alive_registry: KeepAliveRegistry::new(),
         http_client: Client::new(),
         storage,
     };
@@ -1058,6 +1059,7 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
         config,
         docker: Arc::new(docker),
         registry: RuntimeRegistry::new(),
+        keep_alive_registry: KeepAliveRegistry::new(),
         http_client: Client::new(),
         storage,
     };

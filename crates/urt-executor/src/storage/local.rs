@@ -80,6 +80,11 @@ impl Storage for LocalStorage {
             .await
             .map_err(|e| ExecutorError::Storage(format!("Failed to write {}: {}", full_path, e)))?;
 
+        // Ensure data is flushed to disk so metadata (size) is immediately available
+        file.sync_all()
+            .await
+            .map_err(|e| ExecutorError::Storage(format!("Failed to sync {}: {}", full_path, e)))?;
+
         Ok(())
     }
 

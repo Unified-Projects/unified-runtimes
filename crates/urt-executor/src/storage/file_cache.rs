@@ -160,6 +160,11 @@ impl StorageFileCache {
             ExecutorError::Storage(format!("Failed to write cache metadata: {}", e))
         })?;
 
+        // Ensure metadata is flushed to disk
+        file.sync_all()
+            .await
+            .map_err(|e| ExecutorError::Storage(format!("Failed to sync cache metadata: {}", e)))?;
+
         Ok(())
     }
 
@@ -215,6 +220,11 @@ impl StorageFileCache {
         file.write_all(data)
             .await
             .map_err(|e| ExecutorError::Storage(format!("Failed to write cache file: {}", e)))?;
+
+        // Ensure data is flushed to disk so file is immediately visible
+        file.sync_all()
+            .await
+            .map_err(|e| ExecutorError::Storage(format!("Failed to sync cache file: {}", e)))?;
 
         // Write metadata
         let meta = CacheMetadata {
@@ -579,7 +589,7 @@ mod tests {
 
         let cache = StorageFileCache::new(
             Some(&cache_dir),
-            Some(Duration::from_millis(10)), // Very short TTL
+            Some(Duration::from_millis(100)), // Short TTL (but long enough for file sync)
             Some(1024 * 1024),
         );
         cache.initialize().await.unwrap();
@@ -591,8 +601,8 @@ mod tests {
         cache.put(remote_path, data).await.unwrap();
         assert!(cache.exists(remote_path).await);
 
-        // Wait for expiry
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait for expiry (longer than TTL)
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Should be expired now
         assert!(!cache.exists(remote_path).await);
