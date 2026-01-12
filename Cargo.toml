@@ -59,7 +59,7 @@ sha2 = "0.10"
 urlencoding = "2.1"
 
 # Docker
-bollard = "0.19"
+bollard = "0.20"
 
 # S3 Storage
 rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-native-tls"] }
