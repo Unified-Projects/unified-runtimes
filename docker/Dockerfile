@@ -6,7 +6,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build the Rust binary
 # -----------------------------------------------------------------------------
-FROM rust:1.92-alpine AS builder
+FROM rust:1.93-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
