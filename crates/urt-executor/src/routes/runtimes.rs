@@ -11,6 +11,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
@@ -327,18 +328,39 @@ pub async fn create_runtime(
     }
 
     // Volume mounts - exactly matches Docker.php lines 471-479
-    let tmp_folder = format!("/tmp/{}", full_name);
+    let tmp_base = Path::new("/tmp");
+    let tmp_folder = tmp_base.join(&full_name);
     let code_mount_path = if req.version == "v2" {
         "/usr/code"
     } else {
         "/mnt/code"
     };
 
+    // Ensure the runtime directory stays within /tmp
+    let canonical_tmp_folder = match tokio::fs::canonicalize(&tmp_folder).await {
+        Ok(path) => path,
+        Err(e) => {
+            // If the directory does not exist yet, use the joined path directly
+            // and rely on the base prefix check below.
+            tmp_folder.clone()
+        }
+    };
+    if !canonical_tmp_folder.starts_with(tmp_base) {
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::BadRequest(
+            "Invalid runtime id leads to unsafe path".to_string(),
+        ));
+    }
+
     // Create mount directories (Docker.php line 448)
-    let src_dir = format!("{}/src", tmp_folder);
-    let builds_dir = format!("{}/builds", tmp_folder);
+    let src_dir: PathBuf = tmp_folder.join("src");
+    let builds_dir: PathBuf = tmp_folder.join("builds");
     if let Err(e) = tokio::fs::create_dir_all(&src_dir).await {
-        error!("Failed to create src directory {}: {}", src_dir, e);
+        error!(
+            "Failed to create src directory {}: {}",
+            src_dir.display(),
+            e
+        );
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create source directory: {}",
@@ -349,7 +371,11 @@ pub async fn create_runtime(
     if let Err(e) =
         tokio::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o777)).await
     {
-        error!("Failed to set src directory permissions: {}", e);
+        error!(
+            "Failed to set src directory permissions {}: {}",
+            src_dir.display(),
+            e
+        );
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set source directory permissions: {}",
@@ -357,7 +383,11 @@ pub async fn create_runtime(
         )));
     }
     if let Err(e) = tokio::fs::create_dir_all(&builds_dir).await {
-        error!("Failed to create builds directory {}: {}", builds_dir, e);
+        error!(
+            "Failed to create builds directory {}: {}",
+            builds_dir.display(),
+            e
+        );
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create builds directory: {}",
