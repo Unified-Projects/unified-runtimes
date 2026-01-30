@@ -12,6 +12,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use tracing::{error, info};
 
@@ -344,11 +345,33 @@ pub async fn create_runtime(
             e
         )));
     }
+    // Set directory permissions to 0777 to allow tar extraction with preserved permissions
+    if let Err(e) =
+        tokio::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o777)).await
+    {
+        error!("Failed to set src directory permissions: {}", e);
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::RuntimeFailed(format!(
+            "Failed to set source directory permissions: {}",
+            e
+        )));
+    }
     if let Err(e) = tokio::fs::create_dir_all(&builds_dir).await {
         error!("Failed to create builds directory {}: {}", builds_dir, e);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create builds directory: {}",
+            e
+        )));
+    }
+    // Set directory permissions to 0777 to allow tar extraction with preserved permissions
+    if let Err(e) =
+        tokio::fs::set_permissions(&builds_dir, std::fs::Permissions::from_mode(0o777)).await
+    {
+        error!("Failed to set builds directory permissions: {}", e);
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::RuntimeFailed(format!(
+            "Failed to set builds directory permissions: {}",
             e
         )));
     }

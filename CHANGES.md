@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1]
+
+### Fixed
+- Fixed tar extraction permission errors during fresh builds by setting mount directories to 0777
+
 ## [0.1.0]
 
 Initial release.
