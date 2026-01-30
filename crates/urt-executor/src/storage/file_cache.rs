@@ -54,7 +54,11 @@ impl StorageFileCache {
     /// * `ttl` - Time-to-live for cache entries (defaults to 30 days)
     /// * `max_size` - Maximum cache size in bytes (defaults to 1GB)
     pub fn new(cache_dir: Option<&str>, ttl: Option<Duration>, max_size: Option<u64>) -> Self {
-        let cache_dir = PathBuf::from(cache_dir.unwrap_or("/tmp")).join(CACHE_DIR);
+        let base = match cache_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => std::env::temp_dir(),
+        };
+        let cache_dir = base.join(CACHE_DIR);
 
         Self {
             cache_dir,

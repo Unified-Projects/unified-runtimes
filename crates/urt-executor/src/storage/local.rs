@@ -20,7 +20,7 @@ impl LocalStorage {
     /// Create a new local storage with default base path
     pub fn new() -> Self {
         Self {
-            base_path: "/tmp".to_string(),
+            base_path: std::env::temp_dir().to_string_lossy().to_string(),
         }
     }
 
@@ -33,10 +33,13 @@ impl LocalStorage {
     }
 
     fn full_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
+        if Path::new(path).is_absolute() {
             path.to_string()
         } else {
-            format!("{}/{}", self.base_path, path)
+            Path::new(&self.base_path)
+                .join(path)
+                .to_string_lossy()
+                .to_string()
         }
     }
 }

@@ -155,13 +155,13 @@ async fn cleanup_idle(
 
 /// Clean up temporary build directories
 async fn cleanup_temp_dirs(hostname: &str) {
-    let tmp_dir = "/tmp";
+    let tmp_dir = std::env::temp_dir();
     let prefix = format!("{}-", hostname);
 
-    let entries = match tokio::fs::read_dir(tmp_dir).await {
+    let entries = match tokio::fs::read_dir(&tmp_dir).await {
         Ok(entries) => entries,
         Err(e) => {
-            debug!("Failed to read /tmp: {}", e);
+            debug!("Failed to read {}: {}", tmp_dir.display(), e);
             return;
         }
     };

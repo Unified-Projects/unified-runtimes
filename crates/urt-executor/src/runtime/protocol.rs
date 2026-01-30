@@ -295,8 +295,17 @@ impl RuntimeProtocol for V5Protocol {
 /// Read log files from disk and clean up (matching executor-main behavior)
 /// Log files are stored at /tmp/{runtime_name}/logs/{file_id}_logs.log
 async fn read_log_files(runtime_name: &str, file_id: &str) -> (String, String) {
-    let log_path = format!("/tmp/{}/logs/{}_logs.log", runtime_name, file_id);
-    let error_path = format!("/tmp/{}/logs/{}_errors.log", runtime_name, file_id);
+    let base = std::env::temp_dir();
+    let log_path = base
+        .join(runtime_name)
+        .join("logs")
+        .join(format!("{}_logs.log", file_id));
+    let error_path = base
+        .join(runtime_name)
+        .join("logs")
+        .join(format!("{}_errors.log", file_id));
+    let log_path = log_path.to_string_lossy().to_string();
+    let error_path = error_path.to_string_lossy().to_string();
 
     debug!("Reading log files: {} and {}", log_path, error_path);
 
@@ -414,10 +423,15 @@ mod tests {
     }
 
     /// Build the log file path for a runtime
-    /// IMPORTANT: Uses runtime.name (container name) to match the volume mount at /tmp/{name}/
+    /// IMPORTANT: Uses runtime.name (container name) to match the volume mount at temp_dir/{name}/
     #[inline]
     fn build_log_path(runtime_name: &str, file_id: &str, log_type: &str) -> String {
-        format!("/tmp/{}/logs/{}_{}.log", runtime_name, file_id, log_type)
+        std::env::temp_dir()
+            .join(runtime_name)
+            .join("logs")
+            .join(format!("{}_{}.log", file_id, log_type))
+            .to_string_lossy()
+            .to_string()
     }
 
     #[test]
@@ -458,16 +472,25 @@ mod tests {
 
     #[test]
     fn test_build_log_path_uses_container_name() {
-        // Log files are stored at /tmp/{runtime.name}/logs/
-        // The mount is: host /tmp/{full_name} -> container /tmp
+        // Log files are stored at {temp_dir}/{runtime.name}/logs/
+        // The mount is: host {temp_dir}/{full_name} -> container /tmp
         // So we need to use runtime.name to find logs on the executor's filesystem
         let container_name = "exc1-myruntime123";
         let file_id = "abc123";
 
+        let expected_log = std::env::temp_dir()
+            .join("exc1-myruntime123")
+            .join("logs")
+            .join("abc123_logs.log");
+        let expected_error = std::env::temp_dir()
+            .join("exc1-myruntime123")
+            .join("logs")
+            .join("abc123_errors.log");
+
         let log_path = build_log_path(container_name, file_id, "logs");
-        assert_eq!(log_path, "/tmp/exc1-myruntime123/logs/abc123_logs.log");
+        assert_eq!(log_path, expected_log.to_string_lossy());
 
         let error_path = build_log_path(container_name, file_id, "errors");
-        assert_eq!(error_path, "/tmp/exc1-myruntime123/logs/abc123_errors.log");
+        assert_eq!(error_path, expected_error.to_string_lossy());
     }
 }
