@@ -59,7 +59,7 @@ jobs:
 
     release:
         name: Build and Release
-        runs-on: blacksmith-8vcpu-ubuntu-2204
+        runs-on: ubuntu-latest
         needs: check-version
         if: needs.check-version.outputs.version != ''
         permissions:
