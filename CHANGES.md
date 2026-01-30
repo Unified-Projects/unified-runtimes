@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - Fixed tar extraction permission errors during fresh builds by setting mount directories to 0777
+
+### Added
 - Added cross-platform (Linux/Windows) support for host-side paths and APIs
 
 
