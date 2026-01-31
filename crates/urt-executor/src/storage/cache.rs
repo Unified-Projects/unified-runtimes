@@ -81,7 +81,10 @@ impl<S: Storage> BuildCache<S> {
 
         for layer_path in &layers {
             let layer_name = layer_path.rsplit('/').next().unwrap_or("layer");
-            let local_path = format!("{}/{}", build_dir, layer_name);
+            let local_path = Path::new(build_dir)
+                .join(layer_name)
+                .to_string_lossy()
+                .to_string();
 
             self.storage.download(layer_path, &local_path).await?;
 
@@ -107,13 +110,16 @@ impl<S: Storage> BuildCache<S> {
         let mut layer_names = Vec::new();
 
         for dir in layer_dirs {
-            let full_path = format!("{}/{}", build_dir, dir);
+            let full_path = Path::new(build_dir).join(dir).to_string_lossy().to_string();
             if !Path::new(&full_path).exists() {
                 continue;
             }
 
             let layer_name = format!("{}.tar.zst", dir.replace('/', "_"));
-            let layer_path = format!("/tmp/{}", layer_name);
+            let layer_path = std::env::temp_dir()
+                .join(&layer_name)
+                .to_string_lossy()
+                .to_string();
 
             // Create compressed tarball
             Self::create_layer(&full_path, &layer_path).await?;

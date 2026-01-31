@@ -15,6 +15,7 @@ mod config;
 mod docker;
 mod error;
 mod middleware;
+mod platform;
 mod routes;
 mod runtime;
 mod storage;

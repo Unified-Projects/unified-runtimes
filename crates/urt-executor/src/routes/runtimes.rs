@@ -5,6 +5,7 @@ use super::logs::{parse_build_logs, LogEntry};
 use super::AppState;
 use crate::docker::container::ContainerConfig;
 use crate::error::{ExecutorError, Result};
+use crate::platform;
 use crate::runtime::Runtime;
 use axum::{
     extract::{Path, State},
@@ -12,7 +13,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info};
 
@@ -327,7 +328,8 @@ pub async fn create_runtime(
     }
 
     // Volume mounts - exactly matches Docker.php lines 471-479
-    let tmp_folder = format!("/tmp/{}", full_name);
+    let tmp_base = platform::temp_dir();
+    let tmp_folder = tmp_base.join(&full_name);
     let code_mount_path = if req.version == "v2" {
         "/usr/code"
     } else {
@@ -335,10 +337,14 @@ pub async fn create_runtime(
     };
 
     // Create mount directories (Docker.php line 448)
-    let src_dir = format!("{}/src", tmp_folder);
-    let builds_dir = format!("{}/builds", tmp_folder);
+    let src_dir: PathBuf = tmp_folder.join("src");
+    let builds_dir: PathBuf = tmp_folder.join("builds");
     if let Err(e) = tokio::fs::create_dir_all(&src_dir).await {
-        error!("Failed to create src directory {}: {}", src_dir, e);
+        error!(
+            "Failed to create src directory {}: {}",
+            src_dir.display(),
+            e
+        );
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create source directory: {}",
@@ -346,10 +352,12 @@ pub async fn create_runtime(
         )));
     }
     // Set directory permissions to 0777 to allow tar extraction with preserved permissions
-    if let Err(e) =
-        tokio::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o777)).await
-    {
-        error!("Failed to set src directory permissions: {}", e);
+    if let Err(e) = platform::set_permissions_open(&src_dir).await {
+        error!(
+            "Failed to set src directory permissions {}: {}",
+            src_dir.display(),
+            e
+        );
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set source directory permissions: {}",
@@ -357,7 +365,11 @@ pub async fn create_runtime(
         )));
     }
     if let Err(e) = tokio::fs::create_dir_all(&builds_dir).await {
-        error!("Failed to create builds directory {}: {}", builds_dir, e);
+        error!(
+            "Failed to create builds directory {}: {}",
+            builds_dir.display(),
+            e
+        );
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create builds directory: {}",
@@ -365,9 +377,7 @@ pub async fn create_runtime(
         )));
     }
     // Set directory permissions to 0777 to allow tar extraction with preserved permissions
-    if let Err(e) =
-        tokio::fs::set_permissions(&builds_dir, std::fs::Permissions::from_mode(0o777)).await
-    {
+    if let Err(e) = platform::set_permissions_open(&builds_dir).await {
         error!("Failed to set builds directory permissions: {}", e);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
@@ -375,6 +385,24 @@ pub async fn create_runtime(
             e
         )));
     }
+
+    // Canonicalize now that directories exist, and verify containment within temp dir
+    let canonical_tmp_base = tokio::fs::canonicalize(&tmp_base).await.map_err(|e| {
+        ExecutorError::RuntimeFailed(format!("Failed to canonicalize temp base path: {}", e))
+    })?;
+    let canonical_tmp = tokio::fs::canonicalize(&tmp_folder).await.map_err(|e| {
+        ExecutorError::RuntimeFailed(format!("Failed to canonicalize runtime path: {}", e))
+    })?;
+    if !canonical_tmp.starts_with(&canonical_tmp_base) {
+        tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::BadRequest(
+            "Invalid runtime id leads to unsafe path".to_string(),
+        ));
+    }
+    let tmp_folder = canonical_tmp;
+    let src_dir = tmp_folder.join("src");
+    let builds_dir = tmp_folder.join("builds");
 
     // Copy source file from storage to local tmp (Docker.php lines 439-443)
     // This is required because Docker can only mount local paths
@@ -385,10 +413,11 @@ pub async fn create_runtime(
         } else {
             "code.tar.gz"
         };
-        let local_source = format!("{}/{}", src_dir, source_file);
+        let local_source = src_dir.join(source_file);
+        let local_source_str = local_source.display().to_string();
 
-        info!("Downloading source {} to {}", req.source, local_source);
-        if let Err(e) = state.storage.download(&req.source, &local_source).await {
+        info!("Downloading source {} to {}", req.source, local_source_str);
+        if let Err(e) = state.storage.download(&req.source, &local_source_str).await {
             error!("Failed to download source: {}", e);
             state.registry.remove(&full_name).await;
             return Err(ExecutorError::RuntimeFailed(format!(
@@ -404,21 +433,23 @@ pub async fn create_runtime(
     }
 
     // Add standard mounts (Docker.php lines 471-474)
-    container = container.with_mount(&src_dir, "/tmp", false).with_mount(
-        &builds_dir,
-        code_mount_path,
-        false,
-    );
+    let src_dir_str = src_dir.display().to_string();
+    let builds_dir_str = builds_dir.display().to_string();
+    container = container
+        .with_mount(&src_dir_str, "/tmp", false)
+        .with_mount(&builds_dir_str, code_mount_path, false);
 
     // Add v5-specific mounts (Docker.php lines 476-479)
     if req.version == "v5" {
-        let logs_dir = format!("{}/logs", tmp_folder);
-        let logging_dir = format!("{}/logging", tmp_folder);
+        let logs_dir = tmp_folder.join("logs");
+        let logging_dir = tmp_folder.join("logging");
         tokio::fs::create_dir_all(&logs_dir).await.ok();
         tokio::fs::create_dir_all(&logging_dir).await.ok();
+        let logs_dir_str = logs_dir.display().to_string();
+        let logging_dir_str = logging_dir.display().to_string();
         container = container
-            .with_mount(&logs_dir, "/mnt/logs", false)
-            .with_mount(&logging_dir, "/tmp/logging", false);
+            .with_mount(&logs_dir_str, "/mnt/logs", false)
+            .with_mount(&logging_dir_str, "/tmp/logging", false);
     }
 
     // Container command logic - exactly matches Docker.php lines 456-464
@@ -537,8 +568,9 @@ pub async fn create_runtime(
             Ok(result) => {
                 // For v5, parse logs with timing info (matches executor-main Logs::get())
                 if req.version != "v2" {
-                    let logging_dir = format!("{}/logging", tmp_folder);
-                    let parsed_logs = parse_build_logs(&logging_dir).await;
+                    let logging_dir = tmp_folder.join("logging");
+                    let logging_dir_str = logging_dir.display().to_string();
+                    let parsed_logs = parse_build_logs(&logging_dir_str).await;
                     output_logs.extend(parsed_logs);
                 } else if !result.stdout.is_empty() {
                     // v2: use stdout directly
@@ -590,7 +622,8 @@ pub async fn create_runtime(
     if !req.destination.is_empty() {
         // Determine build file path
         let build_file = "code.tar.gz";
-        let local_build = format!("{}/{}", builds_dir, build_file);
+        let local_build = builds_dir.join(build_file);
+        let local_build_str = local_build.display().to_string();
 
         // Check if build artifact exists
         if tokio::fs::metadata(&local_build).await.is_ok() {
@@ -609,14 +642,14 @@ pub async fn create_runtime(
 
             // Upload to storage
             info!("Uploading build artifact to {}", dest_path);
-            if let Err(e) = state.storage.upload(&local_build, &dest_path).await {
+            if let Err(e) = state.storage.upload(&local_build_str, &dest_path).await {
                 error!("Failed to upload build artifact: {}", e);
                 // Continue anyway, just won't have the path
             } else {
                 result_path = Some(dest_path);
             }
         } else {
-            error!("Build artifact not found at {}", local_build);
+            error!("Build artifact not found at {}", local_build.display());
         }
     }
 
@@ -686,6 +719,9 @@ pub async fn delete_runtime(
     State(state): State<AppState>,
     Path(runtime_id): Path<String>,
 ) -> Result<StatusCode> {
+    // Validate runtime_id from URL path parameter
+    validate_runtime_id(&runtime_id)?;
+
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
     info!("Deleting runtime: {}", full_name);
@@ -704,7 +740,8 @@ pub async fn delete_runtime(
     }
 
     // Remove runtime-owned tmp directory
-    let tmp_folder = format!("/tmp/{}", full_name);
+    let tmp_base = platform::temp_dir();
+    let tmp_folder = tmp_base.join(&full_name);
     tokio::fs::remove_dir_all(&tmp_folder).await.ok();
 
     // Unregister keep-alive ownership if this runtime had one

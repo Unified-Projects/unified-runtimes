@@ -159,8 +159,9 @@ pub async fn build_image<S: Storage>(
                 logs.push(format!("Cache hit: {}", cache_key));
 
                 // Restore cached layers
+                let source_dir_str = source_dir.to_string_lossy();
                 if build_cache
-                    .restore_layers(&cache_key, source_dir.to_str().unwrap_or("/tmp"))
+                    .restore_layers(&cache_key, &source_dir_str)
                     .await?
                 {
                     cache_hit = true;
@@ -251,12 +252,9 @@ pub async fn build_image<S: Storage>(
                 .collect();
 
             if !layer_dirs.is_empty() {
+                let source_dir_str = source_dir.to_string_lossy();
                 match build_cache
-                    .cache_layers(
-                        &cache_key,
-                        source_dir.to_str().unwrap_or("/tmp"),
-                        &layer_dirs,
-                    )
+                    .cache_layers(&cache_key, &source_dir_str, &layer_dirs)
                     .await
                 {
                     Ok(_) => {

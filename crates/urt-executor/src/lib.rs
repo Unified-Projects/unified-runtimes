@@ -7,6 +7,7 @@ pub mod config;
 pub mod docker;
 pub mod error;
 pub mod middleware;
+pub mod platform;
 pub mod routes;
 pub mod runtime;
 pub mod storage;

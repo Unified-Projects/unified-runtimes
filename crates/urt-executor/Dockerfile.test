@@ -2,18 +2,50 @@
 # This allows tests to communicate with containers on the Docker network
 # IMPORTANT: E2E tests MUST run inside Docker for proper DNS resolution between containers
 
-FROM rust:latest
+# -----------------------------------------------------------------------------
+# Stage 1: Chef base with build tools
+# -----------------------------------------------------------------------------
+FROM rust:1.93 AS chef
 
-# Install Docker CLI (to communicate with host Docker daemon) and Apache Bench for benchmarks
 RUN apt-get update && apt-get install -y \
     docker.io \
     apache2-utils \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+RUN cargo install cargo-chef
+
 WORKDIR /app
 
-# Copy workspace files
+# -----------------------------------------------------------------------------
+# Stage 2: Plan dependencies
+# -----------------------------------------------------------------------------
+FROM chef AS planner
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+# Stage 3: Cook dependencies (cached unless recipe changes)
+# -----------------------------------------------------------------------------
+FROM chef AS deps
+
+COPY --from=planner /app/recipe.json recipe.json
+
+RUN cargo chef cook --recipe-path recipe.json --package urt-executor --tests
+
+# -----------------------------------------------------------------------------
+# Stage 4: Build tests
+# -----------------------------------------------------------------------------
+FROM chef AS builder
+
+# Copy pre-built dependencies from the cook stage
+COPY --from=deps /app/target target
+COPY --from=deps /usr/local/cargo /usr/local/cargo
+
+# Copy workspace source
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
