@@ -1,14 +1,13 @@
 # =============================================================================
 # URT Executor Dockerfile
-# Multi-stage build for optimized production image
+# Multi-stage build with cargo-chef for optimised dependency caching
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Stage 1: Build the Rust binary
+# Stage 1: Generate dependency recipe
 # -----------------------------------------------------------------------------
-FROM rust:1.92-alpine AS builder
+FROM rust:1.93-alpine AS chef
 
-# Install build dependencies
 RUN apk add --no-cache \
     musl-dev \
     openssl-dev \
@@ -16,14 +15,44 @@ RUN apk add --no-cache \
     pkgconfig \
     git
 
-# Set up workspace
+RUN cargo install cargo-chef
+
 WORKDIR /app
 
-# Copy workspace files
+# -----------------------------------------------------------------------------
+# Stage 2: Plan dependencies (only re-runs when Cargo.toml/Cargo.lock change)
+# -----------------------------------------------------------------------------
+FROM chef AS planner
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build only urt-executor in release mode with optimizations.
+RUN cargo chef prepare --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+# Stage 3: Cook dependencies (cached unless recipe changes)
+# -----------------------------------------------------------------------------
+FROM chef AS deps
+
+COPY --from=planner /app/recipe.json recipe.json
+
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+# Stage 4: Build the application
+# -----------------------------------------------------------------------------
+FROM chef AS builder
+
+# Copy pre-built dependencies from the cook stage
+COPY --from=deps /app/target target
+COPY --from=deps /usr/local/cargo /usr/local/cargo
+
+# Copy workspace source
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build only urt-executor in release mode with optimisations.
 # Disable -crt-static explicitly so the binary links dynamically against the
 # Alpine base image's musl libc at runtime instead of producing a fully static
 # binary. This keeps the binary compatible with the container's C runtime and
@@ -35,7 +64,7 @@ RUN cargo build --release --package urt-executor
 RUN strip /app/target/release/urt-executor
 
 # -----------------------------------------------------------------------------
-# Stage 2: Production image
+# Stage 5: Production image
 # -----------------------------------------------------------------------------
 FROM alpine:3.23
 

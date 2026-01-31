@@ -45,9 +45,24 @@ updates:
         patterns:
           - "*"
 
-  # Docker dependencies (if any Dockerfiles exist)
+  # Docker dependencies
   - package-ecosystem: "docker"
     directory: "/docker"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "deps(docker)"
+
+  - package-ecosystem: "docker"
+    directory: "/crates/urt-executor"
     target-branch: "dev"
     schedule:
       interval: "weekly"

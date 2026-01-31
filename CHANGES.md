@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1]
+
+### Fixed
+- Fixed tar extraction permission errors during fresh builds by setting mount directories to 0777
+
+### Added
+- Added cross-platform (Linux/Windows) support for host-side paths and APIs
+
+### Changed
+- Optimised CI pipeline: removed redundant build job, merged Docker build and test jobs, switched PR checks to single-arch (amd64)
+- Added cargo-chef dependency caching to production and test Dockerfiles
+- Pinned test Dockerfile base image to `rust:1.93`
+
+
 ## [0.1.0]
 
 Initial release.

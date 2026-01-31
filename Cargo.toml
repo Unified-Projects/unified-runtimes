@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Unified Runtimes Contributors"]
 license = "MIT"
@@ -14,7 +14,7 @@ repository = "https://github.com/open-runtimes/unified-runtimes"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # HTTP server
 axum = { version = "0.8", features = ["multipart"] }
