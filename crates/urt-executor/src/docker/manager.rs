@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tracing::warn;
 use tracing::{debug, error, info};
 
 /// Main Docker manager for container operations
@@ -104,6 +105,44 @@ impl DockerManager {
             ensure_network(&self.docker, network).await?;
         }
         Ok(())
+    }
+
+    /// Resolve a container name by hostname (best-effort)
+    pub async fn resolve_container_name_by_hostname(&self, hostname: &str) -> Option<String> {
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), vec![hostname.to_string()]);
+
+        let options = ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+
+        let containers = self.docker.list_containers(Some(options)).await.ok()?;
+        let name = containers
+            .into_iter()
+            .find_map(|c| c.names.and_then(|n| n.first().cloned()))
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .to_string();
+
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// Connect a container to all configured networks (best-effort)
+    pub async fn connect_container_to_networks(&self, container: &str) {
+        for network in &self.config.networks {
+            if let Err(e) = connect_container(&self.docker, network, container).await {
+                warn!(
+                    "Failed to connect container {} to network {}: {}",
+                    container, network, e
+                );
+            }
+        }
     }
 
     /// Pull a Docker image
