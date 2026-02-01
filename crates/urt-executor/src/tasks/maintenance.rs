@@ -52,7 +52,7 @@ pub async fn run_maintenance<S: Storage + 'static>(
                 }
 
                 // Always clean up temporary build directories
-                cleanup_temp_dirs(&config.hostname).await;
+                cleanup_temp_dirs(&config.hostname, &registry).await;
 
                 // Clean up build cache if it exceeds size limit
                 cleanup_build_cache(&build_cache).await;
@@ -154,7 +154,7 @@ async fn cleanup_idle(
 // Shutdown cleanup is now handled in main.rs via with_graceful_shutdown.
 
 /// Clean up temporary build directories
-async fn cleanup_temp_dirs(hostname: &str) {
+async fn cleanup_temp_dirs(hostname: &str, registry: &RuntimeRegistry) {
     let tmp_dir = std::env::temp_dir();
     let prefix = format!("{}-", hostname);
 
@@ -171,6 +171,11 @@ async fn cleanup_temp_dirs(hostname: &str) {
         let name = entry.file_name().to_string_lossy().to_string();
 
         if name.starts_with(&prefix) {
+            // Skip active runtimes to avoid breaking live containers
+            if registry.exists(&name).await {
+                continue;
+            }
+
             let path = entry.path();
             if path.is_dir() {
                 debug!("Removing temp dir: {}", path.display());

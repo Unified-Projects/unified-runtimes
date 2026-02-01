@@ -1699,7 +1699,7 @@ mod appwrite_compatibility {
 
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            // Execute with text/plain accept
+            // Execute with multipart accept (default in executor-main)
             let exec_payload = json!({
                 "body": "{}",
                 "path": "/",
@@ -1715,31 +1715,27 @@ mod appwrite_compatibility {
                 ))
                 .header(server.auth_header().0, server.auth_header().1.clone())
                 .header("Content-Type", "application/json")
-                .header("Accept", "text/plain")
+                .header("Accept", "multipart/form-data")
                 .json(&exec_payload)
                 .send()
                 .await
                 .expect("Failed to execute");
 
-            // Check for AppWrite-specific headers (these are set for text/plain responses)
-            let _has_status_code = response
+            let content_type = response
                 .headers()
-                .contains_key("x-open-runtimes-status-code");
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
 
-            // Headers should be present on success
             if response.status().is_success() {
-                // On success, headers should be present for text/plain responses
-                // Note: These headers may or may not be present depending on implementation
-                if _has_status_code {
-                    // Headers are present as expected
-                } else {
-                    eprintln!("Note: x-open-runtimes-status-code header not found");
-                }
-            } else {
-                // On error, headers might not be set
                 assert!(
-                    response.status().is_client_error() || response.status().is_server_error(),
-                    "Should get an error response"
+                    content_type.contains("multipart/form-data"),
+                    "Expected multipart response"
+                );
+            } else {
+                assert!(
+                    content_type.contains("application/json"),
+                    "Error responses should be JSON"
                 );
             }
 

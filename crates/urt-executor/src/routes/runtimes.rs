@@ -15,7 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Request body for creating a runtime
 #[derive(Debug, Deserialize)]
@@ -258,9 +258,10 @@ pub async fn create_runtime(
 
     // Register keep-alive ownership (if applicable)
     // This also revokes protection from any previous owner with the same ID
+    let mut previous_keep_alive_owner: Option<String> = None;
     if let Some(ref ka_id) = keep_alive_id {
-        let previous_owner = state.keep_alive_registry.register(ka_id, &runtime.name);
-        if let Some(prev) = previous_owner {
+        previous_keep_alive_owner = state.keep_alive_registry.register(ka_id, &runtime.name);
+        if let Some(prev) = &previous_keep_alive_owner {
             info!(
                 "Keep-alive ID '{}' transferred from {} to {}",
                 ka_id, prev, runtime.name
@@ -272,6 +273,10 @@ pub async fn create_runtime(
 
     // Build environment variables (convert any JSON values to strings)
     let mut env = req.variables.to_map();
+    let build_compression_none = env
+        .get("OPEN_RUNTIMES_BUILD_COMPRESSION")
+        .map(|v| v.eq_ignore_ascii_case("none"))
+        .unwrap_or(false);
 
     // Add version-specific variables
     match req.version.as_str() {
@@ -620,8 +625,12 @@ pub async fn create_runtime(
     let mut result_size: Option<u64> = None;
 
     if !req.destination.is_empty() {
-        // Determine build file path
-        let build_file = "code.tar.gz";
+        // Determine build file path (matches executor-main OPEN_RUNTIMES_BUILD_COMPRESSION)
+        let build_file = if build_compression_none {
+            "code.tar"
+        } else {
+            "code.tar.gz"
+        };
         let local_build = builds_dir.join(build_file);
         let local_build_str = local_build.display().to_string();
 
@@ -634,11 +643,19 @@ pub async fn create_runtime(
 
             // Generate unique destination path
             let unique_id = uuid::Uuid::new_v4().to_string();
-            let dest_path = format!(
-                "{}/{}.tar.gz",
-                req.destination.trim_end_matches('/'),
-                unique_id
-            );
+            let dest_path = if build_file.ends_with(".tar") {
+                format!(
+                    "{}/{}.tar",
+                    req.destination.trim_end_matches('/'),
+                    unique_id
+                )
+            } else {
+                format!(
+                    "{}/{}.tar.gz",
+                    req.destination.trim_end_matches('/'),
+                    unique_id
+                )
+            };
 
             // Upload to storage
             info!("Uploading build artifact to {}", dest_path);
@@ -674,6 +691,16 @@ pub async fn create_runtime(
             let mut updated_runtime = runtime.clone();
             updated_runtime.mark_running(&info.status);
             state.registry.update(updated_runtime).await.ok();
+        }
+    }
+
+    // If a keep-alive ID was transferred, clean up the previous owner now that
+    // this runtime is successfully running (avoid removing the new runtime).
+    if !req.remove {
+        if let (Some(prev), Some(ka_id)) = (previous_keep_alive_owner, keep_alive_id.as_ref()) {
+            if prev != runtime.name {
+                cleanup_previous_keep_alive_runtime(&state, &prev, ka_id).await;
+            }
         }
     }
 
@@ -761,4 +788,42 @@ pub async fn delete_runtime(
     info!("Delete runtime finished: {}", full_name);
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cleanup_previous_keep_alive_runtime(
+    state: &AppState,
+    previous_owner: &str,
+    keep_alive_id: &str,
+) {
+    info!(
+        "Cleaning up previous keep-alive runtime {} for keep-alive ID '{}'",
+        previous_owner, keep_alive_id
+    );
+
+    let runtime_info = state.registry.get(previous_owner).await;
+
+    if let Err(e) = state.docker.stop_container(previous_owner, 10).await {
+        warn!(
+            "Failed to stop previous keep-alive container {}: {}",
+            previous_owner, e
+        );
+    }
+
+    if let Err(e) = state.docker.remove_container(previous_owner, true).await {
+        warn!(
+            "Failed to remove previous keep-alive container {}: {}",
+            previous_owner, e
+        );
+    }
+
+    let tmp_folder = platform::temp_dir().join(previous_owner);
+    tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+
+    if let Some(runtime) = runtime_info {
+        if let Some(ref ka_id) = runtime.keep_alive_id {
+            state.keep_alive_registry.unregister(ka_id, previous_owner);
+        }
+    }
+
+    state.registry.remove(previous_owner).await;
 }
