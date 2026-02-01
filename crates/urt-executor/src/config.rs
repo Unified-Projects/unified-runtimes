@@ -274,10 +274,10 @@ impl ExecutorConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
 
-            // Lifecycle - keep_alive defaults to true
+            // Lifecycle - keep_alive defaults to false
             keep_alive: env_urt_or_opr("KEEP_ALIVE")
                 .map(|v| v.to_lowercase() != "false")
-                .unwrap_or(true),
+                .unwrap_or(false),
             inactive_threshold: env_urt_or_opr("INACTIVE_THRESHOLD")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
@@ -327,6 +327,11 @@ impl ExecutorConfig {
     /// Matches against both raw allowed runtimes and their expanded forms
     /// e.g., if allowed_runtimes contains "node-22", it will match "openruntimes/node:v5-22"
     pub fn is_runtime_allowed(&self, image: &str) -> bool {
+        // Always allow the official static runtime for sites/assets
+        if Self::is_static_runtime_image(image) {
+            return true;
+        }
+
         if self.allowed_runtimes.is_empty() {
             return true; // No allowlist means all are allowed
         }
@@ -341,6 +346,15 @@ impl ExecutorConfig {
             let expanded = self.expand_runtime_name(r);
             image == expanded
         })
+    }
+
+    /// Detect the official OpenRuntimes static image (always allowed)
+    fn is_static_runtime_image(image: &str) -> bool {
+        let img = image.to_ascii_lowercase();
+        if let Some(rest) = img.strip_prefix("openruntimes/static") {
+            return rest.is_empty() || rest.starts_with(':');
+        }
+        false
     }
 
     /// Get a random network from the configured networks
@@ -441,6 +455,17 @@ mod tests {
         // Not allowed
         assert!(!config.is_runtime_allowed("openruntimes/ruby:v5-3.2"));
         assert!(!config.is_runtime_allowed("openruntimes/node:v5-20.0"));
+    }
+
+    #[test]
+    fn test_is_runtime_allowed_static_always() {
+        let mut config = ExecutorConfig::from_env();
+        config.runtime_versions = vec!["v5".to_string()];
+        config.allowed_runtimes = vec!["node-22".to_string()];
+
+        // Static runtime should always be allowed, even if not in allowlist
+        assert!(config.is_runtime_allowed("openruntimes/static:v5-1"));
+        assert!(config.is_runtime_allowed("openruntimes/static"));
     }
 
     #[test]

@@ -497,73 +497,27 @@ pub async fn create_execution(
     };
 
     // Determine response format based on Accept header
+    // Matches executor-main: default to multipart unless JSON is explicitly requested.
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json");
+        .unwrap_or("multipart/form-data");
 
-    if accept.contains("multipart/form-data") {
+    if !accepts_json(accept) {
         // Return multipart response
         return Ok(build_multipart_response(&response));
     }
 
-    if accept.contains("text/plain") {
-        // Return plain text (just body)
-        let mut res = Response::builder()
-            .status(200)
-            .header(
-                header::CONTENT_TYPE,
-                response
-                    .headers
-                    .get("content-type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("text/plain"),
-            )
-            .header(
-                "x-open-runtimes-status-code",
-                response.status_code.to_string(),
-            )
-            .header("x-open-runtimes-logs", base64_encode(&response.logs))
-            .header("x-open-runtimes-errors", base64_encode(&response.errors))
-            .body(Body::from(response.body))
-            .unwrap();
+    // JSON response - reject binary bodies like executor-main
+    let body = std::str::from_utf8(&response.body).map_err(|_| {
+        ExecutorError::ExecutionBadJson(
+            "Execution resulted in binary response, but JSON response does not allow binaries. Use \"Accept: multipart/form-data\" header to support binaries.".to_string(),
+        )
+    })?;
 
-        for (key, value) in &response.headers {
-            if !should_forward_header(key) {
-                continue;
-            }
-
-            let name = match header::HeaderName::from_bytes(key.as_bytes()) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-
-            match value {
-                serde_json::Value::String(s) => {
-                    if let Ok(hv) = HeaderValue::from_str(s) {
-                        res.headers_mut().insert(name, hv);
-                    }
-                }
-                serde_json::Value::Array(arr) => {
-                    for item in arr {
-                        if let Some(s) = item.as_str() {
-                            if let Ok(hv) = HeaderValue::from_str(s) {
-                                res.headers_mut().append(name.clone(), hv);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        return Ok(res);
-    }
-
-    // Default: JSON response
     Ok(Json(JsonExecutionResponse {
         status_code: response.status_code,
-        body: String::from_utf8_lossy(&response.body).into_owned(),
+        body: body.to_string(),
         logs: response.logs,
         errors: response.errors,
         headers: response.headers,
@@ -699,34 +653,17 @@ fn parse_multipart_execution_request_bytes(
     })
 }
 
-/// Whether an upstream header should be forwarded to the client.
-///
-/// We deliberately strip headers that can cause browser/client decoding issues when the upstream
-/// payload has already been decompressed (e.g. by reqwest) or when Axum will re-derive them.
-fn should_forward_header(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-
-    // Hop-by-hop headers (RFC 7230) + encoding/length/type headers we should not copy verbatim.
-    !matches!(
-        k.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "content-encoding"
-            | "content-length"
-            | "content-type"
-    )
-}
-
-/// Base64 encode a string for header transport
-fn base64_encode(s: &str) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+/// Determine if the Accept header requests JSON.
+/// Matches executor-main: JSON only when Accept contains application/json or application/*.
+fn accepts_json(accept: &str) -> bool {
+    accept
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .any(|entry| {
+            let mime = entry.split(';').next().unwrap_or(entry).trim();
+            mime.starts_with("application/json") || mime.starts_with("application/*")
+        })
 }
 
 /// Wait for a runtime to start listening on a TCP port

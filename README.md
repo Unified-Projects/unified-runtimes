@@ -82,7 +82,7 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_PORT` | `80` | Server port |
 | `URT_SECRET` | `` | API authentication secret (required for production) |
 | `URT_NETWORK` | `executor_runtimes` | Docker network for containers |
-| `URT_KEEP_ALIVE` | `true` | Disable idle timeout (containers only removed via DELETE) |
+| `URT_KEEP_ALIVE` | `false` | Disable idle timeout (containers only removed via DELETE) |
 | `URT_INACTIVE_THRESHOLD` | `60` | Seconds before marking runtime inactive |
 | `URT_MAINTENANCE_INTERVAL` | `3600` | Seconds between cleanup tasks |
 | `URT_MIN_CPUS` | `0` | Minimum CPU allocation override |

@@ -15,6 +15,14 @@ All notable changes to this project will be documented in this file.
 - Added cargo-chef dependency caching to production and test Dockerfiles
 - Pinned test Dockerfile base image to `rust:1.93`
 
+## [0.1.2]
+
+### Fixed
+- Clean up the previous keep-alive runtime when a new runtime claims the same keep-alive ID
+
+### Changed
+- Default executor keep-alive mode to false so idle cleanup runs unless explicitly enabled
+
 
 ## [0.1.0]
 
