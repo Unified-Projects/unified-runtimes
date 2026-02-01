@@ -644,7 +644,11 @@ pub async fn create_runtime(
             // Generate unique destination path
             let unique_id = uuid::Uuid::new_v4().to_string();
             let dest_path = if build_file.ends_with(".tar") {
-                format!("{}/{}.tar", req.destination.trim_end_matches('/'), unique_id)
+                format!(
+                    "{}/{}.tar",
+                    req.destination.trim_end_matches('/'),
+                    unique_id
+                )
             } else {
                 format!(
                     "{}/{}.tar.gz",
@@ -693,7 +697,7 @@ pub async fn create_runtime(
     // If a keep-alive ID was transferred, clean up the previous owner now that
     // this runtime is successfully running (avoid removing the new runtime).
     if !req.remove {
-        if let (Some(prev), Some(ref ka_id)) = (previous_keep_alive_owner, keep_alive_id.as_ref()) {
+        if let (Some(prev), Some(ka_id)) = (previous_keep_alive_owner, keep_alive_id.as_ref()) {
             if prev != runtime.name {
                 cleanup_previous_keep_alive_runtime(&state, &prev, ka_id).await;
             }
