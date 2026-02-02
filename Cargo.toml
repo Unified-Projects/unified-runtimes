@@ -47,7 +47,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 # Utilities
 chrono = "0.4"
-uuid = { version = "1.19", features = ["v4"] }
+uuid = { version = "1.20", features = ["v4"] }
 bytes = "1.11"
 url = "2.5"
 http = "1.4"
