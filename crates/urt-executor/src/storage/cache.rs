@@ -348,6 +348,8 @@ impl<S: Storage> BuildCache<S> {
 
         let output = Command::new("tar")
             .arg("--zstd")
+            .arg("--no-same-owner")
+            .arg("--no-same-permissions")
             .arg("-xf")
             .arg(layer_path_obj.to_string_lossy().to_string())
             .arg("-C")

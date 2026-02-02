@@ -9,9 +9,11 @@ All notable changes to this project will be documented in this file.
 - JSON responses now fail fast for binary bodies, matching reference behavior
 - Static runtime images are always allowed, even when runtime allowlist is set
 - Build artifact naming respects `OPEN_RUNTIMES_BUILD_COMPRESSION=none` (tar vs tar.gz)
+- Ignore tar permission-setting errors during build source extraction to avoid failures on restricted mounts
 - Prevent maintenance from deleting temp directories for active runtimes
 - Ensure executor container joins runtime networks and resolve container name via Docker
 - Normalize v5 execution paths to always start with `/`
+- Disable ownership and permission restoration when extracting cached tar layers
 
 ## [0.1.2]
 
