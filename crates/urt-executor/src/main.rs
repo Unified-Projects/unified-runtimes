@@ -97,6 +97,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("Failed to create networks");
 
+    // Connect executor container to configured runtime networks (best-effort)
+    // This mirrors executor-main behavior and ensures DNS/port checks work.
+    let executor_container = docker
+        .resolve_container_name_by_hostname(&config.hostname)
+        .await
+        .unwrap_or_else(|| {
+            warn!(
+                "Could not resolve container name for hostname '{}', using hostname directly",
+                config.hostname
+            );
+            config.hostname.clone()
+        });
+    docker
+        .connect_container_to_networks(&executor_container)
+        .await;
+
     // Create runtime registry
     let registry = RuntimeRegistry::new();
 

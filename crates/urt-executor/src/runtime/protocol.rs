@@ -169,7 +169,12 @@ impl RuntimeProtocol for V5Protocol {
 
         // Use runtime.name (container name) for DNS resolution, not runtime.hostname
         // Docker DNS resolves containers by name, not by internal hostname
-        let url = format!("http://{}:3000{}", runtime.name, request.path);
+        let path = if request.path.starts_with('/') {
+            request.path.clone()
+        } else {
+            format!("/{}", request.path)
+        };
+        let url = format!("http://{}:3000{}", runtime.name, path);
 
         // Build Basic auth header
         let auth = format!("opr:{}", runtime.key);

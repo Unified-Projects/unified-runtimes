@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use http_body_util::{Either, Full};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use tar::Archive;
 use tokio::fs;
@@ -400,19 +401,43 @@ pub async fn extract_source_tarball(tarball: &[u8], dest_dir: &Path) -> Result<(
         .await
         .map_err(|e| ExecutorError::Storage(format!("Failed to create dest dir: {}", e)))?;
 
+    fn ignore_permission_error(err: &io::Error) -> bool {
+        err.kind() == io::ErrorKind::PermissionDenied
+            && err.to_string().starts_with("failed to set permissions to")
+    }
+
+    fn unpack_archive<R: io::Read>(mut archive: Archive<R>, dest_dir: &Path) -> Result<()> {
+        let entries = archive
+            .entries()
+            .map_err(|e| ExecutorError::Storage(format!("Failed to read tar entries: {}", e)))?;
+
+        for entry in entries {
+            let mut entry = entry
+                .map_err(|e| ExecutorError::Storage(format!("Failed to read tar entry: {}", e)))?;
+            if let Err(err) = entry.unpack_in(dest_dir) {
+                if ignore_permission_error(&err) {
+                    debug!("Ignoring tar permission error during extract: {}", err);
+                    continue;
+                }
+                return Err(ExecutorError::Storage(format!(
+                    "Failed to extract tar entry: {}",
+                    err
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     // Try gzip first, then plain tar
-    let result = if tarball.starts_with(&[0x1f, 0x8b]) {
+    if tarball.starts_with(&[0x1f, 0x8b]) {
         // gzip magic bytes
         let decoder = GzDecoder::new(tarball);
-        let mut archive = Archive::new(decoder);
-        archive.unpack(dest_dir)
+        unpack_archive(Archive::new(decoder), dest_dir)?;
     } else {
         // Plain tar
-        let mut archive = Archive::new(tarball);
-        archive.unpack(dest_dir)
-    };
-
-    result.map_err(|e| ExecutorError::Storage(format!("Failed to extract tarball: {}", e)))?;
+        unpack_archive(Archive::new(tarball), dest_dir)?;
+    }
 
     Ok(())
 }

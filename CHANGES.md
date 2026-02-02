@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3]
+
+### Fixed
+- Default execution response now matches OpenRuntimes (multipart unless JSON is explicitly requested)
+- JSON responses now fail fast for binary bodies, matching reference behavior
+- Static runtime images are always allowed, even when runtime allowlist is set
+- Build artifact naming respects `OPEN_RUNTIMES_BUILD_COMPRESSION=none` (tar vs tar.gz)
+- Ignore tar permission-setting errors during build source extraction to avoid failures on restricted mounts
+- Prevent maintenance from deleting temp directories for active runtimes
+- Ensure executor container joins runtime networks and resolve container name via Docker
+- Normalize v5 execution paths to always start with `/`
+- Disable ownership and permission restoration when extracting cached tar layers
+
+## [0.1.2]
+
+### Fixed
+- Clean up the previous keep-alive runtime when a new runtime claims the same keep-alive ID
+
+### Changed
+- Default executor keep-alive mode to false so idle cleanup runs unless explicitly enabled
+
 ## [0.1.1]
 
 ### Fixed
@@ -14,15 +35,6 @@ All notable changes to this project will be documented in this file.
 - Optimised CI pipeline: removed redundant build job, merged Docker build and test jobs, switched PR checks to single-arch (amd64)
 - Added cargo-chef dependency caching to production and test Dockerfiles
 - Pinned test Dockerfile base image to `rust:1.93`
-
-## [0.1.2]
-
-### Fixed
-- Clean up the previous keep-alive runtime when a new runtime claims the same keep-alive ID
-
-### Changed
-- Default executor keep-alive mode to false so idle cleanup runs unless explicitly enabled
-
 
 ## [0.1.0]
 
