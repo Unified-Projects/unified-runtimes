@@ -403,9 +403,7 @@ pub async fn extract_source_tarball(tarball: &[u8], dest_dir: &Path) -> Result<(
 
     fn ignore_permission_error(err: &io::Error) -> bool {
         err.kind() == io::ErrorKind::PermissionDenied
-            && err
-                .to_string()
-                .starts_with("failed to set permissions to")
+            && err.to_string().starts_with("failed to set permissions to")
     }
 
     fn unpack_archive<R: io::Read>(mut archive: Archive<R>, dest_dir: &Path) -> Result<()> {
