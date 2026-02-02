@@ -31,7 +31,8 @@ jobs:
             contents: read
         outputs:
             is_release: ${{ steps.check.outputs.is_release }}
-            version: ${{ steps.check.outputs.version }}
+            docker_tag: ${{ steps.check.outputs.docker_tag }}
+            release_version: ${{ steps.check.outputs.release_version }}
         steps:
             - name: Determine version
               id: check
@@ -40,20 +41,24 @@ jobs:
                   MANUAL_TAG: ${{ inputs.docker_tag }}
               run: |
                   if [[ -n "$MANUAL_TAG" ]]; then
+                      RELEASE_VERSION="${MANUAL_TAG#v}"
                       if [[ "${{ inputs.create_release }}" == "true" ]]; then
                           echo "is_release=true" >> "$GITHUB_OUTPUT"
                       else
                           echo "is_release=false" >> "$GITHUB_OUTPUT"
                       fi
-                      echo "version=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
+                      echo "docker_tag=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
+                      echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
                       echo "Manual Docker build with tag: $MANUAL_TAG"
                   elif [[ "$COMMIT_MSG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
                       echo "is_release=true" >> "$GITHUB_OUTPUT"
-                      echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+                      echo "docker_tag=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+                      echo "release_version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
                       echo "Release detected: v${BASH_REMATCH[1]}"
                   else
                       echo "is_release=false" >> "$GITHUB_OUTPUT"
-                      echo "version=" >> "$GITHUB_OUTPUT"
+                      echo "docker_tag=" >> "$GITHUB_OUTPUT"
+                      echo "release_version=" >> "$GITHUB_OUTPUT"
                       echo "Not a release commit: $COMMIT_MSG"
                   fi
 
@@ -61,7 +66,7 @@ jobs:
         name: Build and Release
         runs-on: ubuntu-latest
         needs: check-version
-        if: needs.check-version.outputs.version != ''
+        if: needs.check-version.outputs.docker_tag != ''
         permissions:
             contents: write
             packages: write
@@ -87,7 +92,7 @@ jobs:
                   file: docker/Dockerfile
                   push: true
                   platforms: linux/amd64,linux/arm64
-                  tags: unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
+                  tags: unifiedprojects/urt-executor:${{ needs.check-version.outputs.docker_tag }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
@@ -95,14 +100,14 @@ jobs:
               if: needs.check-version.outputs.is_release == 'true'
               uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
               with:
-                  tag_name: v${{ needs.check-version.outputs.version }}
-                  name: v${{ needs.check-version.outputs.version }}
+                  tag_name: v${{ needs.check-version.outputs.release_version }}
+                  name: v${{ needs.check-version.outputs.release_version }}
                   generate_release_notes: true
                   body: |
                       ## Docker Image
 
                       ```bash
-                      docker pull unifiedprojects/urt-executor:${{ needs.check-version.outputs.version }}
+                      docker pull unifiedprojects/urt-executor:${{ needs.check-version.outputs.docker_tag }}
                       ```
 
                       Or use the latest tag:
