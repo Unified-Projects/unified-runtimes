@@ -47,7 +47,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 # Utilities
 chrono = "0.4"
-uuid = { version = "1.19", features = ["v4"] }
+uuid = { version = "1.20", features = ["v4"] }
 bytes = "1.11"
 url = "2.5"
 http = "1.4"
@@ -70,12 +70,12 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 
 # Lock-free concurrency
-arc-swap = "1.7"
+arc-swap = "1.8"
 dashmap = "6.1"
 
 # Performance optimizations
 smallvec = "1.13"
-memchr = "2.7"
+memchr = "2.8"
 itoa = "1.0"
 num_cpus = "1.16"
 
