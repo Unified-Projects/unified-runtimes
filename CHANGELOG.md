@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-02-20
+
+### Fixed
+- **Tar permission/ACL/xattr failures**: Inject `--no-same-permissions --no-same-owner --no-acls --no-xattrs` into tar extraction commands via `sanitize_tar_flags`, preventing exit code 2 failures when tar tries to restore ownership, permission bits, POSIX ACLs, or extended attributes (including macOS `com.apple.*`) on host-mounted Docker volumes where the container user lacks those privileges. Flags are injected idempotently and only for extract (`x`) invocations; create commands are left unchanged.
+- **Source file permission normalization**: After downloading source archives, recursively normalize permissions on all files (`0o644`) and directories (`0o755`) under the source directory before handing off to the runtime container.
+- **Container startup detection**: Replace the single 100ms sleep + one-shot `inspect_container` check with a 30-second retry loop (200ms poll interval). Terminal states (`exited`, `dead`, `removing`) fail fast; transient states (`created`, `restarting`) continue polling. Fixes runtimes such as Next.js SSR (which log `✓ Ready in 124ms`) never being marked as running due to the race between container startup and the old one-shot check.
+
 ## [0.1.3]
 
 ### Fixed
