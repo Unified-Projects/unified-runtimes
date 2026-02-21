@@ -7,7 +7,7 @@
 
 use crate::error::{ExecutorError, Result};
 use arc_swap::ArcSwap;
-use bollard::container::StatsOptions;
+use bollard::query_parameters::StatsOptions;
 use bollard::Docker;
 use futures_util::StreamExt;
 use serde::Serialize;

@@ -127,6 +127,49 @@ fn validate_runtime_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Sanitize tar extraction commands to prevent permission, ownership, ACL, and xattr failures
+/// on Docker-mounted volumes where the container user lacks the necessary privileges.
+///
+/// Injects `--no-same-permissions --no-same-owner --no-acls --no-xattrs` immediately after
+/// `tar` for any invocation that includes the extract flag (`x`) without the create flag (`c`).
+/// Idempotent: no-op if the flags are already present. Does not touch create commands or
+/// non-tar commands.
+fn sanitize_tar_flags(cmd: &str) -> String {
+    // Idempotent guard: if the flags are already in the command, return unchanged.
+    if cmd.contains("--no-same-permissions") {
+        return cmd.to_string();
+    }
+
+    // Find the `tar ` invocation.
+    let tar_pos = match cmd.find("tar ") {
+        Some(pos) => pos,
+        None => return cmd.to_string(),
+    };
+
+    // Inspect the first argument token after `tar `.
+    let after_tar = &cmd[tar_pos + 4..];
+    let first_arg = after_tar.split_whitespace().next().unwrap_or("");
+
+    // Only handle short-flag style (e.g. -zxf, -xzf, -xf).
+    // Must contain 'x' (extract) and must NOT contain 'c' (create).
+    let is_extract = first_arg.starts_with('-')
+        && !first_arg.starts_with("--")
+        && first_arg.contains('x')
+        && !first_arg.contains('c');
+
+    if !is_extract {
+        return cmd.to_string();
+    }
+
+    // Inject flags immediately after "tar ".
+    let inject_pos = tar_pos + 4;
+    format!(
+        "{}--no-same-permissions --no-same-owner --no-acls --no-xattrs {}",
+        &cmd[..inject_pos],
+        &cmd[inject_pos..]
+    )
+}
+
 /// Validate Docker image name format
 fn validate_image_name(image: &str) -> Result<()> {
     if image.is_empty() {
@@ -435,6 +478,13 @@ pub async fn create_runtime(
         if let Ok(metadata) = tokio::fs::metadata(&local_source).await {
             info!("Source downloaded successfully: {} bytes", metadata.len());
         }
+
+        // Fix permissions on all input source files before handing off to the runtime container.
+        // This prevents tar from trying to chown/chmod on a Docker-mounted volume (exit code 2).
+        if let Err(e) = platform::set_permissions_recursive(&src_dir).await {
+            warn!("Failed to normalize src directory permissions: {}", e);
+            // Non-fatal: log and continue
+        }
     }
 
     // Add standard mounts (Docker.php lines 471-474)
@@ -505,31 +555,53 @@ pub async fn create_runtime(
         }
     }
 
-    // Note: OPR doesn't wait for port during runtime creation (Docker.php lines 482-496)
-    // Port readiness is only checked during execution (Docker.php line 1088)
-    // Just verify container is running
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    match state.docker.inspect_container(&full_name).await {
-        Ok(info) if info.status.to_lowercase().contains("running") => {
-            // Container is running, good to go
-        }
-        Ok(info) => {
-            error!("Container not running, status: {}", info.status);
-            state.docker.remove_container(&full_name, true).await.ok();
-            state.registry.remove(&full_name).await;
-            return Err(ExecutorError::RuntimeFailed(format!(
-                "Container exited with status: {}",
-                info.status
-            )));
-        }
-        Err(e) => {
-            error!("Failed to inspect container: {}", e);
-            state.docker.remove_container(&full_name, true).await.ok();
-            state.registry.remove(&full_name).await;
-            return Err(ExecutorError::RuntimeFailed(format!(
-                "Failed to inspect container: {}",
-                e
-            )));
+    // Wait for container to reach running state, with retries.
+    // A single 100ms sleep is insufficient for runtimes like Next.js SSR that take longer to
+    // start; we poll until the container is running or a terminal state is reached.
+    let startup_timeout = Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(200);
+    let deadline = tokio::time::Instant::now() + startup_timeout;
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        match state.docker.inspect_container(&full_name).await {
+            Ok(info) => {
+                let status = info.status.to_lowercase();
+                if status.contains("running") {
+                    break; // success
+                } else if status == "exited" || status == "dead" || status == "removing" {
+                    // Terminal failure states — no point retrying.
+                    error!("Container reached terminal state: {}", info.status);
+                    state.docker.remove_container(&full_name, true).await.ok();
+                    state.registry.remove(&full_name).await;
+                    return Err(ExecutorError::RuntimeFailed(format!(
+                        "Container exited with status: {}",
+                        info.status
+                    )));
+                }
+                // "created", "restarting", "paused", etc: keep waiting.
+                if tokio::time::Instant::now() >= deadline {
+                    error!("Container startup timed out, last status: {}", info.status);
+                    state.docker.remove_container(&full_name, true).await.ok();
+                    state.registry.remove(&full_name).await;
+                    return Err(ExecutorError::RuntimeFailed(format!(
+                        "Container startup timed out (last status: {})",
+                        info.status
+                    )));
+                }
+            }
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    error!("Failed to inspect container after timeout: {}", e);
+                    state.docker.remove_container(&full_name, true).await.ok();
+                    state.registry.remove(&full_name).await;
+                    return Err(ExecutorError::RuntimeFailed(format!(
+                        "Failed to inspect container: {}",
+                        e
+                    )));
+                }
+                // Transient inspect error: retry.
+            }
         }
     }
 
@@ -541,17 +613,20 @@ pub async fn create_runtime(
     if !req.command.is_empty() {
         info!("Executing build command: {}", req.command);
 
+        // Normalize tar extraction flags to prevent permission errors on Docker volumes.
+        let sanitized_command = sanitize_tar_flags(&req.command);
+
         let wrapped_command = if req.version == "v2" {
             // v2: simple shell with log capture
             format!(
                 "touch /var/tmp/logs.txt && ({}) >> /var/tmp/logs.txt 2>&1 && cat /var/tmp/logs.txt",
-                req.command
+                sanitized_command
             )
         } else {
             // v5: use script for proper TTY logging
             format!(
                 "mkdir -p /tmp/logging && touch /tmp/logging/timings.txt && touch /tmp/logging/logs.txt && script --log-out /tmp/logging/logs.txt --flush --log-timing /tmp/logging/timings.txt --return --quiet --command \"{}\"",
-                req.command.replace('"', "\\\"")
+                sanitized_command.replace('"', "\\\"")
             )
         };
 
@@ -826,4 +901,94 @@ async fn cleanup_previous_keep_alive_runtime(
     }
 
     state.registry.remove(previous_owner).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_tar_flags;
+
+    #[test]
+    fn test_sanitize_tar_flags_injects_all_flags() {
+        let cmd = "tar -zxf /tmp/code.tar.gz -C /mnt/code && helpers/build.sh 'npm install'";
+        let result = sanitize_tar_flags(cmd);
+        assert!(
+            result.contains("--no-same-permissions"),
+            "expected --no-same-permissions in: {}",
+            result
+        );
+        assert!(
+            result.contains("--no-same-owner"),
+            "expected --no-same-owner in: {}",
+            result
+        );
+        assert!(
+            result.contains("--no-acls"),
+            "expected --no-acls in: {}",
+            result
+        );
+        assert!(
+            result.contains("--no-xattrs"),
+            "expected --no-xattrs in: {}",
+            result
+        );
+        // Non-tar parts of the command must be preserved.
+        assert!(
+            result.contains("helpers/build.sh"),
+            "expected helpers/build.sh to be preserved in: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sanitize_tar_flags_xzf_variant() {
+        let cmd = "tar -xzf /tmp/code.tar.gz -C /mnt/code";
+        let result = sanitize_tar_flags(cmd);
+        assert!(result.contains("--no-same-permissions"));
+        assert!(result.contains("--no-same-owner"));
+        assert!(result.contains("--no-acls"));
+        assert!(result.contains("--no-xattrs"));
+    }
+
+    #[test]
+    fn test_sanitize_tar_flags_xf_variant() {
+        let cmd = "tar -xf /tmp/code.tar -C /mnt/code";
+        let result = sanitize_tar_flags(cmd);
+        assert!(result.contains("--no-same-permissions"));
+        assert!(result.contains("--no-same-owner"));
+        assert!(result.contains("--no-acls"));
+        assert!(result.contains("--no-xattrs"));
+    }
+
+    #[test]
+    fn test_sanitize_tar_flags_no_change_for_create() {
+        // tar -czf is a create command and must not be modified.
+        let cmd = "tar -czf output.tar.gz /mnt/code";
+        let result = sanitize_tar_flags(cmd);
+        assert!(
+            !result.contains("--no-same-permissions"),
+            "create command must not be modified, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sanitize_tar_flags_idempotent() {
+        // Flags already present: must not be duplicated.
+        let cmd = "tar --no-same-permissions --no-same-owner --no-acls --no-xattrs -zxf /tmp/code.tar.gz -C /mnt/code";
+        let result = sanitize_tar_flags(cmd);
+        assert_eq!(
+            result.matches("--no-same-permissions").count(),
+            1,
+            "flags must appear exactly once, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sanitize_tar_flags_no_tar_in_command() {
+        // Command with no tar invocation must be returned unchanged.
+        let cmd = "npm install && npm run build";
+        let result = sanitize_tar_flags(cmd);
+        assert_eq!(result, cmd);
+    }
 }

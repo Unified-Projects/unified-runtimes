@@ -3,7 +3,8 @@
 #![allow(deprecated)]
 
 use crate::error::{ExecutorError, Result};
-use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
+use bollard::models::{NetworkConnectRequest, NetworkCreateRequest};
+use bollard::query_parameters::InspectNetworkOptions;
 use bollard::Docker;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -14,9 +15,9 @@ pub async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
     match docker
         .inspect_network(
             name,
-            Some(InspectNetworkOptions::<String> {
+            Some(InspectNetworkOptions {
                 verbose: false,
-                scope: "local".to_string(),
+                scope: Some("local".to_string()),
             }),
         )
         .await
@@ -37,11 +38,13 @@ pub async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
 
     // Create network
     info!("Creating network: {}", name);
-    let options = CreateNetworkOptions {
+    let options = NetworkCreateRequest {
         name: name.to_string(),
-        driver: "bridge".to_string(),
-        check_duplicate: true,
-        labels: HashMap::from([("urt.managed".to_string(), "true".to_string())]),
+        driver: Some("bridge".to_string()),
+        labels: Some(HashMap::from([(
+            "urt.managed".to_string(),
+            "true".to_string(),
+        )])),
         ..Default::default()
     };
 
@@ -67,14 +70,11 @@ pub async fn remove_network(docker: &Docker, name: &str) -> Result<()> {
 
 /// Connect a container to a network
 pub async fn connect_container(docker: &Docker, network: &str, container: &str) -> Result<()> {
-    use bollard::models::EndpointSettings;
-    use bollard::network::ConnectNetworkOptions;
-
     debug!("Connecting container {} to network {}", container, network);
 
-    let config = ConnectNetworkOptions {
+    let config = NetworkConnectRequest {
         container: container.to_string(),
-        endpoint_config: EndpointSettings::default(),
+        endpoint_config: None,
     };
 
     docker.connect_network(network, config).await.map_err(|e| {

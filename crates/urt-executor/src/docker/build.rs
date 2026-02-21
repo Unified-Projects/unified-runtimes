@@ -224,7 +224,10 @@ pub async fn build_image<S: Storage>(
                         image_id = id;
                     }
                 }
-                if let Some(error_msg) = info.error {
+                if let Some(error_detail) = info.error_detail {
+                    let error_msg = error_detail
+                        .message
+                        .unwrap_or_else(|| "unknown build error".to_string());
                     error!("Build error: {}", error_msg);
                     return Err(ExecutorError::RuntimeFailed(format!(
                         "Build failed: {}",
