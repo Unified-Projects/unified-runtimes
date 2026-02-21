@@ -11,12 +11,12 @@ use crate::config::ExecutorConfig;
 use crate::error::{ExecutorError, Result};
 use crate::storage::{BuildCache, Storage};
 use bollard::auth::DockerCredentials;
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+use bollard::container::LogOutput;
+use bollard::models::{ContainerCreateBody, HostConfig, RestartPolicy, RestartPolicyNameEnum};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
+    LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
-use bollard::image::CreateImageOptions;
-use bollard::models::{HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -114,7 +114,7 @@ impl DockerManager {
 
         let options = ListContainersOptions {
             all: true,
-            filters,
+            filters: Some(filters),
             ..Default::default()
         };
 
@@ -152,7 +152,7 @@ impl DockerManager {
         info!("Pulling image: {}", image);
 
         let options = CreateImageOptions {
-            from_image: image,
+            from_image: Some(image.to_string()),
             ..Default::default()
         };
 
@@ -252,7 +252,7 @@ impl DockerManager {
         };
 
         // Build container config
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(container_config.image.clone()),
             hostname: if container_config.hostname.is_empty() {
                 None
@@ -268,8 +268,8 @@ impl DockerManager {
         };
 
         let options = CreateContainerOptions {
-            name: &container_config.name,
-            platform: None,
+            name: Some(container_config.name.clone()),
+            platform: String::new(),
         };
 
         // Create container
@@ -291,10 +291,7 @@ impl DockerManager {
 
         // Start container
         self.docker
-            .start_container(
-                &container_config.name,
-                None::<StartContainerOptions<String>>,
-            )
+            .start_container(&container_config.name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ExecutorError::Docker(e.to_string()))?;
 
@@ -307,7 +304,10 @@ impl DockerManager {
     pub async fn stop_container(&self, name: &str, timeout_secs: i64) -> Result<()> {
         debug!("Stopping container: {}", name);
 
-        let options = StopContainerOptions { t: timeout_secs };
+        let options = StopContainerOptions {
+            t: Some(timeout_secs as i32),
+            ..Default::default()
+        };
 
         self.docker
             .stop_container(name, Some(options))
@@ -358,7 +358,7 @@ impl DockerManager {
     pub async fn inspect_container(&self, name: &str) -> Result<ContainerInfo> {
         let info = self
             .docker
-            .inspect_container(name, None::<bollard::container::InspectContainerOptions>)
+            .inspect_container(name, None::<InspectContainerOptions>)
             .await
             .map_err(|e| {
                 if e.to_string().contains("No such container") {
@@ -397,7 +397,7 @@ impl DockerManager {
 
         let options = ListContainersOptions {
             all: true,
-            filters,
+            filters: Some(filters),
             ..Default::default()
         };
 
@@ -468,7 +468,7 @@ impl DockerManager {
         follow: bool,
         tail: Option<&str>,
     ) -> impl futures_util::Stream<Item = Result<String>> + '_ {
-        let options = LogsOptions::<String> {
+        let options = LogsOptions {
             follow,
             stdout: true,
             stderr: true,

@@ -9,6 +9,13 @@ All notable changes to this project will be documented in this file.
 - **Source file permission normalization**: After downloading source archives, recursively normalize permissions on all files (`0o644`) and directories (`0o755`) under the source directory before handing off to the runtime container.
 - **Container startup detection**: Replace the single 100ms sleep + one-shot `inspect_container` check with a 30-second retry loop (200ms poll interval). Terminal states (`exited`, `dead`, `removing`) fail fast; transient states (`created`, `restarting`) continue polling. Fixes runtimes such as Next.js SSR (which log `✓ Ready in 124ms`) never being marked as running due to the race between container startup and the old one-shot check.
 
+### Dependencies
+- Bumped `bollard` 0.19 → 0.20 (major API reorganisation: all `*Options` types moved to `bollard::query_parameters`, `Config` replaced by `ContainerCreateBody`, `BuildInfo.error` replaced by `error_detail`, network types moved to `bollard::models`)
+- Bumped `time` 0.3.44 → 0.3.47 (resolves RUSTSEC-2026-0009)
+- Bumped `uuid` 1.19 → 1.21, `arc-swap` 1.7 → 1.8, `memchr` 2.7 → 2.8
+- Updated transitive dependencies: `tower`, `serde_json`, `thiserror`, `anyhow`, `flate2`, `chrono`, `bytes`, `url`, `futures-util`, `tempfile`, `criterion`
+- Pinned all GitHub Actions to full commit SHAs: `actions/checkout` v6.0.2, `docker/build-push-action` v6.19.2, `docker/login-action` v3.7.0, `docker/setup-qemu-action` v3, `docker/setup-buildx-action` v3, `github/codeql-action` v4.32.3, `dtolnay/rust-toolchain` stable, `Swatinem/rust-cache` v2, `actions/upload-artifact` v4
+
 ## [0.1.3]
 
 ### Fixed
