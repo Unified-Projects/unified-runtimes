@@ -62,14 +62,21 @@ pub async fn ping_handler() -> Json<MinimalHealthResponse> {
     Json(MinimalHealthResponse { status: "ok" })
 }
 
-/// GET /v1/health - Health check with stats
+/// GET /v1/health - OpenRuntimes-compatible health check.
 ///
-/// Returns minimal info for unauthenticated requests (just status: "ok")
-/// Returns full stats for authenticated requests.
+/// Reference executor responds with plain text "OK".
+pub async fn health_handler() -> &'static str {
+    "OK"
+}
+
+/// GET /v1/health/stats - Enhanced health endpoint with runtime and host stats.
 ///
-/// This is the hot path - uses lock-free reads via ArcSwap for zero contention
-/// under high concurrency (50+ concurrent connections).
-pub async fn health_handler(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
+/// Returns minimal info for unauthenticated requests (just status: "ok"),
+/// and full stats for authenticated requests.
+pub async fn health_stats_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response> {
     // Fast path: if auth is required, check header existence first
     // This short-circuits before any string parsing for unauthenticated requests
     if !state.config.secret.is_empty() {

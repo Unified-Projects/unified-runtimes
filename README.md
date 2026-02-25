@@ -16,6 +16,7 @@ URT Executor provides full API compatibility with the PHP OpenRuntimes Executor 
 - S3/MinIO storage support for build artifacts
 - Graceful shutdown with active execution draining
 - Container stats collection and caching
+- Optional Prometheus `/metrics` exporter for Grafana/Prometheus
 - Automatic inactive container cleanup
 
 ## Project Structure
@@ -81,22 +82,35 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_HOST` | `0.0.0.0` | Server bind address |
 | `URT_PORT` | `80` | Server port |
 | `URT_SECRET` | `` | API authentication secret (required for production) |
-| `URT_NETWORK` | `executor_runtimes` | Docker network for containers |
+| `URT_METRICS` | `false` | Enable Prometheus metrics endpoint at `/metrics` |
+| `URT_NETWORK` | `openruntimes-runtimes` | Docker network for containers |
 | `URT_KEEP_ALIVE` | `false` | Disable idle timeout (containers only removed via DELETE) |
 | `URT_INACTIVE_THRESHOLD` | `60` | Seconds before marking runtime inactive |
 | `URT_MAINTENANCE_INTERVAL` | `3600` | Seconds between cleanup tasks |
+| `URT_AUTOSCALE` | `false` | Enable autoscale mode with adaptive concurrency limiting |
+| `URT_MAX_CONCURRENT_EXECUTIONS` | `` | Optional max concurrent executions (autoscale mode) |
+| `URT_MAX_CONCURRENT_RUNTIME_CREATES` | `` | Optional max concurrent runtime creations (autoscale mode) |
+| `URT_EXECUTION_QUEUE_WAIT_MS` | `2000` | Max queue wait before execution fast-fails with overload |
+| `URT_RUNTIME_CREATE_QUEUE_WAIT_MS` | `5000` | Max queue wait before runtime create fast-fails with overload |
 | `URT_MIN_CPUS` | `0` | Minimum CPU allocation override |
 | `URT_MIN_MEMORY` | `0` | Minimum memory (MB) override |
 | `URT_MAX_BODY_SIZE` | `20MB` | Maximum request body size |
-| `URT_RUNTIMES` | `` | Comma-separated allowlist of runtime images |
+| `URT_RUNTIMES` | `` | Comma-separated allowlist of runtime images (falls back to `OPR_EXECUTOR_IMAGES`) |
 | `URT_CONNECTION_STORAGE` | `local://localhost` | Storage DSN for builds |
+| `URT_CACHE_CLEANUP_ON_SHUTDOWN` | `false` | If true, purge local download cache during shutdown |
 
 See `.env.example` for the complete list with descriptions.
 
 ## API Endpoints
 
 ### Health
-- `GET /v1/health` - Health check
+- `GET /v1/health` - OpenRuntimes-compatible text health check (`OK`)
+- `GET /v1/health/stats` - Enhanced JSON health stats (optional)
+- `GET /v1/ping` - Lightweight ping check
+
+### Metrics
+- `GET /metrics` - Prometheus metrics (enabled only when `URT_METRICS=true`)
+  - When `URT_SECRET` is set, provide `Authorization: Bearer <secret>`
 
 ### Runtimes
 - `POST /v1/runtimes` - Create a new runtime

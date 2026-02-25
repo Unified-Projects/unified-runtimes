@@ -6,12 +6,15 @@
 pub mod config;
 pub mod docker;
 pub mod error;
+pub mod execution_counter;
 pub mod middleware;
 pub mod platform;
+pub mod resilience;
 pub mod routes;
 pub mod runtime;
 pub mod storage;
 pub mod tasks;
+pub mod telemetry;
 
 pub use config::ExecutorConfig;
 pub use error::{ExecutorError, Result};

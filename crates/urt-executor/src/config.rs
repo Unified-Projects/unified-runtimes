@@ -7,6 +7,7 @@
 //! This allows existing OpenRuntimes deployments to work as drop-in replacements
 //! while new deployments can use the URT prefix.
 
+use std::collections::HashSet;
 use std::env;
 
 // ============================================================================
@@ -172,6 +173,26 @@ fn parse_size(s: &str) -> Option<usize> {
     num_str.trim().parse::<usize>().ok().map(|n| n * multiplier)
 }
 
+fn parse_bool_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enabled"
+    )
+}
+
+fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut deduped = Vec::with_capacity(values.len());
+
+    for value in values {
+        if seen.insert(value.clone()) {
+            deduped.push(value);
+        }
+    }
+
+    deduped
+}
+
 /// Main configuration for the executor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -179,6 +200,7 @@ pub struct ExecutorConfig {
     pub host: String,
     pub port: u16,
     pub secret: String,
+    pub metrics_enabled: bool,
 
     // Environment mode
     #[allow(dead_code)]
@@ -204,6 +226,11 @@ pub struct ExecutorConfig {
     pub keep_alive: bool,
     pub inactive_threshold: u64,   // seconds
     pub maintenance_interval: u64, // seconds
+    pub autoscale: bool,
+    pub max_concurrent_executions: Option<usize>,
+    pub max_concurrent_runtime_creates: Option<usize>,
+    pub execution_queue_wait_ms: u64,
+    pub runtime_create_queue_wait_ms: u64,
 
     // Request limits
     pub max_body_size: usize, // bytes
@@ -237,31 +264,42 @@ impl ExecutorConfig {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(80),
             secret: env_urt_or_opr_default("SECRET", ""),
+            metrics_enabled: env_urt_or_opr("METRICS")
+                .map(|v| parse_bool_flag(&v))
+                .unwrap_or(false),
 
             // Environment mode
             env: env_urt_or_opr_default("ENV", "production"),
 
             // Docker
-            networks: env_urt_or_opr_default("NETWORK", "executor_runtimes")
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            networks: dedupe_preserve_order(
+                env_urt_or_opr_default("NETWORK", "openruntimes-runtimes")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            ),
             hostname,
             docker_hub_username: env_urt_or_opr("DOCKER_HUB_USERNAME").filter(|s| !s.is_empty()),
             docker_hub_password: env_urt_or_opr("DOCKER_HUB_PASSWORD").filter(|s| !s.is_empty()),
 
             // Runtimes
-            allowed_runtimes: env_urt_or_opr_default("RUNTIMES", "")
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.trim().to_string())
-                .collect(),
-            runtime_versions: env_urt_or_opr_default("RUNTIME_VERSIONS", "v5")
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            allowed_runtimes: dedupe_preserve_order(
+                env_urt_or_opr("RUNTIMES")
+                    .or_else(|| env_urt_or_opr("IMAGES"))
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.trim().to_string())
+                    .collect(),
+            ),
+            runtime_versions: dedupe_preserve_order(
+                env_urt_or_opr_default("RUNTIME_VERSIONS", "v5")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            ),
             image_pull_enabled: env_urt_or_opr("IMAGE_PULL")
                 .map(|v| v.to_lowercase() != "disabled")
                 .unwrap_or(true),
@@ -284,6 +322,23 @@ impl ExecutorConfig {
             maintenance_interval: env_urt_or_opr("MAINTENANCE_INTERVAL")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
+            autoscale: env_urt_or_opr("AUTOSCALE")
+                .map(|v| parse_bool_flag(&v))
+                .unwrap_or(false),
+            max_concurrent_executions: env_urt_or_opr("MAX_CONCURRENT_EXECUTIONS")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0),
+            max_concurrent_runtime_creates: env_urt_or_opr("MAX_CONCURRENT_RUNTIME_CREATES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0),
+            execution_queue_wait_ms: env_urt_or_opr("EXECUTION_QUEUE_WAIT_MS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2_000)
+                .max(1),
+            runtime_create_queue_wait_ms: env_urt_or_opr("RUNTIME_CREATE_QUEUE_WAIT_MS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5_000)
+                .max(1),
 
             // Request limits - default 20MB
             max_body_size: env_urt_or_opr("MAX_BODY_SIZE")
@@ -404,10 +459,12 @@ impl ExecutorConfig {
     /// Get expanded runtime names for warmup
     /// Converts shorthand names to full image references
     pub fn expanded_runtimes(&self) -> Vec<String> {
-        self.allowed_runtimes
-            .iter()
-            .map(|r| self.expand_runtime_name(r))
-            .collect()
+        dedupe_preserve_order(
+            self.allowed_runtimes
+                .iter()
+                .map(|r| self.expand_runtime_name(r))
+                .collect(),
+        )
     }
 }
 
@@ -500,6 +557,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_bool_flag() {
+        assert!(parse_bool_flag("1"));
+        assert!(parse_bool_flag("true"));
+        assert!(parse_bool_flag("yes"));
+        assert!(parse_bool_flag("on"));
+        assert!(parse_bool_flag("enabled"));
+        assert!(!parse_bool_flag("0"));
+        assert!(!parse_bool_flag("false"));
+        assert!(!parse_bool_flag("disabled"));
+    }
+
+    #[test]
     fn test_expand_runtime_name() {
         let mut config = ExecutorConfig::from_env();
         config.runtime_versions = vec!["v5".to_string()];
@@ -554,5 +623,22 @@ mod tests {
         assert_eq!(expanded[0], "openruntimes/node:v5-22");
         assert_eq!(expanded[1], "openruntimes/python:v5-3.11");
         assert_eq!(expanded[2], "openruntimes/bun:v4-1.0"); // Already had tag, unchanged
+    }
+
+    #[test]
+    fn test_expanded_runtimes_deduplicated() {
+        let mut config = ExecutorConfig::from_env();
+        config.runtime_versions = vec!["v5".to_string()];
+        config.allowed_runtimes = vec![
+            "node-22".to_string(),
+            "node-22".to_string(),
+            "openruntimes/node:v5-22".to_string(),
+            "python-3.11".to_string(),
+        ];
+
+        let expanded = config.expanded_runtimes();
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded[0], "openruntimes/node:v5-22");
+        assert_eq!(expanded[1], "openruntimes/python:v5-3.11");
     }
 }

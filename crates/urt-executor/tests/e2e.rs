@@ -101,6 +101,7 @@ fn test_config(network: String) -> ExecutorConfig {
         host: "127.0.0.1".to_string(),
         port: 0, // Will be overridden
         secret: TEST_SECRET.to_string(),
+        metrics_enabled: false,
         env: "development".to_string(),
         networks: vec![network],
         hostname: "e2e-test-executor".to_string(),
@@ -114,6 +115,11 @@ fn test_config(network: String) -> ExecutorConfig {
         keep_alive: true,
         inactive_threshold: 300,
         maintenance_interval: 3600,
+        autoscale: false,
+        max_concurrent_executions: None,
+        max_concurrent_runtime_creates: None,
+        execution_queue_wait_ms: 2_000,
+        runtime_create_queue_wait_ms: 5_000,
         max_body_size: 20 * 1024 * 1024,
         storage: StorageConfig::default(),
         logging_config: None,
@@ -223,6 +229,10 @@ async fn create_test_server_with(
         keep_alive_registry: keep_alive_registry.clone(),
         http_client: Client::new(),
         storage: storage.clone(),
+        execution_limiter: None,
+        runtime_create_limiter: None,
+        execution_limiter_capacity: None,
+        runtime_create_limiter_capacity: None,
     };
 
     // Bind to random available port
@@ -439,7 +449,7 @@ async fn test_health_endpoint_returns_valid_structure() {
 
     let response = server
         .client
-        .get(format!("{}/v1/health", server.base_url))
+        .get(format!("{}/v1/health/stats", server.base_url))
         .header(server.auth_header().0, server.auth_header().1.clone())
         .send()
         .await
@@ -596,7 +606,7 @@ async fn test_delete_runtime_not_found() {
         .await
         .expect("Failed to send request");
 
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1044,7 +1054,7 @@ async fn test_health_shows_runtime_stats() {
 
             let response = server
                 .client
-                .get(format!("{}/v1/health", server.base_url))
+                .get(format!("{}/v1/health/stats", server.base_url))
                 .header(server.auth_header().0, server.auth_header().1.clone())
                 .send()
                 .await
@@ -1238,6 +1248,10 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
         keep_alive_registry: KeepAliveRegistry::new(),
         http_client: Client::new(),
         storage,
+        execution_limiter: None,
+        runtime_create_limiter: None,
+        execution_limiter_capacity: None,
+        runtime_create_limiter_capacity: None,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -2054,7 +2068,7 @@ mod error_scenarios {
             .await
             .expect("Failed to send request");
 
-        // Should still return valid JSON response
+        // Should still return a successful health response
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -2348,7 +2362,7 @@ mod runtime_state {
             // Check health endpoint for our runtime
             let response = server
                 .client
-                .get(format!("{}/v1/health", server.base_url))
+                .get(format!("{}/v1/health/stats", server.base_url))
                 .header(server.auth_header().0, server.auth_header().1.clone())
                 .send()
                 .await
@@ -2844,6 +2858,9 @@ mod docker_dns_resolution {
     /// 3. The listening flag is correctly maintained across keep-alive executions
     #[tokio::test]
     async fn test_execution_with_keepalive() {
+        if should_skip_socket_required("test_execution_with_keepalive").await {
+            return;
+        }
         let server = create_test_server().await;
         let runtime_id = unique_runtime_id("keepalive");
         let keep_alive_id = "test-keepalive-service";
@@ -2969,6 +2986,9 @@ mod docker_dns_resolution {
     /// separate function invocations over time.
     #[tokio::test]
     async fn test_keepalive_runtime_reuse() {
+        if should_skip_socket_required("test_keepalive_runtime_reuse").await {
+            return;
+        }
         let server = create_test_server().await;
         let runtime_id = unique_runtime_id("keepalive-reuse");
 

@@ -7,8 +7,11 @@ use super::runtimes::{
 };
 use super::AppState;
 use crate::error::{ExecutorError, Result};
+use crate::execution_counter::ExecutionGuard;
+use crate::resilience::retry_with_backoff;
 use crate::runtime::{get_protocol, ExecuteRequest, ExecuteResponse};
 use crate::tasks;
+use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
     body::Body,
     extract::{Path, State},
@@ -337,7 +340,10 @@ pub async fn create_execution(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    debug!("Executing function in runtime: {}", runtime_id);
+    let mut operation_timer = OperationTimer::new(LatencyKind::Execution);
+    let _execution_guard = ExecutionGuard::new();
+
+    debug!(runtime_id = %runtime_id, "Executing function in runtime");
 
     // Check Content-Type to determine parsing strategy
     let content_type = headers
@@ -374,6 +380,27 @@ pub async fn create_execution(
             "Timeout cannot exceed 900 seconds".to_string(),
         ));
     }
+
+    let queue_wait_started = Instant::now();
+    let _execution_permit = match &state.execution_limiter {
+        Some(limiter) => {
+            let queue_wait_timeout = Duration::from_millis(state.config.execution_queue_wait_ms);
+            match tokio::time::timeout(queue_wait_timeout, limiter.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => {
+                    metrics().observe_execution_queue_wait(queue_wait_started.elapsed());
+                    Some(permit)
+                }
+                Ok(Err(_)) => return Err(ExecutorError::Unknown),
+                Err(_) => {
+                    metrics().observe_execution_queue_wait(queue_wait_timeout);
+                    metrics().inc_error_class("create_execution", "overload");
+                    operation_timer.mark_overload();
+                    return Err(ExecutorError::ExecutionOverloaded);
+                }
+            }
+        }
+        None => None,
+    };
 
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
@@ -488,29 +515,25 @@ pub async fn create_execution(
     // Get protocol handler
     let protocol = get_protocol(&runtime.version);
 
-    // Execute with retries for transient network errors while the runtime boots.
-    let mut attempt = 0;
-    let max_attempts = state.config.retry_attempts.max(1);
-    let response = loop {
-        match protocol
-            .execute(&runtime, &exec_req, &state.http_client)
-            .await
-        {
-            Ok(response) => break response,
-            Err(ExecutorError::Network(err)) => {
-                attempt += 1;
-                if attempt >= max_attempts {
-                    return Err(ExecutorError::RuntimeTimeout);
-                }
-                debug!(
-                    "Execution network error (attempt {}/{}): {}",
-                    attempt, max_attempts, err
-                );
-                tokio::time::sleep(Duration::from_millis(state.config.retry_delay_ms)).await;
-            }
-            Err(err) => return Err(err),
+    // Execute with jittered retries for transient runtime networking failures.
+    let response: ExecuteResponse = retry_with_backoff(
+        "execution_protocol",
+        state.config.retry_attempts,
+        state.config.retry_delay_ms,
+        |_| async {
+            protocol
+                .execute(&runtime, &exec_req, &state.http_client)
+                .await
+        },
+    )
+    .await
+    .map_err(|err| {
+        if matches!(err, ExecutorError::Network(_)) {
+            ExecutorError::RuntimeTimeout
+        } else {
+            err
         }
-    };
+    })?;
 
     // Determine response format based on Accept header
     // Matches executor-main: default to multipart unless JSON is explicitly requested.
@@ -521,6 +544,7 @@ pub async fn create_execution(
 
     if !accepts_json(accept) {
         // Return multipart response
+        operation_timer.mark_success();
         return Ok(build_multipart_response(&response));
     }
 
@@ -531,6 +555,7 @@ pub async fn create_execution(
         )
     })?;
 
+    operation_timer.mark_success();
     Ok(Json(JsonExecutionResponse {
         status_code: response.status_code,
         body: body.to_string(),

@@ -78,8 +78,19 @@ pub async fn connect_container(docker: &Docker, network: &str, container: &str) 
     };
 
     docker.connect_network(network, config).await.map_err(|e| {
-        warn!("Failed to connect {} to {}: {}", container, network, e);
-        ExecutorError::Docker(e.to_string())
+        let message = e.to_string();
+        if message.contains("No such container") {
+            debug!(
+                "Container {} not found while connecting to network {} (non-fatal)",
+                container, network
+            );
+            return ExecutorError::RuntimeNotFound;
+        }
+        warn!(
+            "Failed to connect {} to {}: {}",
+            container, network, message
+        );
+        ExecutorError::Docker(message)
     })?;
 
     Ok(())
