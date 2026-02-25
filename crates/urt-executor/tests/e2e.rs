@@ -3191,17 +3191,18 @@ mod lifecycle_resilience {
             "Expected orphan container before cleanup"
         );
 
-        let cleanup_happened = wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
-            let labels = labels.clone();
-            let owner_name = owner_name.clone();
-            let orphan_name = orphan_name.clone();
-            async move {
-                let current = list_containers_with_labels(&labels).await;
-                current.iter().any(|name| name == &owner_name)
-                    && !current.iter().any(|name| name == &orphan_name)
-            }
-        })
-        .await;
+        let cleanup_happened =
+            wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
+                let labels = labels.clone();
+                let owner_name = owner_name.clone();
+                let orphan_name = orphan_name.clone();
+                async move {
+                    let current = list_containers_with_labels(&labels).await;
+                    current.iter().any(|name| name == &owner_name)
+                        && !current.iter().any(|name| name == &orphan_name)
+                }
+            })
+            .await;
 
         if !cleanup_happened {
             let after = list_containers_with_labels(&labels).await;
@@ -3315,28 +3316,29 @@ mod lifecycle_resilience {
             "Expected multiple runtimes to be created in mass test"
         );
 
-        let cleanup_happened = wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
-            let base_url = server.base_url.clone();
-            let auth = server.auth_header().1.clone();
-            let client = server.client.clone();
-            async move {
-                let response = client
-                    .get(format!("{}/v1/runtimes", base_url))
-                    .header("Authorization", auth)
-                    .send()
-                    .await;
+        let cleanup_happened =
+            wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
+                let base_url = server.base_url.clone();
+                let auth = server.auth_header().1.clone();
+                let client = server.client.clone();
+                async move {
+                    let response = client
+                        .get(format!("{}/v1/runtimes", base_url))
+                        .header("Authorization", auth)
+                        .send()
+                        .await;
 
-                match response {
-                    Ok(resp) if resp.status() == StatusCode::OK => {
-                        let body: Value = resp.json().await.unwrap_or_else(|_| json!([]));
-                        let remaining = body.as_array().map(|a| a.len()).unwrap_or(0);
-                        remaining <= 2
+                    match response {
+                        Ok(resp) if resp.status() == StatusCode::OK => {
+                            let body: Value = resp.json().await.unwrap_or_else(|_| json!([]));
+                            let remaining = body.as_array().map(|a| a.len()).unwrap_or(0);
+                            remaining <= 2
+                        }
+                        _ => false,
                     }
-                    _ => false,
                 }
-            }
-        })
-        .await;
+            })
+            .await;
 
         if !cleanup_happened {
             let response = server
