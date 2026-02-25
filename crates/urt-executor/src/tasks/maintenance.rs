@@ -439,7 +439,9 @@ async fn cleanup_idle(
     for runtime in runtimes_to_cleanup {
         let name = &runtime.name;
 
-        let removed = remove_container_for_cleanup(docker, name, true, "idle").await;
+        // Force removal is enough for maintenance cleanup and avoids long per-container
+        // graceful-stop waits that can stall cleanup under load.
+        let removed = remove_container_for_cleanup(docker, name, false, "idle").await;
         if !removed {
             debug!(
                 "Keeping idle runtime {} in registry for retry after failed Docker removal",
@@ -557,13 +559,9 @@ async fn cleanup_orphaned_keepalive(
                 container.name, ka_id
             );
 
-            let removed = remove_container_for_cleanup(
-                docker,
-                &container.name,
-                is_container_running(&container),
-                "orphaned keep-alive",
-            )
-            .await;
+            let removed =
+                remove_container_for_cleanup(docker, &container.name, false, "orphaned keep-alive")
+                    .await;
             if !removed {
                 debug!(
                     "Keeping orphaned runtime {} in registry for retry after failed Docker removal",
