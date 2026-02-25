@@ -119,6 +119,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create keep-alive registry for per-runtime cleanup protection
     let keep_alive_registry = KeepAliveRegistry::new();
 
+    // Adopt any existing managed containers from previous runs
+    tasks::adopt_existing_containers(&docker, &registry, &keep_alive_registry, &config.hostname)
+        .await;
+
     let mut default_headers = reqwest::header::HeaderMap::new();
     // Force no compression, matches curl / Docker.php behavior
     default_headers.insert(

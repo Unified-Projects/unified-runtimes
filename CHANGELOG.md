@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-02-25
+
+### Fixed
+- **Lifecycle cleanup safety**: Cleanup workers no longer drop runtime metadata when Docker container removal fails. Registry entries are preserved for retry, preventing unmanaged live container drift.
+- **Targeted re-adoption on runtime misses**: `GET /v1/runtimes/:id` and execution runtime-miss paths now attempt adoption for the specific container name instead of scanning all managed containers, reducing Docker load under repeated bad IDs/misses.
+- **Clippy CI regression**: Restored `-D warnings` compatibility by handling the newly-unused registry helper without failing lint.
+
+### Changed
+- **Container state detection hardening**: Runtime lifecycle reconciliation now uses richer container metadata (canonical state, labels, env, hostname) and more resilient startup/readiness behavior.
+- **Keep-alive orphan reconciliation**: Maintenance cleanup better reconciles keep-alive ownership and stale/orphaned containers after replacements and restarts.
+- **Coverage expansion**: Added lifecycle resilience E2E scenarios for restart re-adoption, keep-alive orphan cleanup, chaos deletion detection, and mass cleanup behavior.
+
 ## [0.1.4] - 2026-02-20
 
 ### Fixed

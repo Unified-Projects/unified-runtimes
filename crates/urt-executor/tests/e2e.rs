@@ -12,6 +12,7 @@
 
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,14 +73,25 @@ fn local_fixture_path() -> String {
 struct TestServer {
     base_url: String,
     client: Client,
-    _handle: tokio::task::JoinHandle<()>,
-    // Keep the shutdown sender alive so the stats collector doesn't exit
-    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+    // Keep the shutdown sender alive so background workers can be stopped in Drop.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl TestServer {
     fn auth_header(&self) -> (&'static str, String) {
         ("Authorization", format!("Bearer {}", TEST_SECRET))
+    }
+
+    fn runtime_container_name(&self, runtime_id: &str, hostname: &str) -> String {
+        format!("{}-{}", hostname, runtime_id)
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        self.handle.abort();
     }
 }
 
@@ -110,6 +122,41 @@ fn test_config(network: String) -> ExecutorConfig {
     }
 }
 
+fn docker_socket_available() -> bool {
+    Path::new("/var/run/docker.sock").exists()
+}
+
+async fn should_skip_socket_required(test_name: &str) -> bool {
+    if !docker_socket_available() {
+        eprintln!(
+            "Skipping {}: /var/run/docker.sock is unavailable in this environment",
+            test_name
+        );
+        return true;
+    }
+
+    let docker = match bollard::Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!(
+                "Skipping {}: failed to initialize Docker client in this environment",
+                test_name
+            );
+            return true;
+        }
+    };
+
+    if docker.ping().await.is_err() {
+        eprintln!(
+            "Skipping {}: Docker daemon is not reachable in this environment",
+            test_name
+        );
+        return true;
+    }
+
+    false
+}
+
 /// Ensure test network exists
 async fn ensure_test_network() {
     let docker =
@@ -136,11 +183,18 @@ async fn ensure_test_network() {
 
 /// Create a new test server instance for each test
 async fn create_test_server() -> TestServer {
+    create_test_server_with(test_config(TEST_NETWORK.to_string()), false, false).await
+}
+
+async fn create_test_server_with(
+    config: ExecutorConfig,
+    adopt_existing: bool,
+    start_maintenance: bool,
+) -> TestServer {
     // Ensure test network exists
     ensure_test_network().await;
 
     // Create Docker manager
-    let config = test_config(TEST_NETWORK.to_string());
     let docker = DockerManager::new(config.clone())
         .await
         .expect("Failed to connect to Docker - is Docker running?");
@@ -148,15 +202,27 @@ async fn create_test_server() -> TestServer {
     // Create storage from config
     let storage: Arc<dyn Storage> =
         Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"));
+    let registry = RuntimeRegistry::new();
+    let keep_alive_registry = KeepAliveRegistry::new();
+
+    if adopt_existing {
+        urt_executor::tasks::adopt_existing_containers(
+            &docker,
+            &registry,
+            &keep_alive_registry,
+            &config.hostname,
+        )
+        .await;
+    }
 
     // Create app state
     let state = AppState {
-        config,
+        config: config.clone(),
         docker: Arc::new(docker),
-        registry: RuntimeRegistry::new(),
-        keep_alive_registry: KeepAliveRegistry::new(),
+        registry: registry.clone(),
+        keep_alive_registry: keep_alive_registry.clone(),
         http_client: Client::new(),
-        storage,
+        storage: storage.clone(),
     };
 
     // Bind to random available port
@@ -176,6 +242,26 @@ async fn create_test_server() -> TestServer {
     tokio::spawn(async move {
         urt_executor::tasks::run_stats_collector(docker_clone, registry_clone, shutdown_rx).await;
     });
+
+    if start_maintenance {
+        let maintenance_docker = state.docker.clone();
+        let maintenance_registry = state.registry.clone();
+        let maintenance_keep_alive_registry = state.keep_alive_registry.clone();
+        let maintenance_config = config.clone();
+        let maintenance_storage = storage.clone();
+        let maintenance_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            urt_executor::tasks::run_maintenance(
+                maintenance_docker,
+                maintenance_registry,
+                maintenance_keep_alive_registry,
+                maintenance_config,
+                maintenance_storage,
+                maintenance_shutdown,
+            )
+            .await;
+        });
+    }
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -215,9 +301,99 @@ async fn create_test_server() -> TestServer {
     TestServer {
         base_url,
         client,
-        _handle: handle,
-        _shutdown_tx: shutdown_tx,
+        handle,
+        shutdown_tx,
     }
+}
+
+async fn list_containers_with_labels(labels: &[String]) -> Vec<String> {
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .expect("Failed to connect to Docker for label listing");
+
+    let mut filters = HashMap::new();
+    filters.insert("label".to_string(), labels.to_vec());
+
+    let options = bollard::query_parameters::ListContainersOptions {
+        all: true,
+        filters: Some(filters),
+        ..Default::default()
+    };
+
+    docker
+        .list_containers(Some(options))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| {
+            c.names
+                .and_then(|n| n.first().cloned())
+                .unwrap_or_default()
+                .trim_start_matches('/')
+                .to_string()
+        })
+        .collect()
+}
+
+async fn wait_until<F, Fut>(timeout: Duration, poll: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+async fn create_orphan_keepalive_container(name: &str, keep_alive_id: &str) {
+    let image = get_runtime_image();
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .expect("Failed to connect to Docker for orphan setup");
+
+    let mut labels = HashMap::new();
+    labels.insert("urt.managed".to_string(), "true".to_string());
+    labels.insert("urt.runtime_id".to_string(), name.to_string());
+    labels.insert("urt.keep_alive_id".to_string(), keep_alive_id.to_string());
+    labels.insert("urt.version".to_string(), "v5".to_string());
+
+    let config = bollard::models::ContainerCreateBody {
+        image: Some(image),
+        cmd: Some(vec![
+            "tail".to_string(),
+            "-f".to_string(),
+            "/dev/null".to_string(),
+        ]),
+        labels: Some(labels),
+        host_config: Some(bollard::models::HostConfig {
+            network_mode: Some(TEST_NETWORK.to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let options = bollard::query_parameters::CreateContainerOptions {
+        name: Some(name.to_string()),
+        platform: String::new(),
+    };
+
+    let _ = docker.remove_container(name, None).await;
+    docker
+        .create_container(Some(options), config)
+        .await
+        .expect("Failed to create orphan container");
+    docker
+        .start_container(
+            name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("Failed to start orphan container");
 }
 
 /// Generate a unique runtime ID for each test
@@ -1114,8 +1290,8 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
     TestServer {
         base_url,
         client,
-        _handle: handle,
-        _shutdown_tx: shutdown_tx,
+        handle,
+        shutdown_tx,
     }
 }
 
@@ -2897,5 +3073,294 @@ mod docker_dns_resolution {
         .await;
 
         assert!(result.is_ok(), "Test timed out - keep-alive reuse failed");
+    }
+}
+
+// Lifecycle resilience tests focused on cleanup, restart re-adoption, and scale.
+mod lifecycle_resilience {
+    use super::*;
+
+    fn lifecycle_config(hostname: String) -> ExecutorConfig {
+        let mut cfg = test_config(TEST_NETWORK.to_string());
+        cfg.hostname = hostname;
+        cfg.keep_alive = true;
+        cfg.maintenance_interval = 1;
+        cfg.inactive_threshold = 2;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn test_restart_re_adopts_running_runtime() {
+        if should_skip_socket_required("test_restart_re_adopts_running_runtime").await {
+            return;
+        }
+
+        let hostname = format!("e2e-adopt-{}", uuid::Uuid::new_v4().as_simple());
+        let config = lifecycle_config(hostname.clone());
+        let runtime_id = unique_runtime_id("restart-adopt");
+
+        let server = create_test_server_with(config.clone(), false, false).await;
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "",
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime");
+        assert!(response.status().is_success());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        drop(server);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let restarted = create_test_server_with(config, true, false).await;
+        let response = restarted
+            .client
+            .get(format!("{}/v1/runtimes/{}", restarted.base_url, runtime_id))
+            .header(restarted.auth_header().0, restarted.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to get runtime after restart");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "Runtime should be re-adopted after restart"
+        );
+
+        cleanup_runtime(&restarted, &runtime_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_keepalive_orphan_cleaned_on_next_cycle() {
+        if should_skip_socket_required("test_keepalive_orphan_cleaned_on_next_cycle").await {
+            return;
+        }
+
+        let hostname = format!("e2e-cleanup-{}", uuid::Uuid::new_v4().as_simple());
+        let config = lifecycle_config(hostname.clone());
+        let server = create_test_server_with(config, false, true).await;
+        let runtime_id = unique_runtime_id("keepalive-owner");
+        let keep_alive_id = format!("service-{}", uuid::Uuid::new_v4().as_simple());
+        let orphan_name = format!("{}-orphan-{}", hostname, uuid::Uuid::new_v4().as_simple());
+
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "",
+            "variables": {},
+            "keepAliveId": keep_alive_id
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create keep-alive runtime");
+        assert!(response.status().is_success());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        create_orphan_keepalive_container(&orphan_name, &keep_alive_id).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let owner_name = server.runtime_container_name(&runtime_id, &hostname);
+        let labels = vec![
+            "urt.managed=true".to_string(),
+            format!("urt.keep_alive_id={}", keep_alive_id),
+        ];
+
+        let before = list_containers_with_labels(&labels).await;
+        assert!(
+            before.iter().any(|name| name == &owner_name),
+            "Expected owner container before cleanup"
+        );
+        assert!(
+            before.iter().any(|name| name == &orphan_name),
+            "Expected orphan container before cleanup"
+        );
+
+        let cleanup_happened =
+            wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
+                let labels = labels.clone();
+                let owner_name = owner_name.clone();
+                let orphan_name = orphan_name.clone();
+                async move {
+                    let current = list_containers_with_labels(&labels).await;
+                    current.iter().any(|name| name == &owner_name)
+                        && !current.iter().any(|name| name == &orphan_name)
+                }
+            })
+            .await;
+
+        if !cleanup_happened {
+            let after = list_containers_with_labels(&labels).await;
+            panic!(
+                "Orphan container should be removed by maintenance cycle; current keepalive containers: {:?}",
+                after
+            );
+        }
+
+        cleanup_runtime(&server, &runtime_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_chaos_removed_container_detected_immediately() {
+        if should_skip_socket_required("test_chaos_removed_container_detected_immediately").await {
+            return;
+        }
+
+        let hostname = format!("e2e-chaos-{}", uuid::Uuid::new_v4().as_simple());
+        let config = lifecycle_config(hostname.clone());
+        let server = create_test_server_with(config, false, false).await;
+        let runtime_id = unique_runtime_id("chaos");
+
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "",
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime");
+        assert!(response.status().is_success());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let container_name = server.runtime_container_name(&runtime_id, &hostname);
+        let docker = bollard::Docker::connect_with_local_defaults()
+            .expect("Failed to connect to Docker for chaos test");
+        docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("Failed to remove runtime container");
+
+        let response = server
+            .client
+            .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .send()
+            .await
+            .expect("Failed to get runtime after forced removal");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "Removed container should be detected as gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mass_runtime_cleanup_cycle() {
+        if should_skip_socket_required("test_mass_runtime_cleanup_cycle").await {
+            return;
+        }
+
+        let hostname = format!("e2e-mass-{}", uuid::Uuid::new_v4().as_simple());
+        let mut config = lifecycle_config(hostname);
+        config.keep_alive = false;
+        config.inactive_threshold = 1;
+        config.maintenance_interval = 1;
+        let server = create_test_server_with(config, false, true).await;
+
+        let mut created = Vec::new();
+        for idx in 0..10 {
+            let runtime_id = unique_runtime_id(&format!("mass-{}", idx));
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": get_runtime_image(),
+                "entrypoint": "",
+                "variables": {}
+            });
+
+            let response = server
+                .client
+                .post(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .expect("Failed to create runtime in mass test");
+
+            if response.status().is_success() {
+                created.push(runtime_id);
+            }
+        }
+
+        assert!(
+            created.len() >= 4,
+            "Expected multiple runtimes to be created in mass test"
+        );
+
+        let cleanup_happened =
+            wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
+                let base_url = server.base_url.clone();
+                let auth = server.auth_header().1.clone();
+                let client = server.client.clone();
+                async move {
+                    let response = client
+                        .get(format!("{}/v1/runtimes", base_url))
+                        .header("Authorization", auth)
+                        .send()
+                        .await;
+
+                    match response {
+                        Ok(resp) if resp.status() == StatusCode::OK => {
+                            let body: Value = resp.json().await.unwrap_or_else(|_| json!([]));
+                            let remaining = body.as_array().map(|a| a.len()).unwrap_or(0);
+                            remaining <= 2
+                        }
+                        _ => false,
+                    }
+                }
+            })
+            .await;
+
+        if !cleanup_happened {
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to list runtimes after cleanup timeout");
+            let body: Value = response
+                .json()
+                .await
+                .expect("Failed to parse list response");
+            let remaining = body.as_array().map(|a| a.len()).unwrap_or(0);
+            panic!(
+                "Mass cleanup should remove most idle runtimes within timeout; remaining={}",
+                remaining
+            );
+        }
+
+        for runtime_id in created {
+            cleanup_runtime(&server, &runtime_id).await;
+        }
     }
 }

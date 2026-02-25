@@ -8,6 +8,7 @@ use super::runtimes::{
 use super::AppState;
 use crate::error::{ExecutorError, Result};
 use crate::runtime::{get_protocol, ExecuteRequest, ExecuteResponse};
+use crate::tasks;
 use axum::{
     body::Body,
     extract::{Path, State},
@@ -376,6 +377,21 @@ pub async fn create_execution(
 
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
+    // Sync status from Docker before getting runtime
+    state.registry.sync_status(&full_name, &state.docker).await;
+
+    // If runtime metadata is missing (e.g., executor restart), attempt on-demand re-adoption.
+    if state.registry.get(&full_name).await.is_none() {
+        let _ = tasks::adopt_container_by_name(
+            &state.docker,
+            &state.registry,
+            &state.keep_alive_registry,
+            &state.config.hostname,
+            &full_name,
+        )
+        .await;
+    }
+
     // Get or create runtime
     let runtime = match state.registry.get(&full_name).await {
         Some(rt) => {
@@ -671,6 +687,8 @@ fn accepts_json(accept: &str) -> bool {
 async fn wait_for_port(hostname: &str, port: u16, timeout: Duration) -> Result<()> {
     let addr = format!("{}:{}", hostname, port);
     let start = Instant::now();
+    let mut retry_delay = Duration::from_millis(50);
+    let max_retry_delay = Duration::from_millis(500);
 
     debug!(
         "Waiting for {} to be available (timeout: {:?})",
@@ -690,8 +708,9 @@ async fn wait_for_port(hostname: &str, port: u16, timeout: Duration) -> Result<(
                 return Ok(());
             }
             _ => {
-                // Wait 500ms before retrying (matching executor-main usleep(500000))
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Fast retries reduce warm-start latency while still backing off under failures.
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(max_retry_delay);
             }
         }
     }

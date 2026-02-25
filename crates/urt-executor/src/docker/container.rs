@@ -122,6 +122,15 @@ pub struct ContainerInfo {
     pub id: String,
     pub name: String,
     pub image: String,
+    /// Canonical Docker state (e.g. running, exited, paused)
+    pub state: String,
+    /// Human-readable Docker status (e.g. Up 5 seconds)
     pub status: String,
     pub created: i64,
+    /// Container labels (empty on list endpoints when unavailable)
+    pub labels: HashMap<String, String>,
+    /// Container environment variables keyed by variable name
+    pub env: HashMap<String, String>,
+    /// Container hostname (internal)
+    pub hostname: String,
 }
