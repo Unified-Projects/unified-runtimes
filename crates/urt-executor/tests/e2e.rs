@@ -334,6 +334,23 @@ async fn list_containers_with_labels(labels: &[String]) -> Vec<String> {
         .collect()
 }
 
+async fn wait_until<F, Fut>(timeout: Duration, poll: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 async fn create_orphan_keepalive_container(name: &str, keep_alive_id: &str) {
     let image = get_runtime_image();
     let docker = bollard::Docker::connect_with_local_defaults()
@@ -3174,18 +3191,25 @@ mod lifecycle_resilience {
             "Expected orphan container before cleanup"
         );
 
-        // Wait for at least one maintenance cycle.
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        let cleanup_happened = wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
+            let labels = labels.clone();
+            let owner_name = owner_name.clone();
+            let orphan_name = orphan_name.clone();
+            async move {
+                let current = list_containers_with_labels(&labels).await;
+                current.iter().any(|name| name == &owner_name)
+                    && !current.iter().any(|name| name == &orphan_name)
+            }
+        })
+        .await;
 
-        let after = list_containers_with_labels(&labels).await;
-        assert!(
-            after.iter().any(|name| name == &owner_name),
-            "Owner container should still exist after cleanup"
-        );
-        assert!(
-            !after.iter().any(|name| name == &orphan_name),
-            "Orphan container should be removed by maintenance cycle"
-        );
+        if !cleanup_happened {
+            let after = list_containers_with_labels(&labels).await;
+            panic!(
+                "Orphan container should be removed by maintenance cycle; current keepalive containers: {:?}",
+                after
+            );
+        }
 
         cleanup_runtime(&server, &runtime_id).await;
     }
@@ -3291,28 +3315,47 @@ mod lifecycle_resilience {
             "Expected multiple runtimes to be created in mass test"
         );
 
-        // Allow inactivity threshold + maintenance cycles to run cleanup.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let cleanup_happened = wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
+            let base_url = server.base_url.clone();
+            let auth = server.auth_header().1.clone();
+            let client = server.client.clone();
+            async move {
+                let response = client
+                    .get(format!("{}/v1/runtimes", base_url))
+                    .header("Authorization", auth)
+                    .send()
+                    .await;
 
-        let response = server
-            .client
-            .get(format!("{}/v1/runtimes", server.base_url))
-            .header(server.auth_header().0, server.auth_header().1.clone())
-            .send()
-            .await
-            .expect("Failed to list runtimes after cleanup");
+                match response {
+                    Ok(resp) if resp.status() == StatusCode::OK => {
+                        let body: Value = resp.json().await.unwrap_or_else(|_| json!([]));
+                        let remaining = body.as_array().map(|a| a.len()).unwrap_or(0);
+                        remaining <= 2
+                    }
+                    _ => false,
+                }
+            }
+        })
+        .await;
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value = response
-            .json()
-            .await
-            .expect("Failed to parse list response");
-        let remaining = body.as_array().map(|a| a.len()).unwrap_or(0);
-        assert!(
-            remaining <= 2,
-            "Mass cleanup should remove most idle runtimes, remaining={}",
-            remaining
-        );
+        if !cleanup_happened {
+            let response = server
+                .client
+                .get(format!("{}/v1/runtimes", server.base_url))
+                .header(server.auth_header().0, server.auth_header().1.clone())
+                .send()
+                .await
+                .expect("Failed to list runtimes after cleanup timeout");
+            let body: Value = response
+                .json()
+                .await
+                .expect("Failed to parse list response");
+            let remaining = body.as_array().map(|a| a.len()).unwrap_or(0);
+            panic!(
+                "Mass cleanup should remove most idle runtimes within timeout; remaining={}",
+                remaining
+            );
+        }
 
         for runtime_id in created {
             cleanup_runtime(&server, &runtime_id).await;
