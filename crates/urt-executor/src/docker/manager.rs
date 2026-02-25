@@ -26,6 +26,21 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 use tracing::{debug, error, info};
 
+/// Parse Docker environment format (`KEY=VALUE`) into a map.
+fn parse_env_vars(env: Option<Vec<String>>) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+
+    if let Some(entries) = env {
+        for entry in entries {
+            if let Some((key, value)) = entry.split_once('=') {
+                vars.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+
+    vars
+}
+
 /// Main Docker manager for container operations
 #[derive(Clone)]
 pub struct DockerManager {
@@ -367,6 +382,9 @@ impl DockerManager {
                 ExecutorError::Docker(e.to_string())
             })?;
 
+        let config = info.config.unwrap_or_default();
+        let state = info.state.unwrap_or_default();
+
         Ok(ContainerInfo {
             id: info.id.unwrap_or_default(),
             name: info
@@ -374,17 +392,17 @@ impl DockerManager {
                 .unwrap_or_default()
                 .trim_start_matches('/')
                 .to_string(),
-            image: info.config.and_then(|c| c.image).unwrap_or_default(),
-            status: info
-                .state
-                .and_then(|s| s.status)
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
+            image: config.image.unwrap_or_default(),
+            state: state.status.map(|s| s.to_string()).unwrap_or_default(),
+            status: state.status.map(|s| s.to_string()).unwrap_or_default(),
             created: info
                 .created
                 .and_then(|c| chrono::DateTime::parse_from_rfc3339(&c).ok())
                 .map(|dt| dt.timestamp())
                 .unwrap_or(0),
+            labels: config.labels.unwrap_or_default(),
+            env: parse_env_vars(config.env),
+            hostname: config.hostname.unwrap_or_default(),
         })
     }
 
@@ -418,8 +436,12 @@ impl DockerManager {
                     .trim_start_matches('/')
                     .to_string(),
                 image: c.image.unwrap_or_default(),
+                state: c.state.map(|s| s.to_string()).unwrap_or_default(),
                 status: c.status.unwrap_or_default(),
                 created: c.created.unwrap_or(0),
+                labels: c.labels.unwrap_or_default(),
+                env: HashMap::new(),
+                hostname: String::new(),
             })
             .collect())
     }

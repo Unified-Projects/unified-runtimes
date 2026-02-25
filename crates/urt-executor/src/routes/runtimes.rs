@@ -7,6 +7,7 @@ use crate::docker::container::ContainerConfig;
 use crate::error::{ExecutorError, Result};
 use crate::platform;
 use crate::runtime::Runtime;
+use crate::tasks;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -15,7 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Request body for creating a runtime
 #[derive(Debug, Deserialize)]
@@ -368,7 +369,12 @@ pub async fn create_runtime(
         .with_envs(env)
         .with_restart_policy(&req.restart_policy)
         .with_label("urt.managed", "true")
-        .with_label("urt.runtime_id", &req.runtime_id);
+        .with_label("urt.runtime_id", &req.runtime_id)
+        .with_label("urt.version", &req.version);
+
+    if let Some(ref ka_id) = keep_alive_id {
+        container = container.with_label("urt.keep_alive_id", ka_id);
+    }
 
     // Add network
     if let Some(network) = state.config.random_network() {
@@ -555,54 +561,69 @@ pub async fn create_runtime(
         }
     }
 
-    // Wait for container to reach running state, with retries.
-    // A single 100ms sleep is insufficient for runtimes like Next.js SSR that take longer to
-    // start; we poll until the container is running or a terminal state is reached.
+    // Wait for container to reach running state, with exponential backoff.
+    // Start fast (50ms) to detect quick-starting containers, then progressively back off.
     let startup_timeout = Duration::from_secs(30);
-    let poll_interval = Duration::from_millis(200);
     let deadline = tokio::time::Instant::now() + startup_timeout;
+    let mut poll_delay = Duration::from_millis(50);
+    let max_poll_delay = Duration::from_secs(1);
+    let mut last_status = String::from("unknown");
+    let mut running = false;
 
     loop {
-        tokio::time::sleep(poll_interval).await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+
         match state.docker.inspect_container(&full_name).await {
             Ok(info) => {
-                let status = info.status.to_lowercase();
-                if status.contains("running") {
-                    break; // success
-                } else if status == "exited" || status == "dead" || status == "removing" {
+                let status = info.state.to_lowercase();
+                last_status = info.state.clone();
+
+                if status == "running" {
+                    running = true;
+                    break;
+                }
+
+                if matches!(status.as_str(), "exited" | "dead" | "removing" | "failed") {
                     // Terminal failure states — no point retrying.
-                    error!("Container reached terminal state: {}", info.status);
+                    error!("Container reached terminal state: {}", info.state);
                     state.docker.remove_container(&full_name, true).await.ok();
                     state.registry.remove(&full_name).await;
                     return Err(ExecutorError::RuntimeFailed(format!(
                         "Container exited with status: {}",
-                        info.status
+                        info.state
                     )));
                 }
-                // "created", "restarting", "paused", etc: keep waiting.
-                if tokio::time::Instant::now() >= deadline {
-                    error!("Container startup timed out, last status: {}", info.status);
-                    state.docker.remove_container(&full_name, true).await.ok();
-                    state.registry.remove(&full_name).await;
-                    return Err(ExecutorError::RuntimeFailed(format!(
-                        "Container startup timed out (last status: {})",
-                        info.status
-                    )));
-                }
+
+                // "created", "restarting", "paused", etc: keep waiting with backoff.
             }
             Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    error!("Failed to inspect container after timeout: {}", e);
-                    state.docker.remove_container(&full_name, true).await.ok();
-                    state.registry.remove(&full_name).await;
-                    return Err(ExecutorError::RuntimeFailed(format!(
-                        "Failed to inspect container: {}",
-                        e
-                    )));
-                }
-                // Transient inspect error: retry.
+                // Transient inspect error: continue to next retry
+                debug!("Failed to inspect container {}: {}", full_name, e);
             }
         }
+
+        tokio::time::sleep(poll_delay).await;
+        poll_delay = (poll_delay * 2).min(max_poll_delay);
+    }
+
+    if !running {
+        // Final timeout handling - one last inspect for the freshest status.
+        let last_status = state
+            .docker
+            .inspect_container(&full_name)
+            .await
+            .map(|i| i.state)
+            .unwrap_or(last_status);
+
+        error!("Container startup timed out, last status: {}", last_status);
+        state.docker.remove_container(&full_name, true).await.ok();
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::RuntimeFailed(format!(
+            "Container startup timed out (last status: {})",
+            last_status
+        )));
     }
 
     // Note: runtime_entrypoint is now the container CMD (Docker.php line 463)
@@ -764,7 +785,7 @@ pub async fn create_runtime(
         // Update runtime status if keeping it running
         if let Ok(info) = state.docker.inspect_container(&full_name).await {
             let mut updated_runtime = runtime.clone();
-            updated_runtime.mark_running(&info.status);
+            updated_runtime.mark_running(&info.state);
             state.registry.update(updated_runtime).await.ok();
         }
     }
@@ -806,11 +827,33 @@ pub async fn get_runtime(
     State(state): State<AppState>,
     Path(runtime_id): Path<String>,
 ) -> Result<Json<Runtime>> {
-    let runtime = state
-        .registry
-        .get_by_id(&runtime_id, &state.config.hostname)
-        .await
-        .ok_or(ExecutorError::RuntimeNotFound)?;
+    let full_name = format!("{}-{}", state.config.hostname, runtime_id);
+
+    // Sync status from Docker before returning
+    // First try to sync, then fall back to registry lookup.
+    // If missing, attempt re-adoption for resilience after executor restarts.
+    let runtime = if let Some(rt) = state.registry.sync_status(&full_name, &state.docker).await {
+        rt
+    } else if let Some(rt) = state.registry.get(&full_name).await {
+        rt
+    } else {
+        let _ = tasks::adopt_container_by_name(
+            &state.docker,
+            &state.registry,
+            &state.keep_alive_registry,
+            &state.config.hostname,
+            &full_name,
+        )
+        .await;
+
+        if let Some(rt) = state.registry.sync_status(&full_name, &state.docker).await {
+            rt
+        } else if let Some(rt) = state.registry.get(&full_name).await {
+            rt
+        } else {
+            return Err(ExecutorError::RuntimeNotFound);
+        }
+    };
 
     Ok(Json(runtime))
 }

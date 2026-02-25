@@ -42,6 +42,7 @@ impl RuntimeRegistry {
     }
 
     /// Get a runtime by its ID (searches for name ending with -id)
+    #[allow(dead_code)]
     pub async fn get_by_id(&self, runtime_id: &str, hostname: &str) -> Option<Runtime> {
         let full_name = format!("{}-{}", hostname, runtime_id);
         self.get(&full_name).await
@@ -112,6 +113,41 @@ impl RuntimeRegistry {
             Ok(())
         } else {
             Err(ExecutorError::RuntimeNotFound)
+        }
+    }
+
+    /// Sync container status from Docker
+    /// Updates the runtime status based on current Docker container state
+    /// Returns the updated runtime if found, None otherwise
+    pub async fn sync_status(
+        &self,
+        name: &str,
+        docker: &crate::docker::DockerManager,
+    ) -> Option<Runtime> {
+        if !self.runtimes.contains_key(name) {
+            return None;
+        }
+
+        match docker.inspect_container(name).await {
+            Ok(info) => {
+                if let Some(mut runtime) = self.runtimes.get_mut(name) {
+                    runtime.status = info.state;
+                    runtime.initialised = if runtime.status.eq_ignore_ascii_case("running") {
+                        1
+                    } else {
+                        0
+                    };
+                    runtime.touch();
+                    return Some(runtime.clone());
+                }
+                None
+            }
+            Err(ExecutorError::RuntimeNotFound) => {
+                // Container was removed outside the registry - clean up stale metadata.
+                self.runtimes.remove(name);
+                None
+            }
+            Err(_) => self.runtimes.get(name).map(|r| r.clone()),
         }
     }
 

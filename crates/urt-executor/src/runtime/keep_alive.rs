@@ -49,6 +49,14 @@ impl KeepAliveRegistry {
     pub fn get_owner(&self, keep_alive_id: &str) -> Option<String> {
         self.owners.get(keep_alive_id).map(|r| r.value().clone())
     }
+
+    /// Get all registered keep-alive IDs and their owners
+    pub fn get_all_owners(&self) -> Vec<(String, String)> {
+        self.owners
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
 }
 
 impl Default for KeepAliveRegistry {
