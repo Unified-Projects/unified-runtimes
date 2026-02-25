@@ -6,8 +6,10 @@ use super::AppState;
 use crate::docker::container::ContainerConfig;
 use crate::error::{ExecutorError, Result};
 use crate::platform;
-use crate::runtime::Runtime;
+use crate::resilience::retry_with_backoff;
+use crate::runtime::{KeepAliveRegistry, Runtime};
 use crate::tasks;
+use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -64,13 +66,13 @@ pub struct CreateRuntimeRequest {
 pub fn default_timeout() -> u32 {
     600
 }
-/// Default CPU allocation - 4 cores for maximum throughput
+/// Default CPU allocation - matches executor-main.
 pub fn default_cpus() -> f64 {
-    4.0
+    1.0
 }
-/// Default memory allocation - 2GB for high-performance workloads
+/// Default memory allocation in MB - matches executor-main.
 pub fn default_memory() -> u64 {
-    2048
+    512
 }
 pub fn default_version() -> String {
     "v5".to_string()
@@ -78,6 +80,56 @@ pub fn default_version() -> String {
 const DEFAULT_RESTART_POLICY: &str = "no";
 pub fn default_restart_policy() -> String {
     DEFAULT_RESTART_POLICY.to_string()
+}
+
+/// Roll back keep-alive ownership if runtime creation fails after ownership transfer.
+struct KeepAliveRegistrationGuard {
+    registry: KeepAliveRegistry,
+    keep_alive_id: Option<String>,
+    runtime_name: String,
+    previous_owner: Option<String>,
+    committed: bool,
+}
+
+impl KeepAliveRegistrationGuard {
+    fn new(
+        registry: KeepAliveRegistry,
+        keep_alive_id: Option<String>,
+        runtime_name: String,
+    ) -> Self {
+        Self {
+            registry,
+            keep_alive_id,
+            runtime_name,
+            previous_owner: None,
+            committed: false,
+        }
+    }
+
+    fn set_previous_owner(&mut self, previous_owner: Option<String>) {
+        self.previous_owner = previous_owner;
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for KeepAliveRegistrationGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let Some(keep_alive_id) = self.keep_alive_id.as_ref() else {
+            return;
+        };
+
+        self.registry.unregister(keep_alive_id, &self.runtime_name);
+        if let Some(previous_owner) = self.previous_owner.as_ref() {
+            self.registry.register(keep_alive_id, previous_owner);
+        }
+    }
 }
 
 /// Validate runtime ID format
@@ -242,16 +294,41 @@ pub async fn create_runtime(
     State(state): State<AppState>,
     body: String,
 ) -> Result<(StatusCode, Json<CreateRuntimeResponse>)> {
+    let mut operation_timer = OperationTimer::new(LatencyKind::RuntimeCreate);
     let start_time = std::time::Instant::now();
     let start_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+    let queue_wait_started = std::time::Instant::now();
+    let _runtime_create_permit = match &state.runtime_create_limiter {
+        Some(limiter) => {
+            let queue_wait_timeout =
+                Duration::from_millis(state.config.runtime_create_queue_wait_ms);
+            match tokio::time::timeout(queue_wait_timeout, limiter.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => {
+                    metrics().observe_runtime_create_queue_wait(queue_wait_started.elapsed());
+                    Some(permit)
+                }
+                Ok(Err(_)) => return Err(ExecutorError::Unknown),
+                Err(_) => {
+                    metrics().observe_runtime_create_queue_wait(queue_wait_timeout);
+                    metrics().inc_error_class("create_runtime", "overload");
+                    operation_timer.mark_overload();
+                    return Err(ExecutorError::RuntimeOverloaded);
+                }
+            }
+        }
+        None => None,
+    };
 
     // Parse JSON body manually for backwards compatibility (no Content-Type requirement)
     let req: CreateRuntimeRequest = serde_json::from_str(&body)
         .map_err(|e| ExecutorError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
     info!(
-        "Creating runtime: {} with image {}",
-        req.runtime_id, req.image
+        runtime_id = %req.runtime_id,
+        image = %req.image,
+        version = %req.version,
+        "Creating runtime"
     );
 
     // Validate runtime ID and image name
@@ -287,6 +364,10 @@ pub async fn create_runtime(
             .cloned()
             .filter(|s| !s.is_empty())
     });
+    let _keep_alive_lock = match keep_alive_id.as_ref() {
+        Some(ka_id) => Some(state.keep_alive_registry.lock(ka_id).await),
+        None => None,
+    };
 
     // Create runtime entry
     let runtime = Runtime::new(
@@ -302,10 +383,22 @@ pub async fn create_runtime(
 
     // Register keep-alive ownership (if applicable)
     // This also revokes protection from any previous owner with the same ID
+    let mut keep_alive_guard = KeepAliveRegistrationGuard::new(
+        state.keep_alive_registry.clone(),
+        keep_alive_id.clone(),
+        runtime.name.clone(),
+    );
     let mut previous_keep_alive_owner: Option<String> = None;
+    let mut keep_alive_generation: Option<u64> = None;
     if let Some(ref ka_id) = keep_alive_id {
-        previous_keep_alive_owner = state.keep_alive_registry.register(ka_id, &runtime.name);
+        let (previous_owner, generation) = state
+            .keep_alive_registry
+            .register_with_generation(ka_id, &runtime.name);
+        previous_keep_alive_owner = previous_owner;
+        keep_alive_generation = Some(generation);
+        keep_alive_guard.set_previous_owner(previous_keep_alive_owner.clone());
         if let Some(prev) = &previous_keep_alive_owner {
+            metrics().inc_keep_alive_transfer();
             info!(
                 "Keep-alive ID '{}' transferred from {} to {}",
                 ka_id, prev, runtime.name
@@ -374,6 +467,9 @@ pub async fn create_runtime(
 
     if let Some(ref ka_id) = keep_alive_id {
         container = container.with_label("urt.keep_alive_id", ka_id);
+        if let Some(generation) = keep_alive_generation {
+            container = container.with_label("urt.keep_alive_generation", &generation.to_string());
+        }
     }
 
     // Add network
@@ -471,7 +567,14 @@ pub async fn create_runtime(
         let local_source_str = local_source.display().to_string();
 
         info!("Downloading source {} to {}", req.source, local_source_str);
-        if let Err(e) = state.storage.download(&req.source, &local_source_str).await {
+        if let Err(e) = retry_with_backoff(
+            "runtime_source_download",
+            state.config.retry_attempts,
+            state.config.retry_delay_ms,
+            |_| async { state.storage.download(&req.source, &local_source_str).await },
+        )
+        .await
+        {
             error!("Failed to download source: {}", e);
             state.registry.remove(&full_name).await;
             return Err(ExecutorError::RuntimeFailed(format!(
@@ -542,8 +645,20 @@ pub async fn create_runtime(
 
     // Create and start container
     let mut output_logs = Vec::new();
+    let docker = state.docker.clone();
 
-    match state.docker.create_container(container).await {
+    match retry_with_backoff(
+        "runtime_create_container",
+        state.config.retry_attempts,
+        state.config.retry_delay_ms,
+        |_| {
+            let container_cfg = container.clone();
+            let docker = docker.clone();
+            async move { docker.create_container(container_cfg).await }
+        },
+    )
+    .await
+    {
         Ok(container_id) => {
             output_logs.push(LogEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -755,7 +870,14 @@ pub async fn create_runtime(
 
             // Upload to storage
             info!("Uploading build artifact to {}", dest_path);
-            if let Err(e) = state.storage.upload(&local_build_str, &dest_path).await {
+            if let Err(e) = retry_with_backoff(
+                "runtime_artifact_upload",
+                state.config.retry_attempts,
+                state.config.retry_delay_ms,
+                |_| async { state.storage.upload(&local_build_str, &dest_path).await },
+            )
+            .await
+            {
                 error!("Failed to upload build artifact: {}", e);
                 // Continue anyway, just won't have the path
             } else {
@@ -795,14 +917,18 @@ pub async fn create_runtime(
     if !req.remove {
         if let (Some(prev), Some(ka_id)) = (previous_keep_alive_owner, keep_alive_id.as_ref()) {
             if prev != runtime.name {
-                cleanup_previous_keep_alive_runtime(&state, &prev, ka_id).await;
+                cleanup_previous_keep_alive_runtime(&state, &prev, ka_id, keep_alive_generation)
+                    .await;
             }
         }
+
+        keep_alive_guard.commit();
     }
 
     let duration = start_time.elapsed().as_secs_f64();
 
     info!("Runtime {} created in {:.2}s", req.runtime_id, duration);
+    operation_timer.mark_success();
 
     Ok((
         StatusCode::CREATED,
@@ -873,6 +999,13 @@ pub async fn delete_runtime(
 
     // Get runtime info before deletion to check keep_alive_id
     let runtime_info = state.registry.get(&full_name).await;
+    let _keep_alive_lock = match runtime_info
+        .as_ref()
+        .and_then(|runtime| runtime.keep_alive_id.as_ref())
+    {
+        Some(ka_id) => Some(state.keep_alive_registry.lock(ka_id).await),
+        None => None,
+    };
 
     // DO NOT GUESS THE NAME — ASK DOCKER
     let label = format!("urt.runtime_id={}", runtime_id);
@@ -905,13 +1038,14 @@ pub async fn delete_runtime(
 
     info!("Delete runtime finished: {}", full_name);
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::OK)
 }
 
 async fn cleanup_previous_keep_alive_runtime(
     state: &AppState,
     previous_owner: &str,
     keep_alive_id: &str,
+    replacement_generation: Option<u64>,
 ) {
     info!(
         "Cleaning up previous keep-alive runtime {} for keep-alive ID '{}'",
@@ -919,19 +1053,71 @@ async fn cleanup_previous_keep_alive_runtime(
     );
 
     let runtime_info = state.registry.get(previous_owner).await;
+    if state
+        .keep_alive_registry
+        .is_owner(keep_alive_id, previous_owner)
+    {
+        metrics().inc_keep_alive_cleanup("skipped_owner_guard");
+        debug!(
+            "Skipping keep-alive cleanup for {} on '{}' because it is still the owner",
+            previous_owner, keep_alive_id
+        );
+        return;
+    }
+
+    if let Some(expected_generation) = replacement_generation {
+        if let Ok(container_info) = state.docker.inspect_container(previous_owner).await {
+            let label_keep_alive_id = container_info
+                .labels
+                .get("urt.keep_alive_id")
+                .map(String::as_str)
+                .unwrap_or_default();
+            if label_keep_alive_id != keep_alive_id {
+                metrics().inc_keep_alive_cleanup("skipped_id_mismatch");
+                debug!(
+                    "Skipping keep-alive cleanup for {} due keep-alive label mismatch (expected '{}', got '{}')",
+                    previous_owner, keep_alive_id, label_keep_alive_id
+                );
+                return;
+            }
+
+            let label_generation = container_info
+                .labels
+                .get("urt.keep_alive_generation")
+                .and_then(|value| value.parse::<u64>().ok());
+            if label_generation == Some(expected_generation) {
+                metrics().inc_keep_alive_cleanup("skipped_generation_guard");
+                debug!(
+                    "Skipping keep-alive cleanup for {} due generation guard (generation={})",
+                    previous_owner, expected_generation
+                );
+                return;
+            }
+        }
+    }
 
     if let Err(e) = state.docker.stop_container(previous_owner, 10).await {
-        warn!(
-            "Failed to stop previous keep-alive container {}: {}",
+        metrics().inc_keep_alive_cleanup("stop_error");
+        debug!(
+            "Previous keep-alive container {} stop returned non-fatal error: {}",
             previous_owner, e
         );
     }
 
-    if let Err(e) = state.docker.remove_container(previous_owner, true).await {
-        warn!(
-            "Failed to remove previous keep-alive container {}: {}",
-            previous_owner, e
-        );
+    match state.docker.remove_container(previous_owner, true).await {
+        Ok(_) => {
+            metrics().inc_keep_alive_cleanup("removed");
+        }
+        Err(ExecutorError::RuntimeNotFound) => {
+            metrics().inc_keep_alive_cleanup("missing");
+        }
+        Err(e) => {
+            metrics().inc_keep_alive_cleanup("remove_error");
+            warn!(
+                "Failed to remove previous keep-alive container {}: {}",
+                previous_owner, e
+            );
+        }
     }
 
     let tmp_folder = platform::temp_dir().join(previous_owner);
@@ -948,7 +1134,8 @@ async fn cleanup_previous_keep_alive_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_tar_flags;
+    use super::{sanitize_tar_flags, KeepAliveRegistrationGuard};
+    use crate::runtime::KeepAliveRegistry;
 
     #[test]
     fn test_sanitize_tar_flags_injects_all_flags() {
@@ -1033,5 +1220,43 @@ mod tests {
         let cmd = "npm install && npm run build";
         let result = sanitize_tar_flags(cmd);
         assert_eq!(result, cmd);
+    }
+
+    #[test]
+    fn test_keep_alive_registration_guard_rolls_back_owner_on_drop() {
+        let registry = KeepAliveRegistry::new();
+        registry.register("svc-a", "runtime-old");
+
+        {
+            let mut guard = KeepAliveRegistrationGuard::new(
+                registry.clone(),
+                Some("svc-a".to_string()),
+                "runtime-new".to_string(),
+            );
+            let previous = registry.register("svc-a", "runtime-new");
+            guard.set_previous_owner(previous);
+            // no commit => drop rolls back to previous owner
+        }
+
+        assert_eq!(registry.get_owner("svc-a"), Some("runtime-old".to_string()));
+    }
+
+    #[test]
+    fn test_keep_alive_registration_guard_commit_keeps_new_owner() {
+        let registry = KeepAliveRegistry::new();
+        registry.register("svc-b", "runtime-old");
+
+        {
+            let mut guard = KeepAliveRegistrationGuard::new(
+                registry.clone(),
+                Some("svc-b".to_string()),
+                "runtime-new".to_string(),
+            );
+            let previous = registry.register("svc-b", "runtime-new");
+            guard.set_previous_owner(previous);
+            guard.commit();
+        }
+
+        assert_eq!(registry.get_owner("svc-b"), Some("runtime-new".to_string()));
     }
 }

@@ -3,32 +3,32 @@
 //! A high-performance executor for managing containerized function runtimes
 //! with full API compatibility with the PHP OpenRuntimes Executor.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio::sync::{watch, Semaphore};
+use tracing::{debug, info, warn};
 
 mod config;
 mod docker;
 mod error;
+mod execution_counter;
 mod middleware;
 mod platform;
+mod resilience;
 mod routes;
 mod runtime;
 mod storage;
 mod tasks;
+mod telemetry;
 
 use config::ExecutorConfig;
 use docker::DockerManager;
+use execution_counter::active_executions;
 use routes::{create_router, AppState};
 use runtime::{KeepAliveRegistry, RuntimeRegistry};
 use storage::{Storage, StorageFileCache};
-
-/// Track active executions for graceful shutdown
-static ACTIVE_EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Main entry point with optimized Tokio runtime configuration
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,10 +79,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Configuration loaded:");
     info!("  Host: {}:{}", config.host, config.port);
     info!("  Keep-alive: {}", config.keep_alive);
+    info!("  Autoscale: {}", config.autoscale);
+    info!("  Metrics endpoint: {}", config.metrics_enabled);
     info!("  Min CPUs: {}", config.min_cpus);
     info!("  Min Memory: {} MB", config.min_memory);
     info!("  Networks: {:?}", config.networks);
     info!("  Allowed runtimes: {:?}", config.allowed_runtimes);
+    if config.autoscale {
+        info!(
+            "  Autoscale concurrency limits: executions={:?}, runtime_creates={:?}",
+            config.max_concurrent_executions, config.max_concurrent_runtime_creates
+        );
+        info!(
+            "  Autoscale queue waits (ms): execution={}, runtime_create={}",
+            config.execution_queue_wait_ms, config.runtime_create_queue_wait_ms
+        );
+    }
 
     // Create Docker manager
     let docker = Arc::new(
@@ -99,19 +111,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect executor container to configured runtime networks (best-effort)
     // This mirrors executor-main behavior and ensures DNS/port checks work.
-    let executor_container = docker
+    if let Some(executor_container) = docker
         .resolve_container_name_by_hostname(&config.hostname)
         .await
-        .unwrap_or_else(|| {
-            warn!(
-                "Could not resolve container name for hostname '{}', using hostname directly",
-                config.hostname
-            );
-            config.hostname.clone()
-        });
-    docker
-        .connect_container_to_networks(&executor_container)
-        .await;
+    {
+        docker
+            .connect_container_to_networks(&executor_container)
+            .await;
+    } else {
+        debug!(
+            "Could not resolve executor container by hostname '{}'; skipping startup network attach",
+            config.hostname
+        );
+    }
 
     // Create runtime registry
     let registry = RuntimeRegistry::new();
@@ -145,10 +157,36 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("Failed to create HTTP client");
 
-    // Create storage backend from config (supports individual env vars like executor-main)
-    let storage: Arc<dyn Storage> =
-        Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"));
-    info!("Storage backend initialized: {:?}", config.storage.device);
+    // Create storage backend. For drop-in compatibility, support legacy
+    // OPR_EXECUTOR_CONNECTION_STORAGE DSN when STORAGE_DEVICE is not explicitly set.
+    let storage: Arc<dyn Storage> = {
+        let explicit_storage_device = std::env::var("URT_STORAGE_DEVICE")
+            .ok()
+            .or_else(|| std::env::var("OPR_EXECUTOR_STORAGE_DEVICE").ok())
+            .filter(|v| !v.trim().is_empty());
+
+        let connection_dsn = std::env::var("URT_CONNECTION_STORAGE")
+            .ok()
+            .or_else(|| std::env::var("OPR_EXECUTOR_CONNECTION_STORAGE").ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if explicit_storage_device.is_none() {
+            if let Some(dsn) = connection_dsn {
+                let scheme = dsn.split("://").next().unwrap_or("unknown");
+                info!("Storage backend initialized from DSN: {}", scheme);
+                Arc::from(
+                    storage::from_dsn(&dsn).expect("Failed to create storage from connection DSN"),
+                )
+            } else {
+                info!("Storage backend initialized: {:?}", config.storage.device);
+                Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"))
+            }
+        } else {
+            info!("Storage backend initialized: {:?}", config.storage.device);
+            Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"))
+        }
+    };
 
     // Initialize file cache for faster cold starts (30 day TTL, 1GB max size)
     let file_cache = Arc::new(StorageFileCache::new(None, None, None));
@@ -161,6 +199,32 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         "Storage file cache initialized at {}",
         file_cache.cache_dir.display()
     );
+
+    // Autoscale mode applies adaptive concurrency limits to smooth queueing under burst traffic.
+    let (execution_limiter, execution_limiter_capacity): (Option<Arc<Semaphore>>, Option<usize>) =
+        if config.autoscale {
+            let default_limit = num_cpus::get().saturating_mul(64).max(32);
+            let limit = config
+                .max_concurrent_executions
+                .unwrap_or(default_limit)
+                .max(1);
+            (Some(Arc::new(Semaphore::new(limit))), Some(limit))
+        } else {
+            (None, None)
+        };
+    let (runtime_create_limiter, runtime_create_limiter_capacity): (
+        Option<Arc<Semaphore>>,
+        Option<usize>,
+    ) = if config.autoscale {
+        let default_limit = num_cpus::get().saturating_mul(4).max(4);
+        let limit = config
+            .max_concurrent_runtime_creates
+            .unwrap_or(default_limit)
+            .max(1);
+        (Some(Arc::new(Semaphore::new(limit))), Some(limit))
+    } else {
+        (None, None)
+    };
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -205,6 +269,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         keep_alive_registry,
         http_client,
         storage,
+        execution_limiter,
+        runtime_create_limiter,
+        execution_limiter_capacity,
+        runtime_create_limiter_capacity,
     };
 
     // Create router
@@ -250,17 +318,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         let max_wait = Duration::from_secs(30);
         let start = std::time::Instant::now();
 
-        while ACTIVE_EXECUTIONS.load(Ordering::Relaxed) > 0 {
+        while active_executions() > 0 {
             if start.elapsed() > max_wait {
                 warn!(
                     "Timeout waiting for {} active executions",
-                    ACTIVE_EXECUTIONS.load(Ordering::Relaxed)
+                    active_executions()
                 );
                 break;
             }
             info!(
                 "Waiting for {} active executions to complete...",
-                ACTIVE_EXECUTIONS.load(Ordering::Relaxed)
+                active_executions()
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -271,6 +339,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Serve with graceful shutdown
     let docker_for_shutdown = docker.clone();
     let file_cache_for_shutdown = file_cache.clone();
+    let cleanup_cache_on_shutdown = std::env::var("URT_CACHE_CLEANUP_ON_SHUTDOWN")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -279,25 +355,29 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             // BLOCK HERE UNTIL DOCKER FINISHES
             docker_for_shutdown.cleanup_managed_containers().await;
 
-            // Clean up file cache on shutdown
-            info!("Cleaning up file cache...");
-            file_cache_for_shutdown
-                .cleanup_all()
-                .await
-                .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))
-                .ok();
+            // Optional: clean file cache on shutdown (disabled by default to preserve warm cache).
+            if cleanup_cache_on_shutdown {
+                info!("Cleaning up file cache...");
+                file_cache_for_shutdown
+                    .cleanup_all()
+                    .await
+                    .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))
+                    .ok();
+            }
         })
         .await?;
 
     info!("Server stopped");
 
-    // Final cleanup
-    info!("Performing final cleanup...");
-    file_cache
-        .cleanup_all()
-        .await
-        .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))
-        .ok();
+    // Final cleanup (optional to preserve cold-start cache between restarts).
+    if cleanup_cache_on_shutdown {
+        info!("Performing final cleanup...");
+        file_cache
+            .cleanup_all()
+            .await
+            .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))
+            .ok();
+    }
 
     Ok(())
 }

@@ -77,6 +77,14 @@ fn keep_alive_id_from_container(container: &ContainerInfo) -> Option<String> {
         })
 }
 
+fn keep_alive_generation_from_container(container: &ContainerInfo) -> Option<u64> {
+    container
+        .labels
+        .get("urt.keep_alive_generation")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
 fn runtime_from_container(container: &ContainerInfo, hostname: &str) -> Option<Runtime> {
     let runtime_id = runtime_id_from_container(container, hostname)?;
     let version = infer_runtime_version(&container.image, &container.labels);
@@ -178,7 +186,10 @@ async fn adopt_inspected_container(
     }
 
     if let Some(ref ka_id) = runtime.keep_alive_id {
-        if let Some(prev_owner) = keep_alive_registry.register(ka_id, &runtime.name) {
+        if let Some(generation) = keep_alive_generation_from_container(&inspected) {
+            keep_alive_registry.observe_generation(ka_id, generation);
+        }
+        if let Some(prev_owner) = keep_alive_registry.restore_owner(ka_id, &runtime.name) {
             if prev_owner != runtime.name {
                 debug!(
                     "Keep-alive ID '{}' ownership restored from {} to {}",
@@ -437,7 +448,21 @@ async fn cleanup_idle(
     info!("Cleaning up {} idle runtimes", runtimes_to_cleanup.len());
 
     for runtime in runtimes_to_cleanup {
+        let _keep_alive_lock = match runtime.keep_alive_id.as_ref() {
+            Some(ka_id) => Some(keep_alive_registry.lock(ka_id).await),
+            None => None,
+        };
+
         let name = &runtime.name;
+        if let Some(ref ka_id) = runtime.keep_alive_id {
+            if keep_alive_registry.is_owner(ka_id, name) {
+                debug!(
+                    "Skipping cleanup of {} - keep-alive ID '{}' transferred during cleanup cycle",
+                    name, ka_id
+                );
+                continue;
+            }
+        }
 
         // Force removal is enough for maintenance cleanup and avoids long per-container
         // graceful-stop waits that can stall cleanup under load.
@@ -518,6 +543,8 @@ async fn cleanup_orphaned_keepalive(
     }
 
     for (ka_id, mut group) in by_keep_alive {
+        let _keep_alive_lock = keep_alive_registry.lock(&ka_id).await;
+
         // Oldest first: newest running container is the preferred owner.
         group.sort_by_key(|c| c.created);
 
@@ -532,7 +559,10 @@ async fn cleanup_orphaned_keepalive(
         let owner = if current_owner_valid {
             current_owner.unwrap()
         } else if let Some(new_owner) = running.last() {
-            if let Some(prev_owner) = keep_alive_registry.register(&ka_id, &new_owner.name) {
+            if let Some(generation) = keep_alive_generation_from_container(new_owner) {
+                keep_alive_registry.observe_generation(&ka_id, generation);
+            }
+            if let Some(prev_owner) = keep_alive_registry.restore_owner(&ka_id, &new_owner.name) {
                 if prev_owner != new_owner.name {
                     info!(
                         "Keep-alive '{}' owner changed from {} to {}",

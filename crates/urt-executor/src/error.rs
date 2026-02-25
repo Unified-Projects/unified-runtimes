@@ -34,6 +34,9 @@ pub enum ExecutorError {
     #[error("Timed out waiting for execution")]
     ExecutionTimeout,
 
+    #[error("Executor is overloaded processing executions, retry later")]
+    ExecutionOverloaded,
+
     #[error("Runtime not found")]
     RuntimeNotFound,
 
@@ -45,6 +48,9 @@ pub enum ExecutorError {
 
     #[error("Timed out waiting for runtime")]
     RuntimeTimeout,
+
+    #[error("Executor is overloaded creating runtimes, retry later")]
+    RuntimeOverloaded,
 
     #[error("Timed out waiting for logs")]
     LogsTimeout,
@@ -76,10 +82,12 @@ impl ExecutorError {
             Self::ExecutionBadRequest(_) => "execution_bad_request",
             Self::ExecutionBadJson(_) => "execution_bad_json",
             Self::ExecutionTimeout => "execution_timeout",
+            Self::ExecutionOverloaded => "execution_timeout",
             Self::RuntimeNotFound => "runtime_not_found",
             Self::RuntimeConflict => "runtime_conflict",
             Self::RuntimeFailed(_) => "runtime_failed",
             Self::RuntimeTimeout => "runtime_timeout",
+            Self::RuntimeOverloaded => "runtime_timeout",
             Self::LogsTimeout => "logs_timeout",
             Self::CommandTimeout => "command_timeout",
             Self::CommandFailed(_) => "command_failed",
@@ -99,10 +107,12 @@ impl ExecutorError {
             Self::ExecutionBadRequest(_) => StatusCode::BAD_REQUEST,
             Self::ExecutionBadJson(_) => StatusCode::BAD_REQUEST,
             Self::ExecutionTimeout => StatusCode::BAD_REQUEST,
+            Self::ExecutionOverloaded => StatusCode::TOO_MANY_REQUESTS,
             Self::RuntimeNotFound => StatusCode::NOT_FOUND,
             Self::RuntimeConflict => StatusCode::CONFLICT,
             Self::RuntimeFailed(_) => StatusCode::BAD_REQUEST,
             Self::RuntimeTimeout => StatusCode::BAD_REQUEST,
+            Self::RuntimeOverloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::LogsTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::CommandTimeout => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CommandFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -124,6 +134,7 @@ struct ErrorResponse {
 impl IntoResponse for ExecutorError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        crate::telemetry::metrics().inc_error_class("global", self.error_type());
         let body = ErrorResponse {
             message: self.to_string(),
             r#type: self.error_type().to_string(),
@@ -206,6 +217,10 @@ mod tests {
             "execution_timeout"
         );
         assert_eq!(
+            ExecutorError::ExecutionOverloaded.error_type(),
+            "execution_timeout"
+        );
+        assert_eq!(
             ExecutorError::RuntimeNotFound.error_type(),
             "runtime_not_found"
         );
@@ -219,6 +234,10 @@ mod tests {
         );
         assert_eq!(
             ExecutorError::RuntimeTimeout.error_type(),
+            "runtime_timeout"
+        );
+        assert_eq!(
+            ExecutorError::RuntimeOverloaded.error_type(),
             "runtime_timeout"
         );
         assert_eq!(ExecutorError::LogsTimeout.error_type(), "logs_timeout");
@@ -276,6 +295,10 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
+            ExecutorError::ExecutionOverloaded.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
             ExecutorError::RuntimeNotFound.status_code(),
             StatusCode::NOT_FOUND
         );
@@ -290,6 +313,10 @@ mod tests {
         assert_eq!(
             ExecutorError::RuntimeTimeout.status_code(),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ExecutorError::RuntimeOverloaded.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
             ExecutorError::LogsTimeout.status_code(),

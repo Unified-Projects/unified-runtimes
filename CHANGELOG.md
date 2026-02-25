@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [0.2.0] - 2026-02-25
+
+### Changed
+- **Autoscale controls**: Added `URT_AUTOSCALE`, `URT_MAX_CONCURRENT_EXECUTIONS`, and `URT_MAX_CONCURRENT_RUNTIME_CREATES` to enable adaptive runtime/execution concurrency limiting without API schema changes.
+- **Load shedding and queue control**: Added bounded queue wait controls via `URT_EXECUTION_QUEUE_WAIT_MS` and `URT_RUNTIME_CREATE_QUEUE_WAIT_MS`, returning fast overload responses (`429`/`503`) under sustained saturation.
+- **Transient retry hardening**: Added jittered exponential backoff with transient/non-transient error classification for runtime source downloads, runtime container creation, build artifact uploads, and runtime execution protocol calls.
+- **Metrics expansion**: `/metrics` now exports persistent counters/histograms for queue wait/depth, execution/runtime-create latency, retries, keep-alive transfer and cleanup outcomes, active executions, and error classes.
+- **Keep-alive replacement serialization**: Added per-`keepAliveId` async locking to serialize ownership transfer, replacement cleanup, deletion, and maintenance reconciliation paths.
+- **Keep-alive generation labels**: New runtime containers include `urt.keep_alive_generation` and cleanup uses owner/generation guards to avoid removing the active replacement.
+- **Prometheus exporter support**: Added optional `/metrics` endpoint for Prometheus/Grafana, toggled by `URT_METRICS` (with `OPR_EXECUTOR_METRICS` fallback), and protected by bearer auth when `URT_SECRET` is configured.
+- **Request log correlation**: Added structured request logging with propagated/generated `x-request-id` response headers.
+- **Startup/warmup noise reduction**: Runtime/network allowlists are deduplicated and startup network attach now skips unresolved executor container names instead of emitting repeated missing-container warnings.
+- **Cache lifecycle behavior**: Added `URT_CACHE_CLEANUP_ON_SHUTDOWN` (default `false`) so warm cache can persist across restarts for lower cold-start latency.
+- **Drop-in startup compatibility**: `URT_NETWORK` now defaults to `openruntimes-runtimes` and runtime warmup/allowlist accepts legacy `OPR_EXECUTOR_IMAGES` when `*_RUNTIMES` is not set.
+- **Drop-in server compatibility**: `/v1/health` now returns plain-text `OK` (reference behavior), while enhanced JSON stats moved to `/v1/health/stats`.
+- **API response parity**: Runtime delete now responds `200 OK` (instead of `204`) to match executor-main semantics.
+- **Response header parity**: All responses now include `Server: Executor`, matching executor-main startup request handling.
+- **Storage startup compatibility**: When `*_STORAGE_DEVICE` is unset, executor now honors `URT_CONNECTION_STORAGE` / `OPR_EXECUTOR_CONNECTION_STORAGE` DSN during storage initialization.
+
 ## [0.1.5] - 2026-02-25
 
 ### Fixed

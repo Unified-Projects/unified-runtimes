@@ -151,11 +151,20 @@ impl DockerManager {
     /// Connect a container to all configured networks (best-effort)
     pub async fn connect_container_to_networks(&self, container: &str) {
         for network in &self.config.networks {
-            if let Err(e) = connect_container(&self.docker, network, container).await {
-                warn!(
-                    "Failed to connect container {} to network {}: {}",
-                    container, network, e
-                );
+            match connect_container(&self.docker, network, container).await {
+                Ok(_) => {}
+                Err(ExecutorError::RuntimeNotFound) => {
+                    debug!(
+                        "Skipping network attach for missing container {} on {}",
+                        container, network
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to connect container {} to network {}: {}",
+                        container, network, e
+                    );
+                }
             }
         }
     }
@@ -324,20 +333,24 @@ impl DockerManager {
             ..Default::default()
         };
 
-        self.docker
-            .stop_container(name, Some(options))
-            .await
-            .map_err(|e| {
-                // Ignore "not running" errors
-                if e.to_string().contains("not running") {
+        match self.docker.stop_container(name, Some(options)).await {
+            Ok(_) => {
+                info!("Stopped container: {}", name);
+                Ok(())
+            }
+            Err(e) => {
+                let message = e.to_string();
+                if message.contains("not running") {
                     debug!("Container {} already stopped", name);
-                    return ExecutorError::Docker("already stopped".to_string());
+                    return Ok(());
                 }
-                ExecutorError::Docker(e.to_string())
-            })?;
-
-        info!("Stopped container: {}", name);
-        Ok(())
+                if message.contains("No such container") {
+                    debug!("Container {} not found while stopping", name);
+                    return Err(ExecutorError::RuntimeNotFound);
+                }
+                Err(ExecutorError::Docker(message))
+            }
+        }
     }
 
     /// Remove a container

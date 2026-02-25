@@ -24,6 +24,7 @@ fn test_config() -> ExecutorConfig {
         host: "127.0.0.1".to_string(),
         port: 9900,
         secret: "test-secret-key".to_string(),
+        metrics_enabled: false,
         env: "development".to_string(),
         networks: vec!["test-network".to_string()],
         hostname: "test-executor".to_string(),
@@ -37,6 +38,11 @@ fn test_config() -> ExecutorConfig {
         keep_alive: true,
         inactive_threshold: 60,
         maintenance_interval: 3600,
+        autoscale: false,
+        max_concurrent_executions: None,
+        max_concurrent_runtime_creates: None,
+        execution_queue_wait_ms: 2_000,
+        runtime_create_queue_wait_ms: 5_000,
         max_body_size: 20 * 1024 * 1024,
         storage: StorageConfig::default(),
         logging_config: None,
@@ -65,6 +71,10 @@ async fn create_test_state() -> Option<AppState> {
         keep_alive_registry,
         http_client,
         storage,
+        execution_limiter: None,
+        runtime_create_limiter: None,
+        execution_limiter_capacity: None,
+        runtime_create_limiter_capacity: None,
     })
 }
 
@@ -121,7 +131,7 @@ mod health {
     }
 
     #[tokio::test]
-    async fn returns_valid_json_structure() {
+    async fn returns_plain_text_ok() {
         require_docker!(state);
         let app = create_router(state);
 
@@ -129,7 +139,6 @@ mod health {
             .oneshot(
                 Request::builder()
                     .uri("/v1/health")
-                    .header("Authorization", "Bearer test-secret-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -137,40 +146,8 @@ mod health {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let body = parse_json_body(response.into_body()).await;
-
-        // Verify structure
-        assert!(
-            body.get("usage").is_some(),
-            "Response should have 'usage' field"
-        );
-        assert!(
-            body.get("runtimes").is_some(),
-            "Response should have 'runtimes' field"
-        );
-
-        // Verify usage contains expected fields
-        let usage = body.get("usage").unwrap();
-        assert!(
-            usage.get("memory").is_some(),
-            "Usage should have 'memory' field"
-        );
-        assert!(usage.get("cpu").is_some(), "Usage should have 'cpu' field");
-
-        // Verify memory structure
-        let memory = usage.get("memory").unwrap();
-        assert!(
-            memory.get("percentage").is_some(),
-            "Memory should have 'percentage'"
-        );
-        assert!(
-            memory.get("memoryLimit").is_some(),
-            "Memory should have 'memoryLimit'"
-        );
-
-        // Verify runtimes is an array
-        assert!(body["runtimes"].is_array(), "Runtimes should be an array");
+        let body = body_to_string(response.into_body()).await;
+        assert_eq!(body, "OK");
     }
 
     #[tokio::test]
@@ -193,7 +170,7 @@ mod health {
     }
 
     #[tokio::test]
-    async fn content_type_is_json() {
+    async fn sets_server_header() {
         require_docker!(state);
         let app = create_router(state);
 
@@ -201,6 +178,58 @@ mod health {
             .oneshot(
                 Request::builder()
                     .uri("/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let server = response
+            .headers()
+            .get("server")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(server, "Executor");
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_returns_valid_json() {
+        require_docker!(state);
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health/stats")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = parse_json_body(response.into_body()).await;
+        assert!(
+            body.get("usage").is_some(),
+            "Response should have 'usage' field"
+        );
+        assert!(
+            body.get("runtimes").is_some(),
+            "Response should have 'runtimes' field"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_content_type_is_json() {
+        require_docker!(state);
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health/stats")
                     .header("Authorization", "Bearer test-secret-key")
                     .body(Body::empty())
                     .unwrap(),
@@ -397,7 +426,7 @@ mod runtimes {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -803,7 +832,7 @@ mod content_negotiation {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(content_type.contains("application/json"));
+        assert!(content_type.contains("text/plain"));
     }
 
     #[tokio::test]
@@ -1103,7 +1132,7 @@ mod response_format {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v1/health")
+                    .uri("/v1/health/stats")
                     .header("Authorization", "Bearer test-secret-key")
                     .body(Body::empty())
                     .unwrap(),
@@ -1154,11 +1183,11 @@ mod response_format {
         require_docker!(state);
         let app = create_router(state);
 
-        // Without auth, health endpoint returns minimal response
+        // Without auth, stats endpoint returns minimal response
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v1/health")
+                    .uri("/v1/health/stats")
                     .body(Body::empty())
                     .unwrap(),
             )
