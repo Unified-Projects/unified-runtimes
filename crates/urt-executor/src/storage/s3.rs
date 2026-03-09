@@ -421,7 +421,7 @@ impl Storage for S3Storage {
         let s3_key = self.get_s3_key(prefix);
         let response = self
             .bucket
-            .list(s3_key.to_string(), Some("/".to_string()))
+            .list(s3_key.to_string(), None)
             .await
             .map_err(|e| {
                 ExecutorError::Storage(format!("S3 list_objects failed for '{}': {}", prefix, e))

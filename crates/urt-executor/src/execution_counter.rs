@@ -23,11 +23,8 @@ impl Default for ExecutionGuard {
 
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
-        ACTIVE_EXECUTIONS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(1))
-            })
-            .ok();
+        let previous = ACTIVE_EXECUTIONS.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "active execution counter underflow");
     }
 }
 

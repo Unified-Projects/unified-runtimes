@@ -96,6 +96,7 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_MIN_MEMORY` | `0` | Minimum memory (MB) override |
 | `URT_MAX_BODY_SIZE` | `20MB` | Maximum request body size |
 | `URT_RUNTIMES` | `` | Comma-separated allowlist of runtime images (falls back to `OPR_EXECUTOR_IMAGES`) |
+| `URT_AUTO_RUNTIME` | `true` | Auto-resolve official OpenRuntimes shorthands and command mismatches to the newest verified runtime family, bypassing runtime allowlist pinning for official images |
 | `URT_CONNECTION_STORAGE` | `local://localhost` | Storage DSN for builds |
 | `URT_CACHE_CLEANUP_ON_SHUTDOWN` | `false` | If true, purge local download cache during shutdown |
 

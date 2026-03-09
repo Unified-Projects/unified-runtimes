@@ -9,7 +9,7 @@ use super::AppState;
 use crate::error::{ExecutorError, Result};
 use crate::execution_counter::ExecutionGuard;
 use crate::resilience::retry_with_backoff;
-use crate::runtime::{get_protocol, ExecuteRequest, ExecuteResponse};
+use crate::runtime::{get_protocol, wait_for_runtime_port, ExecuteRequest, ExecuteResponse};
 use crate::tasks;
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
@@ -19,9 +19,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -78,6 +77,38 @@ fn default_logging() -> bool {
     true
 }
 
+const LEGACY_RESPONSE_FORMAT_CUTOFF: [u32; 3] = [0, 11, 0];
+
+fn should_flatten_headers_for_legacy_response_format(response_format: &str) -> bool {
+    let mut current = response_format.split('.');
+
+    for rhs in LEGACY_RESPONSE_FORMAT_CUTOFF {
+        let lhs = current
+            .next()
+            .and_then(|segment| segment.parse::<u32>().ok())
+            .unwrap_or(0);
+        if lhs != rhs {
+            return lhs < rhs;
+        }
+    }
+
+    false
+}
+
+fn flatten_headers_for_legacy_clients(headers: &mut HashMap<String, serde_json::Value>) {
+    for value in headers.values_mut() {
+        if let serde_json::Value::Array(items) = value {
+            let replacement = items
+                .iter()
+                .rev()
+                .find(|item| !item.is_null())
+                .cloned()
+                .unwrap_or(serde_json::Value::String(String::new()));
+            *value = replacement;
+        }
+    }
+}
+
 /// Headers can be a string (JSON) or object
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(untagged)]
@@ -89,20 +120,13 @@ pub enum HeadersInput {
 }
 
 impl HeadersInput {
-    /// Returns a reference or owned HashMap - avoids clone when already Object
-    /// Uses Cow for zero-copy when the data is already in the right format
-    #[inline]
-    pub fn to_map_cow(&self) -> Cow<'_, HashMap<String, String>> {
+    /// Consume the input into a HashMap, avoiding clones for object inputs.
+    pub fn into_map(self) -> HashMap<String, String> {
         match self {
-            HeadersInput::Empty => Cow::Owned(HashMap::new()),
-            HeadersInput::String(s) => Cow::Owned(serde_json::from_str(s).unwrap_or_default()),
-            HeadersInput::Object(m) => Cow::Borrowed(m),
+            HeadersInput::Empty => HashMap::new(),
+            HeadersInput::String(s) => serde_json::from_str(&s).unwrap_or_default(),
+            HeadersInput::Object(m) => m,
         }
-    }
-
-    /// Legacy method for compatibility - clones the data
-    pub fn to_map(&self) -> HashMap<String, String> {
-        self.to_map_cow().into_owned()
     }
 }
 
@@ -404,88 +428,20 @@ pub async fn create_execution(
 
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
-    // Sync status from Docker before getting runtime
-    state.registry.sync_status(&full_name, &state.docker).await;
+    let runtime = resolve_runtime(&state, &runtime_id, &full_name, &req).await?;
 
-    // If runtime metadata is missing (e.g., executor restart), attempt on-demand re-adoption.
-    if state.registry.get(&full_name).await.is_none() {
-        let _ = tasks::adopt_container_by_name(
-            &state.docker,
-            &state.registry,
-            &state.keep_alive_registry,
-            &state.config.hostname,
-            &full_name,
-        )
-        .await;
-    }
-
-    // Get or create runtime
-    let runtime = match state.registry.get(&full_name).await {
-        Some(rt) => {
-            // Check if runtime is ready
-            if rt.is_pending() {
-                return Err(ExecutorError::RuntimeTimeout);
-            }
-            rt
-        }
-        None => {
-            // On-the-fly creation if image is provided
-            if req.image.is_empty() {
-                return Err(ExecutorError::RuntimeNotFound);
-            }
-
-            debug!("Creating runtime on-the-fly: {}", runtime_id);
-
-            // Create runtime request as JSON for internal call
-            let create_req_json = serde_json::json!({
-                "runtimeId": runtime_id.clone(),
-                "image": req.image.clone(),
-                "entrypoint": req.entrypoint.clone(),
-                "source": req.source.clone(),
-                "destination": "",
-                "outputDirectory": "",
-                "variables": req.variables.to_map(),
-                "runtimeEntrypoint": req.runtime_entrypoint.clone(),
-                "command": "",
-                "timeout": default_timeout(),
-                "remove": false,
-                "cpus": req.cpus,
-                "memory": req.memory,
-                "version": req.version.clone(),
-                "restartPolicy": req.restart_policy.clone(),
-                "dockerCmd": []
-            });
-
-            // Call create_runtime internally
-            let _ = super::runtimes::create_runtime(
-                State(state.clone()),
-                serde_json::to_string(&create_req_json).unwrap_or_default(),
-            )
-            .await?;
-
-            // Get the created runtime
-            state
-                .registry
-                .get(&full_name)
-                .await
-                .ok_or(ExecutorError::RuntimeNotFound)?
-        }
-    };
-
-    // Touch runtime to update last activity
-    state.registry.touch(&full_name).await.ok();
+    // Coalesce activity updates to reduce write contention on the runtime registry.
+    state.registry.touch_if_stale(&full_name, 1.0).await.ok();
 
     // TCP port readiness check (matching executor-main Docker.php:1088-1115)
     // On first execution, wait for the runtime to start listening on port 3000
-    // NOTE: We use runtime.name (container name) for DNS resolution, not runtime.hostname
-    // Docker DNS resolves containers by name, not by internal hostname
     if !runtime.is_listening() {
         debug!(
             "Checking if runtime {} is listening on port 3000",
             runtime.name
         );
         let port_timeout = Duration::from_secs(req.timeout as u64);
-        wait_for_port(&runtime.name, 3000, port_timeout).await?;
+        wait_for_runtime_port(&runtime.name, 3000, port_timeout).await?;
 
         // Mark runtime as listening so we skip this check on subsequent executions
         if let Err(e) = state.registry.set_listening(&full_name).await {
@@ -498,16 +454,29 @@ pub async fn create_execution(
     // IMPORTANT: Always force identity encoding when talking to the runtime.
     // If we forward an incoming `accept-encoding` (e.g. gzip), different HTTP clients/proxies may
     // transparently decode/encode which can lead to mismatched lengths / truncated bodies.
-    let mut exec_headers = req.headers.to_map();
+    let ExecutionRequest {
+        body,
+        path,
+        method,
+        headers: request_headers,
+        timeout,
+        logging,
+        ..
+    } = req;
+
+    let mut exec_headers = request_headers.into_map();
     exec_headers.insert("accept-encoding".to_string(), "identity".to_string());
 
+    let mut method = method;
+    method.make_ascii_uppercase();
+
     let exec_req = ExecuteRequest {
-        body: req.body,
-        path: req.path,
-        method: req.method.to_uppercase(),
+        body: Bytes::from(body),
+        path,
+        method,
         headers: exec_headers,
-        timeout: req.timeout,
-        logging: req.logging,
+        timeout,
+        logging,
     };
 
     debug!("Executing with protocol {}", runtime.version);
@@ -535,6 +504,16 @@ pub async fn create_execution(
         }
     })?;
 
+    let response_format = headers
+        .get("x-executor-response-format")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("0.10.0");
+
+    let mut response = response;
+    if should_flatten_headers_for_legacy_response_format(response_format) {
+        flatten_headers_for_legacy_clients(&mut response.headers);
+    }
+
     // Determine response format based on Accept header
     // Matches executor-main: default to multipart unless JSON is explicitly requested.
     let accept = headers
@@ -549,7 +528,7 @@ pub async fn create_execution(
     }
 
     // JSON response - reject binary bodies like executor-main
-    let body = std::str::from_utf8(&response.body).map_err(|_| {
+    let body = std::str::from_utf8(response.body.as_ref()).map_err(|_| {
         ExecutorError::ExecutionBadJson(
             "Execution resulted in binary response, but JSON response does not allow binaries. Use \"Accept: multipart/form-data\" header to support binaries.".to_string(),
         )
@@ -558,7 +537,7 @@ pub async fn create_execution(
     operation_timer.mark_success();
     Ok(Json(JsonExecutionResponse {
         status_code: response.status_code,
-        body: body.to_string(),
+        body: body.to_owned(),
         logs: response.logs,
         errors: response.errors,
         headers: response.headers,
@@ -568,10 +547,120 @@ pub async fn create_execution(
     .into_response())
 }
 
+async fn resolve_runtime(
+    state: &AppState,
+    runtime_id: &str,
+    full_name: &str,
+    req: &ExecutionRequest,
+) -> Result<crate::runtime::Runtime> {
+    if let Some(runtime) = state.registry.get(full_name).await {
+        if runtime.is_pending() {
+            state.registry.sync_status(full_name, &state.docker).await;
+            match state.registry.get(full_name).await {
+                Some(updated) if !updated.is_pending() => return Ok(updated),
+                Some(_) => return Err(ExecutorError::RuntimeTimeout),
+                None => {}
+            }
+        } else {
+            return Ok(runtime);
+        }
+    }
+
+    // If runtime metadata is missing (e.g., executor restart), attempt on-demand re-adoption.
+    let _ = tasks::adopt_container_by_name(
+        &state.docker,
+        &state.registry,
+        &state.keep_alive_registry,
+        &state.config.hostname,
+        full_name,
+    )
+    .await;
+
+    if let Some(runtime) = state.registry.get(full_name).await {
+        if runtime.is_pending() {
+            state.registry.sync_status(full_name, &state.docker).await;
+            return match state.registry.get(full_name).await {
+                Some(updated) if !updated.is_pending() => Ok(updated),
+                Some(_) => Err(ExecutorError::RuntimeTimeout),
+                None => Err(ExecutorError::RuntimeNotFound),
+            };
+        }
+
+        return Ok(runtime);
+    }
+
+    // On-the-fly creation if image is provided
+    if req.image.is_empty() {
+        return Err(ExecutorError::RuntimeNotFound);
+    }
+
+    debug!("Creating runtime on-the-fly: {}", runtime_id);
+
+    let create_req_json = serde_json::json!({
+        "runtimeId": runtime_id,
+        "image": req.image,
+        "entrypoint": req.entrypoint,
+        "source": req.source,
+        "destination": "",
+        "outputDirectory": "",
+        "variables": req.variables.to_map(),
+        "runtimeEntrypoint": req.runtime_entrypoint,
+        "command": "",
+        "timeout": default_timeout(),
+        "remove": false,
+        "cpus": req.cpus,
+        "memory": req.memory,
+        "version": req.version,
+        "restartPolicy": req.restart_policy,
+        "dockerCmd": []
+    });
+
+    let _ = super::runtimes::create_runtime(
+        State(state.clone()),
+        serde_json::to_string(&create_req_json).unwrap_or_default(),
+    )
+    .await?;
+
+    state
+        .registry
+        .get(full_name)
+        .await
+        .ok_or(ExecutorError::RuntimeNotFound)
+}
+
 fn parse_multipart_execution_request_bytes(
     body: &[u8],
     content_type: &str,
 ) -> Result<ExecutionRequest> {
+    fn parse_field_name(headers: &[u8]) -> Result<&str> {
+        let name_marker = b"name=\"";
+        let name_start = memchr::memmem::find(headers, name_marker)
+            .ok_or_else(|| ExecutorError::ExecutionBadRequest("Missing field name".into()))?
+            + name_marker.len();
+        let name_len = memchr::memchr(b'"', &headers[name_start..])
+            .ok_or_else(|| ExecutorError::ExecutionBadRequest("Missing field name".into()))?;
+
+        std::str::from_utf8(&headers[name_start..name_start + name_len]).map_err(|_| {
+            ExecutorError::ExecutionBadRequest("Multipart field name must be valid UTF-8".into())
+        })
+    }
+
+    fn parse_string(value: &[u8]) -> String {
+        String::from_utf8_lossy(value).into_owned()
+    }
+
+    fn parse_u32(value: &[u8]) -> Option<u32> {
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
+    fn parse_u64(value: &[u8]) -> Option<u64> {
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
+    fn parse_f64(value: &[u8]) -> Option<f64> {
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
     let boundary = content_type
         .split("boundary=")
         .nth(1)
@@ -581,7 +670,23 @@ fn parse_multipart_execution_request_bytes(
         })?;
 
     let boundary_bytes = format!("--{}", boundary).into_bytes();
-    let mut fields: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut request = ExecutionRequest {
+        body: String::new(),
+        path: default_path(),
+        method: default_method(),
+        headers: HeadersInput::default(),
+        timeout: default_exec_timeout(),
+        image: String::new(),
+        source: String::new(),
+        entrypoint: String::new(),
+        variables: VariablesInput::default(),
+        cpus: default_cpus(),
+        memory: default_memory(),
+        version: default_version(),
+        runtime_entrypoint: String::new(),
+        logging: default_logging(),
+        restart_policy: default_restart_policy(),
+    };
 
     let mut i = 0;
     while i < body.len() {
@@ -604,94 +709,55 @@ fn parse_multipart_execution_request_bytes(
             let headers = &body[i..i + headers_end];
             i += headers_end + 4;
 
-            let headers_str = String::from_utf8_lossy(headers);
-
-            let name = headers_str
-                .split("name=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .ok_or_else(|| ExecutorError::ExecutionBadRequest("Missing field name".into()))?
-                .to_string();
+            let name = parse_field_name(headers)?;
 
             let next_boundary = memchr::memmem::find(&body[i..], &boundary_bytes)
                 .ok_or_else(|| ExecutorError::ExecutionBadRequest("Malformed multipart".into()))?;
 
-            let mut value = body[i..i + next_boundary].to_vec();
+            let mut value = &body[i..i + next_boundary];
 
             // Trim trailing CRLF
             if value.ends_with(b"\r\n") {
-                value.truncate(value.len() - 2);
+                value = &value[..value.len() - 2];
             }
 
-            fields.insert(name, value);
+            match name {
+                "body" => request.body = parse_string(value),
+                "path" => request.path = parse_string(value),
+                "method" => request.method = parse_string(value),
+                "headers" => request.headers = HeadersInput::String(parse_string(value)),
+                "timeout" => {
+                    if let Some(timeout) = parse_u32(value) {
+                        request.timeout = timeout;
+                    }
+                }
+                "image" => request.image = parse_string(value),
+                "source" => request.source = parse_string(value),
+                "entrypoint" => request.entrypoint = parse_string(value),
+                "variables" => request.variables = VariablesInput::String(parse_string(value)),
+                "cpus" => {
+                    if let Some(cpus) = parse_f64(value) {
+                        request.cpus = cpus;
+                    }
+                }
+                "memory" => {
+                    if let Some(memory) = parse_u64(value) {
+                        request.memory = memory;
+                    }
+                }
+                "version" => request.version = parse_string(value),
+                "runtimeEntrypoint" => request.runtime_entrypoint = parse_string(value),
+                "logging" => request.logging = value == b"true" || value == b"1",
+                "restartPolicy" => request.restart_policy = parse_string(value),
+                _ => {}
+            }
             i += next_boundary;
         } else {
             i += 1;
         }
     }
 
-    Ok(ExecutionRequest {
-        body: fields
-            .get("body")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        path: fields
-            .get("path")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_path),
-        method: fields
-            .get("method")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_method),
-        headers: fields
-            .get("headers")
-            .map(|v| HeadersInput::String(String::from_utf8_lossy(v).into_owned()))
-            .unwrap_or_default(),
-        timeout: fields
-            .get("timeout")
-            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
-            .unwrap_or_else(default_exec_timeout),
-        image: fields
-            .get("image")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        source: fields
-            .get("source")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        entrypoint: fields
-            .get("entrypoint")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        variables: fields
-            .get("variables")
-            .map(|v| VariablesInput::String(String::from_utf8_lossy(v).into_owned()))
-            .unwrap_or_default(),
-        cpus: fields
-            .get("cpus")
-            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
-            .unwrap_or_else(default_cpus),
-        memory: fields
-            .get("memory")
-            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
-            .unwrap_or_else(default_memory),
-        version: fields
-            .get("version")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_version),
-        runtime_entrypoint: fields
-            .get("runtimeEntrypoint")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        logging: fields
-            .get("logging")
-            .map(|v| v == b"true" || v == b"1")
-            .unwrap_or_else(default_logging),
-        restart_policy: fields
-            .get("restartPolicy")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_restart_policy),
-    })
+    Ok(request)
 }
 
 /// Determine if the Accept header requests JSON.
@@ -707,43 +773,6 @@ fn accepts_json(accept: &str) -> bool {
         })
 }
 
-/// Wait for a runtime to start listening on a TCP port
-/// (matching executor-main Docker.php:1088-1115 TCP validator)
-async fn wait_for_port(hostname: &str, port: u16, timeout: Duration) -> Result<()> {
-    let addr = format!("{}:{}", hostname, port);
-    let start = Instant::now();
-    let mut retry_delay = Duration::from_millis(50);
-    let max_retry_delay = Duration::from_millis(500);
-
-    debug!(
-        "Waiting for {} to be available (timeout: {:?})",
-        addr, timeout
-    );
-
-    while start.elapsed() < timeout {
-        // Try to connect using tokio's TcpStream which handles DNS resolution
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                debug!("Port {} is now available", addr);
-                return Ok(());
-            }
-            _ => {
-                // Fast retries reduce warm-start latency while still backing off under failures.
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(max_retry_delay);
-            }
-        }
-    }
-
-    debug!("Timeout waiting for {} after {:?}", addr, timeout);
-    Err(ExecutorError::RuntimeTimeout)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,7 +785,7 @@ mod tests {
         #[test]
         fn test_empty() {
             let headers = HeadersInput::Empty;
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert!(map.is_empty());
         }
 
@@ -767,7 +796,7 @@ mod tests {
             map.insert("accept".to_string(), "*/*".to_string());
 
             let headers = HeadersInput::Object(map.clone());
-            let result = headers.to_map();
+            let result = headers.into_map();
             assert_eq!(result.len(), 2);
             assert_eq!(
                 result.get("content-type"),
@@ -780,7 +809,7 @@ mod tests {
             let headers = HeadersInput::String(
                 r#"{"content-type": "text/html", "x-custom": "value"}"#.to_string(),
             );
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert_eq!(map.get("content-type"), Some(&"text/html".to_string()));
             assert_eq!(map.get("x-custom"), Some(&"value".to_string()));
         }
@@ -788,40 +817,15 @@ mod tests {
         #[test]
         fn test_string_invalid_json_returns_empty() {
             let headers = HeadersInput::String("not json".to_string());
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert!(map.is_empty());
         }
 
         #[test]
         fn test_string_empty_json() {
             let headers = HeadersInput::String("{}".to_string());
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert!(map.is_empty());
-        }
-
-        #[test]
-        fn test_to_map_cow_empty() {
-            let headers = HeadersInput::Empty;
-            let cow = headers.to_map_cow();
-            assert!(cow.is_empty());
-        }
-
-        #[test]
-        fn test_to_map_cow_object_borrows() {
-            let mut map = HashMap::new();
-            map.insert("key".to_string(), "value".to_string());
-            let headers = HeadersInput::Object(map.clone());
-            let cow = headers.to_map_cow();
-            // Should be borrowed, not owned
-            assert!(matches!(cow, Cow::Borrowed(_)));
-        }
-
-        #[test]
-        fn test_to_map_cow_string_owned() {
-            let headers = HeadersInput::String(r#"{"key": "value"}"#.to_string());
-            let cow = headers.to_map_cow();
-            // Should be owned since we parsed from string
-            assert!(matches!(cow, Cow::Owned(_)));
         }
     }
 
@@ -972,7 +976,7 @@ mod tests {
             assert!(result.is_ok());
             let req = result.unwrap();
             assert_eq!(req.body, r#"{"key":"value"}"#);
-            let headers = req.headers.to_map();
+            let headers = req.headers.into_map();
             assert_eq!(
                 headers.get("content-type"),
                 Some(&"application/json".to_string())
@@ -1103,6 +1107,37 @@ mod tests {
             assert_eq!(parsed["duration"], 0.123456);
             assert!(parsed["startTime"].is_number());
         }
+
+        #[test]
+        fn test_legacy_response_format_requires_header_flattening() {
+            assert!(should_flatten_headers_for_legacy_response_format("0.10.0"));
+            assert!(should_flatten_headers_for_legacy_response_format("0.10.9"));
+            assert!(!should_flatten_headers_for_legacy_response_format("0.11.0"));
+            assert!(!should_flatten_headers_for_legacy_response_format("0.11"));
+            assert!(!should_flatten_headers_for_legacy_response_format(
+                "0.11.0.1"
+            ));
+            assert!(!should_flatten_headers_for_legacy_response_format("0.12.1"));
+        }
+
+        #[test]
+        fn test_flatten_headers_for_legacy_clients_keeps_last_value() {
+            let mut headers = HashMap::from([
+                (
+                    "set-cookie".to_string(),
+                    json!(["first=value", "second=value"]),
+                ),
+                ("content-type".to_string(), json!("application/json")),
+            ]);
+
+            flatten_headers_for_legacy_clients(&mut headers);
+
+            assert_eq!(headers.get("set-cookie"), Some(&json!("second=value")));
+            assert_eq!(
+                headers.get("content-type"),
+                Some(&json!("application/json"))
+            );
+        }
     }
 
     // Default values tests
@@ -1151,7 +1186,7 @@ mod tests {
             assert_eq!(req.method, "POST");
             assert_eq!(req.timeout, 30);
             assert_eq!(
-                req.headers.to_map().get("content-type"),
+                req.headers.into_map().get("content-type"),
                 Some(&"application/json".to_string())
             );
             assert_eq!(
@@ -1177,7 +1212,7 @@ mod tests {
             }"#;
 
             let req: ExecutionRequest = serde_json::from_str(json).unwrap();
-            let headers = req.headers.to_map();
+            let headers = req.headers.into_map();
             assert_eq!(headers.get("content-type"), Some(&"text/html".to_string()));
         }
 

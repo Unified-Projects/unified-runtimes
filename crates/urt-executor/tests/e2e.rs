@@ -14,9 +14,11 @@ use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio::time::timeout;
 use urt_executor::{
     config::{ExecutorConfig, StorageConfig},
@@ -110,12 +112,14 @@ fn test_config(network: String) -> ExecutorConfig {
         allowed_runtimes: vec![],
         runtime_versions: vec!["v5".to_string()],
         image_pull_enabled: true,
+        auto_runtime: true,
         min_cpus: 0.0,
         min_memory: 0,
         keep_alive: true,
         inactive_threshold: 300,
         maintenance_interval: 3600,
         autoscale: false,
+        eager_runtime_readiness: false,
         max_concurrent_executions: None,
         max_concurrent_runtime_creates: None,
         execution_queue_wait_ms: 2_000,
@@ -163,27 +167,134 @@ async fn should_skip_socket_required(test_name: &str) -> bool {
     false
 }
 
+async fn run_docker_cli(args: &[&str]) -> std::process::Output {
+    Command::new("docker")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("failed to run docker CLI")
+}
+
+struct DockerContainerCleanup {
+    name: String,
+}
+
+impl Drop for DockerContainerCleanup {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// Ensure test network exists
 async fn ensure_test_network() {
+    ensure_named_networks(&[TEST_NETWORK.to_string()]).await;
+}
+
+#[tokio::test]
+async fn test_runtime_network_resolves_hostname_and_name() {
+    if should_skip_socket_required("test_runtime_network_resolves_hostname_and_name").await {
+        return;
+    }
+
+    ensure_test_network().await;
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let target_name = format!("urt-proof-target-{}", &suffix[..12]);
+    let host_name = format!("urt-proof-host-{}", &suffix[..12]);
+    let _cleanup = DockerContainerCleanup {
+        name: target_name.clone(),
+    };
+
+    let run_output = run_docker_cli(&[
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        &target_name,
+        "--hostname",
+        &host_name,
+        "--network",
+        TEST_NETWORK,
+        "nginx:alpine",
+    ])
+    .await;
+    assert!(
+        run_output.status.success(),
+        "failed to start target container: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let by_name = run_docker_cli(&[
+        "run",
+        "--rm",
+        "--network",
+        TEST_NETWORK,
+        "curlimages/curl:latest",
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        &format!("http://{}", target_name),
+    ])
+    .await;
+    assert!(
+        by_name.status.success(),
+        "name probe failed: {}",
+        String::from_utf8_lossy(&by_name.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&by_name.stdout).trim(), "200");
+
+    let by_hostname = run_docker_cli(&[
+        "run",
+        "--rm",
+        "--network",
+        TEST_NETWORK,
+        "curlimages/curl:latest",
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        &format!("http://{}", host_name),
+    ])
+    .await;
+    assert!(
+        by_hostname.status.success(),
+        "hostname probe failed: {}",
+        String::from_utf8_lossy(&by_hostname.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&by_hostname.stdout).trim(), "200");
+}
+
+async fn ensure_named_networks(networks: &[String]) {
     let docker =
         bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker");
 
-    // Check if network exists
-    if docker
-        .inspect_network(
-            TEST_NETWORK,
-            None::<bollard::query_parameters::InspectNetworkOptions>,
-        )
-        .await
-        .is_err()
-    {
-        // Create network
-        let config = bollard::models::NetworkCreateRequest {
-            name: TEST_NETWORK.to_string(),
-            driver: Some("bridge".to_string()),
-            ..Default::default()
-        };
-        let _ = docker.create_network(config).await;
+    for network in networks {
+        if docker
+            .inspect_network(
+                network,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .is_err()
+        {
+            let config = bollard::models::NetworkCreateRequest {
+                name: network.clone(),
+                driver: Some("bridge".to_string()),
+                ..Default::default()
+            };
+            let _ = docker.create_network(config).await;
+        }
     }
 }
 
@@ -197,8 +308,7 @@ async fn create_test_server_with(
     adopt_existing: bool,
     start_maintenance: bool,
 ) -> TestServer {
-    // Ensure test network exists
-    ensure_test_network().await;
+    ensure_named_networks(&config.networks).await;
 
     // Create Docker manager
     let docker = DockerManager::new(config.clone())
@@ -426,6 +536,47 @@ async fn cleanup_runtime(server: &TestServer, runtime_id: &str) {
 
     // Give Docker time to clean up
     tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+fn runtime_tmp_dir(hostname: &str, runtime_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("{}-{}", hostname, runtime_id))
+}
+
+async fn inspect_container_networks(container_name: &str) -> Vec<String> {
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .expect("Failed to connect to Docker for network inspection");
+
+    let info = match docker
+        .inspect_container(
+            container_name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(info) => info,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut names: Vec<String> = info
+        .network_settings
+        .and_then(|settings| settings.networks)
+        .map(|networks| networks.into_keys().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+async fn container_exists(container_name: &str) -> bool {
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .expect("Failed to connect to Docker for existence check");
+
+    docker
+        .inspect_container(
+            container_name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .is_ok()
 }
 
 #[tokio::test]
@@ -1160,6 +1311,75 @@ async fn test_logs_runtime_not_found() {
         .expect("Failed to send request");
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_logs_waits_briefly_for_runtime_creation() {
+    let server = create_test_server().await;
+    let runtime_id = unique_runtime_id("logs-race");
+    let base_url = server.base_url.clone();
+    let client = server.client.clone();
+    let auth_header = server.auth_header().1;
+
+    let logs_request = tokio::spawn({
+        let client = client.clone();
+        let auth_header = auth_header.clone();
+        let base_url = base_url.clone();
+        let runtime_id = runtime_id.clone();
+        async move {
+            client
+                .get(format!(
+                    "{}/v1/runtimes/{}/logs?timeout=5",
+                    base_url, runtime_id
+                ))
+                .header("Authorization", auth_header)
+                .send()
+                .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let payload = json!({
+        "runtimeId": runtime_id,
+        "image": get_runtime_image(),
+        "entrypoint": "index.js",
+        "source": get_test_function_path(),
+        "destination": OPENRUNTIMES_FUNCTION_PATH,
+        "dockerCmd": OPENRUNTIMES_SERVER_CMD,
+        "variables": {}
+    });
+
+    let create_response = client
+        .post(format!("{}/v1/runtimes", base_url))
+        .header("Authorization", auth_header.clone())
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .expect("Failed to create runtime");
+
+    assert!(
+        create_response.status().is_success(),
+        "Create runtime failed with status: {}",
+        create_response.status()
+    );
+
+    let logs_response = logs_request
+        .await
+        .expect("logs request task failed")
+        .expect("logs request failed");
+
+    assert_eq!(logs_response.status(), StatusCode::OK);
+    assert_eq!(
+        logs_response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    cleanup_runtime(&server, &runtime_id).await;
 }
 
 #[tokio::test]
@@ -3382,5 +3602,194 @@ mod lifecycle_resilience {
         for runtime_id in created {
             cleanup_runtime(&server, &runtime_id).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_keep_alive_mode_cleans_idle_non_keepalive_runtime() {
+        if should_skip_socket_required("test_keep_alive_mode_cleans_idle_non_keepalive_runtime")
+            .await
+        {
+            return;
+        }
+
+        let hostname = format!("e2e-idle-{}", uuid::Uuid::new_v4().as_simple());
+        let mut config = lifecycle_config(hostname.clone());
+        config.keep_alive = true;
+        config.inactive_threshold = 1;
+        config.maintenance_interval = 1;
+
+        let server = create_test_server_with(config, false, true).await;
+        let runtime_id = unique_runtime_id("idle-cleanup");
+        let container_name = server.runtime_container_name(&runtime_id, &hostname);
+
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "",
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create idle runtime");
+        assert!(response.status().is_success());
+
+        let cleaned = wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
+            let client = server.client.clone();
+            let base_url = server.base_url.clone();
+            let auth = server.auth_header().1.clone();
+            let runtime_id = runtime_id.clone();
+            let container_name = container_name.clone();
+            async move {
+                let runtime_missing = match client
+                    .get(format!("{}/v1/runtimes/{}", base_url, runtime_id))
+                    .header("Authorization", auth)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp.status() == StatusCode::NOT_FOUND,
+                    Err(_) => false,
+                };
+                runtime_missing && !container_exists(&container_name).await
+            }
+        })
+        .await;
+
+        assert!(
+            cleaned,
+            "Idle runtime without keepAliveId should be removed even when keep_alive=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_runtime_removes_container_and_tmp_dir() {
+        if should_skip_socket_required("test_delete_runtime_removes_container_and_tmp_dir").await {
+            return;
+        }
+
+        let hostname = format!("e2e-delete-{}", uuid::Uuid::new_v4().as_simple());
+        let config = lifecycle_config(hostname.clone());
+        let server = create_test_server_with(config, false, false).await;
+        let runtime_id = unique_runtime_id("teardown");
+        let container_name = server.runtime_container_name(&runtime_id, &hostname);
+        let tmp_dir = runtime_tmp_dir(&hostname, &runtime_id);
+
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "",
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime for teardown test");
+        assert!(response.status().is_success());
+
+        let created = wait_until(Duration::from_secs(20), Duration::from_millis(250), || {
+            let container_name = container_name.clone();
+            let tmp_dir = tmp_dir.clone();
+            async move { container_exists(&container_name).await && tmp_dir.exists() }
+        })
+        .await;
+        assert!(created, "Runtime artifacts should exist before delete");
+
+        cleanup_runtime(&server, &runtime_id).await;
+
+        let deleted = wait_until(Duration::from_secs(20), Duration::from_millis(250), || {
+            let client = server.client.clone();
+            let base_url = server.base_url.clone();
+            let auth = server.auth_header().1.clone();
+            let runtime_id = runtime_id.clone();
+            let container_name = container_name.clone();
+            let tmp_dir = tmp_dir.clone();
+            async move {
+                let runtime_missing = match client
+                    .get(format!("{}/v1/runtimes/{}", base_url, runtime_id))
+                    .header("Authorization", auth)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp.status() == StatusCode::NOT_FOUND,
+                    Err(_) => false,
+                };
+                runtime_missing && !container_exists(&container_name).await && !tmp_dir.exists()
+            }
+        })
+        .await;
+
+        assert!(
+            deleted,
+            "Delete should remove runtime metadata, Docker container, and temp directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_attaches_to_all_configured_networks() {
+        if should_skip_socket_required("test_runtime_attaches_to_all_configured_networks").await {
+            return;
+        }
+
+        let network_a = format!("e2e-net-a-{}", uuid::Uuid::new_v4().as_simple());
+        let network_b = format!("e2e-net-b-{}", uuid::Uuid::new_v4().as_simple());
+        let hostname = format!("e2e-network-{}", uuid::Uuid::new_v4().as_simple());
+
+        let mut config = lifecycle_config(hostname.clone());
+        config.networks = vec![network_a.clone(), network_b.clone()];
+
+        let server = create_test_server_with(config, false, false).await;
+        let runtime_id = unique_runtime_id("networks");
+        let container_name = server.runtime_container_name(&runtime_id, &hostname);
+
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": get_runtime_image(),
+            "entrypoint": "",
+            "variables": {}
+        });
+
+        let response = server
+            .client
+            .post(format!("{}/v1/runtimes", server.base_url))
+            .header(server.auth_header().0, server.auth_header().1.clone())
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .expect("Failed to create runtime for network test");
+        assert!(response.status().is_success());
+
+        let attached = wait_until(Duration::from_secs(20), Duration::from_millis(250), || {
+            let container_name = container_name.clone();
+            let expected_a = network_a.clone();
+            let expected_b = network_b.clone();
+            async move {
+                let current = inspect_container_networks(&container_name).await;
+                current.contains(&expected_a) && current.contains(&expected_b)
+            }
+        })
+        .await;
+
+        if !attached {
+            let current = inspect_container_networks(&container_name).await;
+            panic!(
+                "Runtime should be attached to all configured networks; current={:?}",
+                current
+            );
+        }
+
+        cleanup_runtime(&server, &runtime_id).await;
     }
 }

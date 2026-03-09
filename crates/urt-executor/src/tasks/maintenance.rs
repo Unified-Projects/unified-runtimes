@@ -4,7 +4,7 @@ use crate::config::ExecutorConfig;
 use crate::docker::container::ContainerInfo;
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;
-use crate::runtime::{KeepAliveRegistry, Runtime, RuntimeRegistry};
+use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime, RuntimeRegistry};
 use crate::storage::{BuildCache, Storage};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,13 +20,13 @@ fn infer_runtime_version(image: &str, labels: &HashMap<String, String>) -> Strin
         return version.clone();
     }
 
-    if image.contains(":v5") || image.contains(":v5-") {
-        "v5".to_string()
-    } else if image.contains(":v2") || image.contains(":v2-") {
-        "v2".to_string()
-    } else {
-        "v5".to_string()
+    for version in ["v5", "v4", "v3", "v2"] {
+        if image.contains(&format!(":{version}")) || image.contains(&format!(":{version}-")) {
+            return version.to_string();
+        }
     }
+
+    "v5".to_string()
 }
 
 fn is_managed_container(container: &ContainerInfo) -> bool {
@@ -47,7 +47,26 @@ fn is_container_running(container: &ContainerInfo) -> bool {
     status == "running" || status == "up" || status.starts_with("up ")
 }
 
+fn belongs_to_hostname(container: &ContainerInfo, hostname: &str) -> bool {
+    if let Some(executor_hostname) = container
+        .labels
+        .get("urt.executor_hostname")
+        .filter(|value| !value.is_empty())
+    {
+        return executor_hostname == hostname;
+    }
+
+    container
+        .name
+        .strip_prefix(&format!("{}-", hostname))
+        .is_some()
+}
+
 fn runtime_id_from_container(container: &ContainerInfo, hostname: &str) -> Option<String> {
+    if !belongs_to_hostname(container, hostname) {
+        return None;
+    }
+
     if let Some(runtime_id) = container
         .labels
         .get("urt.runtime_id")
@@ -125,15 +144,11 @@ fn runtime_from_container(container: &ContainerInfo, hostname: &str) -> Option<R
         runtime.key = secret.clone();
     }
 
-    if let Some(internal_hostname) = container
-        .env
-        .get("OPEN_RUNTIMES_HOSTNAME")
-        .or_else(|| container.env.get("INTERNAL_EXECUTOR_HOSTNAME"))
-    {
-        runtime.hostname = internal_hostname.clone();
-    } else if !container.hostname.is_empty() {
+    if !container.hostname.is_empty() {
         runtime.hostname = container.hostname.clone();
     }
+
+    runtime.refresh_cached_auth();
 
     Some(runtime)
 }
@@ -177,6 +192,14 @@ async fn adopt_inspected_container(
         }
     };
 
+    let mut runtime = runtime;
+    if wait_for_runtime_port(&runtime.name, 3000, Duration::from_millis(200))
+        .await
+        .is_ok()
+    {
+        runtime.listening = 1;
+    }
+
     if let Err(e) = registry.insert(runtime.clone()).await {
         if matches!(e, ExecutorError::RuntimeConflict) {
             return false;
@@ -206,18 +229,7 @@ async fn adopt_inspected_container(
     true
 }
 
-async fn remove_container_for_cleanup(
-    docker: &DockerManager,
-    name: &str,
-    attempt_stop: bool,
-    context: &str,
-) -> bool {
-    if attempt_stop {
-        if let Err(e) = docker.stop_container(name, 10).await {
-            warn!("Failed to stop {} container {}: {}", context, name, e);
-        }
-    }
-
+async fn remove_container_for_cleanup(docker: &DockerManager, name: &str, context: &str) -> bool {
     match docker.remove_container(name, true).await {
         Ok(_) => true,
         Err(ExecutorError::RuntimeNotFound) => true,
@@ -283,6 +295,14 @@ pub async fn adopt_existing_containers(
     for container in containers {
         let name = container.name.clone();
 
+        if !belongs_to_hostname(&container, hostname) {
+            debug!(
+                "Skipping managed container {} during adoption for hostname {}",
+                name, hostname
+            );
+            continue;
+        }
+
         // Skip if already in registry
         if registry.exists(&name).await {
             debug!("Container {} already in registry, skipping", name);
@@ -330,9 +350,8 @@ pub async fn adopt_existing_containers(
 
 /// Run the maintenance worker
 ///
-/// When keep_alive is true (default), this only runs cleanup on shutdown.
-/// When keep_alive is false, this removes runtimes that have been idle
-/// longer than inactive_threshold.
+/// Idle runtimes are always eligible for cleanup, but runtimes that currently
+/// own a keep-alive ID stay protected.
 pub async fn run_maintenance<S: Storage + 'static>(
     docker: Arc<DockerManager>,
     registry: RuntimeRegistry,
@@ -360,15 +379,17 @@ pub async fn run_maintenance<S: Storage + 'static>(
             _ = tokio::time::sleep(interval) => {
                 // Always check for orphaned keepalive containers (runs regardless of keep_alive setting)
                 // This catches cases where a container was replaced but previous owner wasn't cleaned up
-                cleanup_orphaned_keepalive(&docker, &registry, &keep_alive_registry).await;
+                cleanup_orphaned_keepalive(&docker, &registry, &keep_alive_registry, &config.hostname).await;
+
+                cleanup_idle(&docker, &registry, &keep_alive_registry, config.inactive_threshold).await;
+                cleanup_untracked_managed_containers(&docker, &registry, &config.hostname).await;
 
                 if config.keep_alive {
-                    // Keep-alive mode: only log stats, no cleanup
                     let count = registry.count().await;
-                    debug!("Maintenance check: {} active runtimes (keep_alive=true, no cleanup)", count);
-                } else {
-                    // Normal mode: clean up idle runtimes (respects per-runtime keep-alive IDs)
-                    cleanup_idle(&docker, &registry, &keep_alive_registry, config.inactive_threshold).await;
+                    debug!(
+                        "Maintenance check: {} active runtimes (keep_alive=true, protected runtimes preserved)",
+                        count
+                    );
                 }
 
                 // Always clean up temporary build directories
@@ -464,9 +485,7 @@ async fn cleanup_idle(
             }
         }
 
-        // Force removal is enough for maintenance cleanup and avoids long per-container
-        // graceful-stop waits that can stall cleanup under load.
-        let removed = remove_container_for_cleanup(docker, name, false, "idle").await;
+        let removed = remove_container_for_cleanup(docker, name, "idle").await;
         if !removed {
             debug!(
                 "Keeping idle runtime {} in registry for retry after failed Docker removal",
@@ -486,6 +505,53 @@ async fn cleanup_idle(
     }
 }
 
+async fn cleanup_untracked_managed_containers(
+    docker: &DockerManager,
+    registry: &RuntimeRegistry,
+    hostname: &str,
+) {
+    let containers = match docker.list_containers(Some("urt.managed=true")).await {
+        Ok(containers) => containers,
+        Err(error) => {
+            warn!(
+                "Failed to list containers for untracked managed cleanup: {}",
+                error
+            );
+            return;
+        }
+    };
+
+    for container in containers {
+        if !belongs_to_hostname(&container, hostname) {
+            continue;
+        }
+
+        if registry.exists(&container.name).await {
+            continue;
+        }
+
+        if let Some(keep_alive_id) = keep_alive_id_from_container(&container) {
+            debug!(
+                "Skipping untracked managed container {} because it carries keep-alive ID '{}'",
+                container.name, keep_alive_id
+            );
+            continue;
+        }
+
+        info!(
+            "Cleaning up untracked managed container {} (state: {}, status: {})",
+            container.name, container.state, container.status
+        );
+
+        let removed =
+            remove_container_for_cleanup(docker, &container.name, "untracked managed").await;
+
+        if removed {
+            registry.remove(&container.name).await;
+        }
+    }
+}
+
 /// Clean up orphaned keepalive containers
 ///
 /// This function handles cases where a container with a keep_alive_id was
@@ -496,6 +562,7 @@ async fn cleanup_orphaned_keepalive(
     docker: &DockerManager,
     registry: &RuntimeRegistry,
     keep_alive_registry: &KeepAliveRegistry,
+    hostname: &str,
 ) {
     // Get all managed containers from Docker
     let containers = match docker.list_containers(Some("urt.managed=true")).await {
@@ -514,6 +581,10 @@ async fn cleanup_orphaned_keepalive(
     let mut by_keep_alive: HashMap<String, Vec<ContainerInfo>> = HashMap::new();
 
     for container in containers {
+        if !belongs_to_hostname(&container, hostname) {
+            continue;
+        }
+
         container_names.insert(container.name.clone());
         if let Some(ka_id) = container
             .labels
@@ -589,9 +660,12 @@ async fn cleanup_orphaned_keepalive(
                 container.name, ka_id
             );
 
+            if !is_container_running(&container) {
+                continue;
+            }
+
             let removed =
-                remove_container_for_cleanup(docker, &container.name, false, "orphaned keep-alive")
-                    .await;
+                remove_container_for_cleanup(docker, &container.name, "orphaned keep-alive").await;
             if !removed {
                 debug!(
                     "Keeping orphaned runtime {} in registry for retry after failed Docker removal",
@@ -644,5 +718,107 @@ async fn cleanup_temp_dirs(hostname: &str, registry: &RuntimeRegistry) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        belongs_to_hostname, infer_runtime_version, is_container_running,
+        keep_alive_id_from_container, runtime_id_from_container,
+    };
+    use crate::docker::container::ContainerInfo;
+    use std::collections::HashMap;
+
+    fn container(name: &str) -> ContainerInfo {
+        ContainerInfo {
+            id: "id".to_string(),
+            name: name.to_string(),
+            image: "openruntimes/node:v4-20".to_string(),
+            state: "running".to_string(),
+            status: "Up 5 seconds".to_string(),
+            created: 1,
+            labels: HashMap::new(),
+            env: HashMap::new(),
+            hostname: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_infer_runtime_version_prefers_label_and_supports_older_modern_versions() {
+        let mut labels = HashMap::new();
+        labels.insert("urt.version".to_string(), "v3".to_string());
+        assert_eq!(
+            infer_runtime_version("openruntimes/node:v5-22", &labels),
+            "v3"
+        );
+
+        let labels = HashMap::new();
+        assert_eq!(
+            infer_runtime_version("openruntimes/node:v4-20", &labels),
+            "v4"
+        );
+        assert_eq!(
+            infer_runtime_version("openruntimes/node:v2-18", &labels),
+            "v2"
+        );
+    }
+
+    #[test]
+    fn test_runtime_id_and_keep_alive_fallbacks_use_labels_then_env() {
+        let mut container = container("executor-my-runtime");
+        container.labels.insert(
+            "urt.runtime_id".to_string(),
+            "runtime-from-label".to_string(),
+        );
+        container
+            .env
+            .insert("URT_KEEP_ALIVE".to_string(), "svc-a".to_string());
+
+        assert_eq!(
+            runtime_id_from_container(&container, "executor"),
+            Some("runtime-from-label".to_string())
+        );
+        assert_eq!(
+            keep_alive_id_from_container(&container),
+            Some("svc-a".to_string())
+        );
+    }
+
+    #[test]
+    fn test_belongs_to_hostname_uses_label_or_name_prefix() {
+        let mut labeled = container("other-host-runtime");
+        labeled
+            .labels
+            .insert("urt.executor_hostname".to_string(), "executor".to_string());
+        assert!(belongs_to_hostname(&labeled, "executor"));
+        assert!(!belongs_to_hostname(&labeled, "someone-else"));
+
+        let prefixed = container("executor-my-runtime");
+        assert!(belongs_to_hostname(&prefixed, "executor"));
+        assert!(!belongs_to_hostname(&prefixed, "other-host"));
+    }
+
+    #[test]
+    fn test_is_container_running_checks_state_and_status() {
+        let mut container = container("executor-my-runtime");
+        assert!(is_container_running(&container));
+
+        container.state.clear();
+        container.status = "Exited (0)".to_string();
+        assert!(!is_container_running(&container));
+    }
+
+    #[test]
+    fn test_runtime_from_container_accepts_legacy_executor_hostname_typo() {
+        let mut container = container("executor-my-runtime");
+        container.env.insert(
+            "INERNAL_EXECUTOR_HOSTNAME".to_string(),
+            "executor-a".to_string(),
+        );
+        container.hostname = "runtime-host-123".to_string();
+
+        let runtime = super::runtime_from_container(&container, "executor").unwrap();
+        assert_eq!(runtime.hostname, "runtime-host-123");
     }
 }

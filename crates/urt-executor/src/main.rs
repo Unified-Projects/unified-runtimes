@@ -26,6 +26,7 @@ mod telemetry;
 use config::ExecutorConfig;
 use docker::DockerManager;
 use execution_counter::active_executions;
+use platform::temp_dir;
 use routes::{create_router, AppState};
 use runtime::{KeepAliveRegistry, RuntimeRegistry};
 use storage::{Storage, StorageFileCache};
@@ -80,7 +81,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Host: {}:{}", config.host, config.port);
     info!("  Keep-alive: {}", config.keep_alive);
     info!("  Autoscale: {}", config.autoscale);
+    info!(
+        "  Eager runtime readiness: {}",
+        config.eager_runtime_readiness
+    );
     info!("  Metrics endpoint: {}", config.metrics_enabled);
+    info!("  Auto runtime: {}", config.auto_runtime);
     info!("  Min CPUs: {}", config.min_cpus);
     info!("  Min Memory: {} MB", config.min_memory);
     info!("  Networks: {:?}", config.networks);
@@ -349,30 +355,38 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal.await;
-
-            // BLOCK HERE UNTIL DOCKER FINISHES
-            docker_for_shutdown.cleanup_managed_containers().await;
-
-            // Optional: clean file cache on shutdown (disabled by default to preserve warm cache).
-            if cleanup_cache_on_shutdown {
-                info!("Cleaning up file cache...");
-                file_cache_for_shutdown
-                    .cleanup_all()
-                    .await
-                    .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))
-                    .ok();
-            }
-        })
+        .with_graceful_shutdown(shutdown_signal)
         .await?;
 
     info!("Server stopped");
 
+    let managed_runtimes = docker_for_shutdown.cleanup_managed_containers().await;
+    let mut runtime_dirs = managed_runtimes;
+
+    for runtime in registry.clear().await {
+        runtime_dirs.push(runtime.name);
+    }
+
+    runtime_dirs.sort();
+    runtime_dirs.dedup();
+
+    for runtime_name in runtime_dirs {
+        let tmp_folder = temp_dir().join(&runtime_name);
+        if let Err(err) = tokio::fs::remove_dir_all(&tmp_folder).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "Failed to remove runtime temp dir {} during shutdown: {}",
+                    tmp_folder.display(),
+                    err
+                );
+            }
+        }
+    }
+
     // Final cleanup (optional to preserve cold-start cache between restarts).
     if cleanup_cache_on_shutdown {
         info!("Performing final cleanup...");
-        file_cache
+        file_cache_for_shutdown
             .cleanup_all()
             .await
             .inspect_err(|e| warn!("Failed to clean up file cache: {}", e))

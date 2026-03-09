@@ -7,7 +7,7 @@ use crate::docker::container::ContainerConfig;
 use crate::error::{ExecutorError, Result};
 use crate::platform;
 use crate::resilience::retry_with_backoff;
-use crate::runtime::{KeepAliveRegistry, Runtime};
+use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime};
 use crate::tasks;
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
@@ -80,6 +80,69 @@ pub fn default_version() -> String {
 const DEFAULT_RESTART_POLICY: &str = "no";
 pub fn default_restart_policy() -> String {
     DEFAULT_RESTART_POLICY.to_string()
+}
+
+fn is_legacy_v2(version: &str) -> bool {
+    version.trim().eq_ignore_ascii_case("v2")
+}
+
+fn uses_modern_runtime_layout(version: &str) -> bool {
+    !is_legacy_v2(version)
+}
+
+struct RuntimeEnvVars<'a> {
+    version: &'a str,
+    entrypoint: &'a str,
+    executor_hostname: &'a str,
+    cpus: f64,
+    memory: u64,
+    output_directory: &'a str,
+}
+
+fn apply_runtime_env_vars(
+    env: &mut std::collections::HashMap<String, String>,
+    runtime: &Runtime,
+    config: RuntimeEnvVars<'_>,
+) {
+    if is_legacy_v2(config.version) {
+        env.insert("INTERNAL_RUNTIME_KEY".to_string(), runtime.key.clone());
+        env.insert(
+            "INTERNAL_RUNTIME_ENTRYPOINT".to_string(),
+            config.entrypoint.to_string(),
+        );
+        env.insert(
+            "INTERNAL_EXECUTOR_HOSTNAME".to_string(),
+            config.executor_hostname.to_string(),
+        );
+        // Mirror the historical typo used by executor-main for older images.
+        env.insert(
+            "INERNAL_EXECUTOR_HOSTNAME".to_string(),
+            config.executor_hostname.to_string(),
+        );
+        return;
+    }
+
+    env.insert("OPEN_RUNTIMES_SECRET".to_string(), runtime.key.clone());
+    env.insert(
+        "OPEN_RUNTIMES_ENTRYPOINT".to_string(),
+        config.entrypoint.to_string(),
+    );
+    env.insert(
+        "OPEN_RUNTIMES_HOSTNAME".to_string(),
+        config.executor_hostname.to_string(),
+    );
+    env.insert("OPEN_RUNTIMES_CPUS".to_string(), config.cpus.to_string());
+    env.insert(
+        "OPEN_RUNTIMES_MEMORY".to_string(),
+        config.memory.to_string(),
+    );
+
+    if !config.output_directory.is_empty() {
+        env.insert(
+            "OPEN_RUNTIMES_OUTPUT_DIRECTORY".to_string(),
+            config.output_directory.to_string(),
+        );
+    }
 }
 
 /// Roll back keep-alive ownership if runtime creation fails after ownership transfer.
@@ -180,16 +243,19 @@ fn validate_runtime_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Sanitize tar extraction commands to prevent permission, ownership, ACL, and xattr failures
-/// on Docker-mounted volumes where the container user lacks the necessary privileges.
+/// Sanitize tar extraction commands to prevent permission and ownership restoration failures on
+/// Docker-mounted volumes where the container user lacks the necessary privileges.
 ///
-/// Injects `--no-same-permissions --no-same-owner --no-acls --no-xattrs` immediately after
-/// `tar` for any invocation that includes the extract flag (`x`) without the create flag (`c`).
+/// Injects `--no-same-permissions -o` immediately after `tar` for any invocation that includes
+/// the extract flag (`x`) without the create flag (`c`). These flags are supported by both GNU
+/// tar and BusyBox tar; GNU-only flags such as `--no-acls` and `--no-xattrs` break BusyBox-based
+/// runtime images.
 /// Idempotent: no-op if the flags are already present. Does not touch create commands or
 /// non-tar commands.
 fn sanitize_tar_flags(cmd: &str) -> String {
     // Idempotent guard: if the flags are already in the command, return unchanged.
-    if cmd.contains("--no-same-permissions") {
+    if cmd.contains("--no-same-permissions") || cmd.contains("tar -o ") || cmd.contains(" tar -o ")
+    {
         return cmd.to_string();
     }
 
@@ -217,7 +283,7 @@ fn sanitize_tar_flags(cmd: &str) -> String {
     // Inject flags immediately after "tar ".
     let inject_pos = tar_pos + 4;
     format!(
-        "{}--no-same-permissions --no-same-owner --no-acls --no-xattrs {}",
+        "{}--no-same-permissions -o {}",
         &cmd[..inject_pos],
         &cmd[inject_pos..]
     )
@@ -266,6 +332,91 @@ fn validate_image_name(image: &str) -> Result<()> {
         return Err(ExecutorError::BadRequest(
             "Image name contains path traversal sequence".to_string(),
         ));
+    }
+
+    Ok(())
+}
+
+fn is_live_container_state(state: &str, status: &str) -> bool {
+    let normalized_state = state.trim().to_ascii_lowercase();
+    if !normalized_state.is_empty() {
+        return matches!(
+            normalized_state.as_str(),
+            "running" | "created" | "restarting" | "paused"
+        );
+    }
+
+    let normalized_status = status.trim().to_ascii_lowercase();
+    normalized_status == "running"
+        || normalized_status == "up"
+        || normalized_status.starts_with("up ")
+}
+
+async fn cleanup_runtime_artifacts(state: &AppState, full_name: &str) {
+    state.registry.remove(full_name).await;
+    let tmp_folder = platform::temp_dir().join(full_name);
+    tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+}
+
+async fn reconcile_existing_runtime_id(
+    state: &AppState,
+    runtime_id: &str,
+    full_name: &str,
+) -> Result<()> {
+    if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
+        if is_live_container_state(&runtime.status, &runtime.status) || runtime.is_pending() {
+            info!(
+                "Runtime {} already exists with live status {}",
+                runtime_id, runtime.status
+            );
+            return Err(ExecutorError::RuntimeConflict);
+        }
+
+        warn!(
+            "Cleaning up stale registry entry for runtime {} with status {}",
+            runtime_id, runtime.status
+        );
+        let _ = state.docker.remove_container(full_name, true).await;
+        cleanup_runtime_artifacts(state, full_name).await;
+    } else if state.registry.exists(full_name).await {
+        return Err(ExecutorError::RuntimeConflict);
+    }
+
+    match state.docker.inspect_container(full_name).await {
+        Ok(container) => {
+            if tasks::adopt_container_by_name(
+                &state.docker,
+                &state.registry,
+                &state.keep_alive_registry,
+                &state.config.hostname,
+                full_name,
+            )
+            .await
+            {
+                info!(
+                    "Runtime {} already exists as managed container {}",
+                    runtime_id, full_name
+                );
+                return Err(ExecutorError::RuntimeConflict);
+            }
+
+            if is_live_container_state(&container.state, &container.status) {
+                warn!(
+                    "Refusing to recreate runtime {} because live container {} already exists",
+                    runtime_id, full_name
+                );
+                return Err(ExecutorError::RuntimeConflict);
+            }
+
+            warn!(
+                "Removing stale container {} before recreating runtime {}",
+                full_name, runtime_id
+            );
+            state.docker.remove_container(full_name, true).await?;
+            cleanup_runtime_artifacts(state, full_name).await;
+        }
+        Err(ExecutorError::RuntimeNotFound) => {}
+        Err(error) => return Err(error),
     }
 
     Ok(())
@@ -323,29 +474,43 @@ pub async fn create_runtime(
     // Parse JSON body manually for backwards compatibility (no Content-Type requirement)
     let req: CreateRuntimeRequest = serde_json::from_str(&body)
         .map_err(|e| ExecutorError::BadRequest(format!("Invalid JSON: {}", e)))?;
+    let resolved_image = state.config.resolve_runtime_image(
+        &req.image,
+        &req.entrypoint,
+        &req.runtime_entrypoint,
+        &req.command,
+    );
+
+    if resolved_image != req.image {
+        info!(
+            runtime_id = %req.runtime_id,
+            requested_image = %req.image,
+            resolved_image = %resolved_image,
+            "Resolved runtime image"
+        );
+    }
 
     info!(
         runtime_id = %req.runtime_id,
-        image = %req.image,
+        image = %resolved_image,
         version = %req.version,
         "Creating runtime"
     );
 
     // Validate runtime ID and image name
     validate_runtime_id(&req.runtime_id)?;
-    validate_image_name(&req.image)?;
+    validate_image_name(&resolved_image)?;
 
-    // Check if runtime already exists
     let full_name = format!("{}-{}", state.config.hostname, req.runtime_id);
     if state.registry.exists(&full_name).await {
-        return Err(ExecutorError::RuntimeConflict);
+        reconcile_existing_runtime_id(&state, &req.runtime_id, &full_name).await?;
     }
 
     // Check if image is allowed
-    if !state.config.is_runtime_allowed(&req.image) {
+    if !state.config.is_runtime_allowed(&resolved_image) {
         return Err(ExecutorError::BadRequest(format!(
             "Image {} is not in allowed runtimes list",
-            req.image
+            resolved_image
         )));
     }
 
@@ -373,7 +538,7 @@ pub async fn create_runtime(
     let runtime = Runtime::new(
         &req.runtime_id,
         &state.config.hostname,
-        &req.image,
+        &resolved_image,
         &req.version,
         keep_alive_id.clone(),
     );
@@ -415,53 +580,31 @@ pub async fn create_runtime(
         .map(|v| v.eq_ignore_ascii_case("none"))
         .unwrap_or(false);
 
-    // Add version-specific variables
-    match req.version.as_str() {
-        "v2" => {
-            env.insert("INTERNAL_RUNTIME_KEY".to_string(), runtime.key.clone());
-            env.insert(
-                "INTERNAL_RUNTIME_ENTRYPOINT".to_string(),
-                req.entrypoint.clone(),
-            );
-            env.insert(
-                "INTERNAL_EXECUTOR_HOSTNAME".to_string(),
-                runtime.hostname.clone(),
-            );
-        }
-        _ => {
-            // v4/v5
-            env.insert("OPEN_RUNTIMES_SECRET".to_string(), runtime.key.clone());
-            env.insert(
-                "OPEN_RUNTIMES_ENTRYPOINT".to_string(),
-                req.entrypoint.clone(),
-            );
-            env.insert(
-                "OPEN_RUNTIMES_HOSTNAME".to_string(),
-                runtime.hostname.clone(),
-            );
-            env.insert("OPEN_RUNTIMES_CPUS".to_string(), cpus.to_string());
-            env.insert("OPEN_RUNTIMES_MEMORY".to_string(), memory.to_string());
-
-            if !req.output_directory.is_empty() {
-                env.insert(
-                    "OPEN_RUNTIMES_OUTPUT_DIRECTORY".to_string(),
-                    req.output_directory.clone(),
-                );
-            }
-        }
-    }
+    apply_runtime_env_vars(
+        &mut env,
+        &runtime,
+        RuntimeEnvVars {
+            version: &req.version,
+            entrypoint: &req.entrypoint,
+            executor_hostname: &state.config.hostname,
+            cpus,
+            memory,
+            output_directory: &req.output_directory,
+        },
+    );
 
     // Always set CI=true
     env.insert("CI".to_string(), "true".to_string());
 
     // Build container config
-    let mut container = ContainerConfig::new(&full_name, &req.image)
+    let mut container = ContainerConfig::new(&full_name, &resolved_image)
         .with_hostname(&runtime.hostname)
         .with_cpus(cpus)
         .with_memory_mb(memory)
         .with_envs(env)
         .with_restart_policy(&req.restart_policy)
         .with_label("urt.managed", "true")
+        .with_label("urt.executor_hostname", &state.config.hostname)
         .with_label("urt.runtime_id", &req.runtime_id)
         .with_label("urt.version", &req.version);
 
@@ -472,15 +615,17 @@ pub async fn create_runtime(
         }
     }
 
-    // Add network
-    if let Some(network) = state.config.random_network() {
+    // Attach to one configured network at create time, then connect to the rest
+    // after start so runtimes are reachable everywhere the executor is attached.
+    let primary_network = state.config.random_network().map(str::to_string);
+    if let Some(network) = primary_network.as_deref() {
         container = container.with_network(network);
     }
 
     // Volume mounts - exactly matches Docker.php lines 471-479
     let tmp_base = platform::temp_dir();
     let tmp_folder = tmp_base.join(&full_name);
-    let code_mount_path = if req.version == "v2" {
+    let code_mount_path = if is_legacy_v2(&req.version) {
         "/usr/code"
     } else {
         "/mnt/code"
@@ -604,7 +749,7 @@ pub async fn create_runtime(
         .with_mount(&builds_dir_str, code_mount_path, false);
 
     // Add v5-specific mounts (Docker.php lines 476-479)
-    if req.version == "v5" {
+    if uses_modern_runtime_layout(&req.version) {
         let logs_dir = tmp_folder.join("logs");
         let logging_dir = tmp_folder.join("logging");
         tokio::fs::create_dir_all(&logs_dir).await.ok();
@@ -627,7 +772,7 @@ pub async fn create_runtime(
             "-c".to_string(),
             req.runtime_entrypoint.clone(),
         ]
-    } else if req.version == "v2" && req.command.is_empty() {
+    } else if is_legacy_v2(&req.version) && req.command.is_empty() {
         // v2 with no command - no keep-alive needed (Docker.php lines 457-458)
         vec![]
     } else {
@@ -674,6 +819,10 @@ pub async fn create_runtime(
                 e
             )));
         }
+    }
+
+    if state.config.networks.len() > 1 {
+        state.docker.connect_container_to_networks(&full_name).await;
     }
 
     // Wait for container to reach running state, with exponential backoff.
@@ -752,7 +901,7 @@ pub async fn create_runtime(
         // Normalize tar extraction flags to prevent permission errors on Docker volumes.
         let sanitized_command = sanitize_tar_flags(&req.command);
 
-        let wrapped_command = if req.version == "v2" {
+        let wrapped_command = if is_legacy_v2(&req.version) {
             // v2: simple shell with log capture
             format!(
                 "touch /var/tmp/logs.txt && ({}) >> /var/tmp/logs.txt 2>&1 && cat /var/tmp/logs.txt",
@@ -768,7 +917,7 @@ pub async fn create_runtime(
 
         // Execute using the appropriate shell for the version
         // v2 uses sh, v5 uses bash (matches executor-main Docker.php lines 507-517)
-        let exec_result = if req.version == "v2" {
+        let exec_result = if is_legacy_v2(&req.version) {
             state
                 .docker
                 .exec_shell(&full_name, &wrapped_command, req.timeout as u64)
@@ -783,7 +932,7 @@ pub async fn create_runtime(
         match exec_result {
             Ok(result) => {
                 // For v5, parse logs with timing info (matches executor-main Logs::get())
-                if req.version != "v2" {
+                if uses_modern_runtime_layout(&req.version) {
                     let logging_dir = tmp_folder.join("logging");
                     let logging_dir_str = logging_dir.display().to_string();
                     let parsed_logs = parse_build_logs(&logging_dir_str).await;
@@ -904,12 +1053,28 @@ pub async fn create_runtime(
 
         info!("Cleaned up runtime {} after build", req.runtime_id);
     } else {
-        // Update runtime status if keeping it running
-        if let Ok(info) = state.docker.inspect_container(&full_name).await {
-            let mut updated_runtime = runtime.clone();
-            updated_runtime.mark_running(&info.state);
-            state.registry.update(updated_runtime).await.ok();
+        let mut updated_runtime = runtime.clone();
+        if state.config.eager_runtime_readiness {
+            let port_timeout_secs = u64::from(req.timeout.clamp(1, 30));
+            if let Err(error) =
+                wait_for_runtime_port(&full_name, 3000, Duration::from_secs(port_timeout_secs))
+                    .await
+            {
+                error!(
+                    "Runtime {} failed port readiness: {}",
+                    req.runtime_id, error
+                );
+                state.docker.remove_container(&full_name, true).await.ok();
+                tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+                state.registry.remove(&full_name).await;
+                return Err(ExecutorError::RuntimeFailed(
+                    "Runtime port readiness check timed out".to_string(),
+                ));
+            }
+            updated_runtime.set_listening();
         }
+        updated_runtime.mark_running("running");
+        state.registry.update(updated_runtime).await.ok();
     }
 
     // If a keep-alive ID was transferred, clean up the previous owner now that
@@ -1134,11 +1299,15 @@ async fn cleanup_previous_keep_alive_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_tar_flags, KeepAliveRegistrationGuard};
-    use crate::runtime::KeepAliveRegistry;
+    use super::{
+        apply_runtime_env_vars, is_legacy_v2, is_live_container_state, sanitize_tar_flags,
+        uses_modern_runtime_layout, KeepAliveRegistrationGuard, RuntimeEnvVars,
+    };
+    use crate::runtime::{KeepAliveRegistry, Runtime};
+    use std::collections::HashMap;
 
     #[test]
-    fn test_sanitize_tar_flags_injects_all_flags() {
+    fn test_sanitize_tar_flags_injects_portable_flags() {
         let cmd = "tar -zxf /tmp/code.tar.gz -C /mnt/code && helpers/build.sh 'npm install'";
         let result = sanitize_tar_flags(cmd);
         assert!(
@@ -1146,19 +1315,15 @@ mod tests {
             "expected --no-same-permissions in: {}",
             result
         );
+        assert!(result.contains(" -o "), "expected -o in: {}", result);
         assert!(
-            result.contains("--no-same-owner"),
-            "expected --no-same-owner in: {}",
+            !result.contains("--no-acls"),
+            "unexpected GNU-only --no-acls in: {}",
             result
         );
         assert!(
-            result.contains("--no-acls"),
-            "expected --no-acls in: {}",
-            result
-        );
-        assert!(
-            result.contains("--no-xattrs"),
-            "expected --no-xattrs in: {}",
+            !result.contains("--no-xattrs"),
+            "unexpected GNU-only --no-xattrs in: {}",
             result
         );
         // Non-tar parts of the command must be preserved.
@@ -1174,9 +1339,7 @@ mod tests {
         let cmd = "tar -xzf /tmp/code.tar.gz -C /mnt/code";
         let result = sanitize_tar_flags(cmd);
         assert!(result.contains("--no-same-permissions"));
-        assert!(result.contains("--no-same-owner"));
-        assert!(result.contains("--no-acls"));
-        assert!(result.contains("--no-xattrs"));
+        assert!(result.contains(" -o "));
     }
 
     #[test]
@@ -1184,9 +1347,7 @@ mod tests {
         let cmd = "tar -xf /tmp/code.tar -C /mnt/code";
         let result = sanitize_tar_flags(cmd);
         assert!(result.contains("--no-same-permissions"));
-        assert!(result.contains("--no-same-owner"));
-        assert!(result.contains("--no-acls"));
-        assert!(result.contains("--no-xattrs"));
+        assert!(result.contains(" -o "));
     }
 
     #[test]
@@ -1204,10 +1365,16 @@ mod tests {
     #[test]
     fn test_sanitize_tar_flags_idempotent() {
         // Flags already present: must not be duplicated.
-        let cmd = "tar --no-same-permissions --no-same-owner --no-acls --no-xattrs -zxf /tmp/code.tar.gz -C /mnt/code";
+        let cmd = "tar --no-same-permissions -o -zxf /tmp/code.tar.gz -C /mnt/code";
         let result = sanitize_tar_flags(cmd);
         assert_eq!(
             result.matches("--no-same-permissions").count(),
+            1,
+            "flags must appear exactly once, got: {}",
+            result
+        );
+        assert_eq!(
+            result.matches(" -o ").count(),
             1,
             "flags must appear exactly once, got: {}",
             result
@@ -1258,5 +1425,87 @@ mod tests {
         }
 
         assert_eq!(registry.get_owner("svc-b"), Some("runtime-new".to_string()));
+    }
+
+    #[test]
+    fn test_version_helpers_treat_only_v2_as_legacy() {
+        assert!(is_legacy_v2("v2"));
+        assert!(is_legacy_v2(" V2 "));
+        assert!(!is_legacy_v2("v4"));
+        assert!(uses_modern_runtime_layout("v4"));
+        assert!(uses_modern_runtime_layout("v5"));
+    }
+
+    #[test]
+    fn test_live_container_state_includes_running_and_created_states() {
+        assert!(is_live_container_state("running", ""));
+        assert!(is_live_container_state("created", ""));
+        assert!(is_live_container_state("", "Up 10 seconds"));
+        assert!(!is_live_container_state("exited", ""));
+    }
+
+    #[test]
+    fn test_apply_runtime_env_vars_uses_executor_hostname_for_modern_runtimes() {
+        let runtime = Runtime::new("rt1", "executor-a", "img", "v5", None);
+        let mut env = HashMap::new();
+
+        apply_runtime_env_vars(
+            &mut env,
+            &runtime,
+            RuntimeEnvVars {
+                version: "v5",
+                entrypoint: "index.js",
+                executor_hostname: "executor-a",
+                cpus: 1.0,
+                memory: 512,
+                output_directory: "dist",
+            },
+        );
+
+        assert_eq!(
+            env.get("OPEN_RUNTIMES_HOSTNAME"),
+            Some(&"executor-a".to_string())
+        );
+        assert_eq!(
+            env.get("OPEN_RUNTIMES_ENTRYPOINT"),
+            Some(&"index.js".to_string())
+        );
+        assert_eq!(
+            env.get("OPEN_RUNTIMES_OUTPUT_DIRECTORY"),
+            Some(&"dist".to_string())
+        );
+        assert_ne!(
+            env.get("OPEN_RUNTIMES_HOSTNAME"),
+            Some(&runtime.hostname),
+            "executor hostname must not be replaced with the random container hostname"
+        );
+    }
+
+    #[test]
+    fn test_apply_runtime_env_vars_sets_legacy_hostname_aliases() {
+        let runtime = Runtime::new("rt2", "executor-a", "img", "v2", None);
+        let mut env = HashMap::new();
+
+        apply_runtime_env_vars(
+            &mut env,
+            &runtime,
+            RuntimeEnvVars {
+                version: "v2",
+                entrypoint: "index.php",
+                executor_hostname: "executor-a",
+                cpus: 1.0,
+                memory: 512,
+                output_directory: "",
+            },
+        );
+
+        assert_eq!(
+            env.get("INTERNAL_EXECUTOR_HOSTNAME"),
+            Some(&"executor-a".to_string())
+        );
+        assert_eq!(
+            env.get("INERNAL_EXECUTOR_HOSTNAME"),
+            Some(&"executor-a".to_string())
+        );
     }
 }

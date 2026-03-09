@@ -14,7 +14,7 @@ use http_body_util::{Either, Full};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tar::Archive;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -145,15 +145,32 @@ pub async fn build_image<S: Storage>(
 
     info!("Building image {} from {:?}", request.image_tag, source_dir);
 
-    // Detect dependency files
-    let dep_files = detect_dependency_files(source_dir).await?;
+    // Ensure Dockerfile exists
+    let dockerfile_path = source_dir.join("Dockerfile");
+    if let Some(ref dockerfile_content) = request.dockerfile {
+        fs::write(&dockerfile_path, dockerfile_content)
+            .await
+            .map_err(|e| ExecutorError::Storage(format!("Failed to write Dockerfile: {}", e)))?;
+        logs.push("Using provided Dockerfile".to_string());
+    } else if !dockerfile_path.exists() {
+        return Err(ExecutorError::ExecutionBadRequest(
+            "No Dockerfile provided or found in source".to_string(),
+        ));
+    }
+
+    // Detect dependency files after Dockerfile has been finalized so cache keys
+    // reflect Dockerfile changes as well.
+    let mut dep_files = detect_dependency_files(source_dir).await?;
+    dep_files.push(dockerfile_path.clone());
     debug!("Found {} dependency files", dep_files.len());
+
+    let cache_scope = build_cache_scope(request);
 
     // Check cache if enabled
     if request.cache_enabled {
         if let Some(build_cache) = cache {
             let deps_hash = hash_files(&dep_files).await?;
-            let cache_key = build_cache.cache_key(&request.build_id, &deps_hash);
+            let cache_key = build_cache.cache_key(&cache_scope, &deps_hash);
 
             if build_cache.has_cache(&cache_key).await? {
                 info!("Cache hit for {}", cache_key);
@@ -173,19 +190,6 @@ pub async fn build_image<S: Storage>(
                 logs.push(format!("Cache miss: {}", cache_key));
             }
         }
-    }
-
-    // Ensure Dockerfile exists
-    let dockerfile_path = source_dir.join("Dockerfile");
-    if let Some(ref dockerfile_content) = request.dockerfile {
-        fs::write(&dockerfile_path, dockerfile_content)
-            .await
-            .map_err(|e| ExecutorError::Storage(format!("Failed to write Dockerfile: {}", e)))?;
-        logs.push("Using provided Dockerfile".to_string());
-    } else if !dockerfile_path.exists() {
-        return Err(ExecutorError::ExecutionBadRequest(
-            "No Dockerfile provided or found in source".to_string(),
-        ));
     }
 
     // Create build context tarball
@@ -246,7 +250,7 @@ pub async fn build_image<S: Storage>(
     if request.cache_enabled && !cache_hit {
         if let Some(build_cache) = cache {
             let deps_hash = hash_files(&dep_files).await?;
-            let cache_key = build_cache.cache_key(&request.build_id, &deps_hash);
+            let cache_key = build_cache.cache_key(&cache_scope, &deps_hash);
 
             // Find and cache layer directories
             let layer_dirs: Vec<&str> = CACHE_LAYER_DIRS
@@ -327,6 +331,7 @@ pub async fn hash_files(files: &[PathBuf]) -> Result<String> {
 
     for file in files {
         if file.exists() {
+            hasher.update(file.to_string_lossy().as_bytes());
             let mut f = fs::File::open(file)
                 .await
                 .map_err(|e| ExecutorError::Storage(format!("Failed to open {:?}: {}", file, e)))?;
@@ -371,15 +376,24 @@ fn add_dir_to_tar<W: std::io::Write>(
 ) -> Result<()> {
     let entries = std::fs::read_dir(source_dir)
         .map_err(|e| ExecutorError::Storage(format!("Failed to read dir: {}", e)))?;
+    let mut entries: Vec<_> = entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| ExecutorError::Storage(format!("Failed to read entry: {}", e)))?;
+    entries.sort_by_key(|entry| entry.file_name());
 
     for entry in entries {
-        let entry =
-            entry.map_err(|e| ExecutorError::Storage(format!("Failed to read entry: {}", e)))?;
         let path = entry.path();
         let name = path.file_name().unwrap_or_default();
         let target_path = prefix.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| ExecutorError::Storage(format!("Failed to stat path: {}", e)))?;
 
-        if path.is_dir() {
+        if metadata.file_type().is_symlink() {
+            debug!("Skipping symlink in build context: {}", path.display());
+            continue;
+        }
+
+        if metadata.is_dir() {
             // Skip common ignorable directories
             let name_str = name.to_str().unwrap_or("");
             if name_str == ".git" || name_str == ".svn" || name_str == ".hg" {
@@ -387,7 +401,7 @@ fn add_dir_to_tar<W: std::io::Write>(
             }
 
             add_dir_to_tar(builder, &path, &target_path)?;
-        } else if path.is_file() {
+        } else if metadata.is_file() {
             builder
                 .append_path_with_name(&path, &target_path)
                 .map_err(|e| ExecutorError::Storage(format!("Failed to add file to tar: {}", e)))?;
@@ -409,6 +423,28 @@ pub async fn extract_source_tarball(tarball: &[u8], dest_dir: &Path) -> Result<(
             && err.to_string().starts_with("failed to set permissions to")
     }
 
+    fn validate_tar_path(path: &Path) -> Result<()> {
+        if path.as_os_str().is_empty() {
+            return Err(ExecutorError::Storage(
+                "Tar entry had an empty path".to_string(),
+            ));
+        }
+
+        for component in path.components() {
+            match component {
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(ExecutorError::Storage(format!(
+                        "Unsafe tar entry path: {}",
+                        path.display()
+                    )));
+                }
+                Component::CurDir | Component::Normal(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
     fn unpack_archive<R: io::Read>(mut archive: Archive<R>, dest_dir: &Path) -> Result<()> {
         let entries = archive
             .entries()
@@ -417,6 +453,20 @@ pub async fn extract_source_tarball(tarball: &[u8], dest_dir: &Path) -> Result<(
         for entry in entries {
             let mut entry = entry
                 .map_err(|e| ExecutorError::Storage(format!("Failed to read tar entry: {}", e)))?;
+            let path = entry
+                .path()
+                .map_err(|e| ExecutorError::Storage(format!("Failed to read tar path: {}", e)))?
+                .into_owned();
+            validate_tar_path(&path)?;
+
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                return Err(ExecutorError::Storage(format!(
+                    "Unsupported tar entry type for {}",
+                    path.display()
+                )));
+            }
+
             if let Err(err) = entry.unpack_in(dest_dir) {
                 if ignore_permission_error(&err) {
                     debug!("Ignoring tar permission error during extract: {}", err);
@@ -445,10 +495,63 @@ pub async fn extract_source_tarball(tarball: &[u8], dest_dir: &Path) -> Result<(
     Ok(())
 }
 
+fn build_cache_scope(request: &BuildRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(request.build_id.as_bytes());
+
+    let mut build_args: Vec<_> = request.build_args.iter().collect();
+    build_args.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (key, value) in build_args {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update([0xff]);
+    }
+
+    if let Some(dockerfile) = request.dockerfile.as_ref() {
+        hasher.update(dockerfile.as_bytes());
+    }
+
+    format!("{}/{}", request.build_id, hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn build_raw_tar_with_path(path: &str, data: &[u8]) -> Vec<u8> {
+        fn write_octal(dst: &mut [u8], value: u64) {
+            let width = dst.len().saturating_sub(1);
+            let formatted = format!("{value:0width$o}", width = width);
+            dst[..width].copy_from_slice(formatted.as_bytes());
+            dst[width] = 0;
+        }
+
+        let mut header = [0u8; 512];
+        header[..path.len()].copy_from_slice(path.as_bytes());
+        write_octal(&mut header[100..108], 0o644);
+        write_octal(&mut header[108..116], 0);
+        write_octal(&mut header[116..124], 0);
+        write_octal(&mut header[124..136], data.len() as u64);
+        write_octal(&mut header[136..148], 0);
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+
+        let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+        let checksum_field = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum_field.as_bytes());
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(data);
+        let padding = (512 - (data.len() % 512)) % 512;
+        archive.resize(archive.len() + padding, 0);
+        archive.resize(archive.len() + 1024, 0);
+        archive
+    }
 
     #[tokio::test]
     async fn test_detect_dependency_files() {
@@ -515,6 +618,52 @@ mod tests {
         // Verify
         let content = std::fs::read_to_string(dest_dir.join("test.txt")).unwrap();
         assert_eq!(content, "test content");
+    }
+
+    #[tokio::test]
+    async fn test_extract_source_tarball_rejects_parent_traversal() {
+        let dir = tempdir().unwrap();
+        let dest_dir = dir.path().join("dest");
+        let tar_bytes = build_raw_tar_with_path("../escape.txt", b"owned");
+
+        let error = extract_source_tarball(&tar_bytes, &dest_dir)
+            .await
+            .expect_err("parent traversal should be rejected");
+        assert!(error.to_string().contains("Unsafe tar entry path"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_source_tarball_rejects_symlink_entries() {
+        let dir = tempdir().unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_link_name("../outside").unwrap();
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "link", io::empty())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let error = extract_source_tarball(&tar_bytes, &dest_dir)
+            .await
+            .expect_err("symlink entries should be rejected");
+        assert!(error.to_string().contains("Unsupported tar entry type"));
+    }
+
+    #[test]
+    fn test_build_cache_scope_changes_with_build_args() {
+        let base = BuildRequest::new("runtime-a", "image:1");
+        let with_arg = BuildRequest::new("runtime-a", "image:1").with_build_arg("NODE_ENV", "dev");
+
+        assert_ne!(build_cache_scope(&base), build_cache_scope(&with_arg));
     }
 
     #[test]

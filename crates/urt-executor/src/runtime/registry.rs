@@ -105,6 +105,15 @@ impl RuntimeRegistry {
         }
     }
 
+    /// Touch a runtime only when its activity timestamp is stale enough.
+    pub async fn touch_if_stale(&self, name: &str, min_interval_secs: f64) -> Result<bool> {
+        if let Some(mut runtime) = self.runtimes.get_mut(name) {
+            Ok(runtime.touch_if_stale(min_interval_secs))
+        } else {
+            Err(ExecutorError::RuntimeNotFound)
+        }
+    }
+
     /// Mark a runtime as listening on port 3000
     /// Called after successful TCP port check (matching executor-main)
     pub async fn set_listening(&self, name: &str) -> Result<()> {
@@ -132,17 +141,16 @@ impl RuntimeRegistry {
             Ok(info) => {
                 if let Some(mut runtime) = self.runtimes.get_mut(name) {
                     runtime.status = info.state;
-                    runtime.initialised = if runtime.status.eq_ignore_ascii_case("running") {
-                        1
-                    } else {
-                        0
-                    };
-                    runtime.touch();
                     return Some(runtime.clone());
                 }
                 None
             }
             Err(ExecutorError::RuntimeNotFound) => {
+                if let Some(runtime) = self.runtimes.get(name) {
+                    if runtime.is_pending() {
+                        return Some(runtime.clone());
+                    }
+                }
                 // Container was removed outside the registry - clean up stale metadata.
                 self.runtimes.remove(name);
                 None
@@ -249,6 +257,22 @@ mod tests {
 
         let updated = registry.get(&name).await.unwrap();
         assert!(updated.updated >= original_updated);
+    }
+
+    #[tokio::test]
+    async fn test_touch_if_stale_skips_frequent_updates() {
+        let registry = RuntimeRegistry::new();
+        let rt = Runtime::new("test", "exec", "img", "v5", None);
+        let name = rt.name.clone();
+        let original_updated = rt.updated;
+
+        registry.insert(rt).await.unwrap();
+
+        let touched = registry.touch_if_stale(&name, 60.0).await.unwrap();
+        assert!(!touched);
+
+        let updated = registry.get(&name).await.unwrap();
+        assert_eq!(updated.updated, original_updated);
     }
 
     #[tokio::test]

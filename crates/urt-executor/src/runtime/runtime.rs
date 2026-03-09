@@ -1,9 +1,11 @@
 //! Runtime struct representing a container instance
 
+use crate::error::{ExecutorError, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Runtime state representing a containerized function instance
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,9 @@ pub struct Runtime {
     /// owns this ID (i.e., is the newest runtime with this ID).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_alive_id: Option<String>,
+    /// Precomputed Authorization header for runtime requests.
+    #[serde(skip)]
+    pub authorization_header: String,
 }
 
 impl Runtime {
@@ -55,7 +60,7 @@ impl Runtime {
         rng.try_fill_bytes(&mut hostname_bytes)
             .expect("failed to read OS randomness for runtime hostname");
 
-        Self {
+        let mut runtime = Self {
             version: version.to_string(),
             created: now,
             updated: now,
@@ -67,7 +72,10 @@ impl Runtime {
             image: image.to_string(),
             initialised: 0,
             keep_alive_id,
-        }
+            authorization_header: String::new(),
+        };
+        runtime.refresh_cached_auth();
+        runtime
     }
 
     /// Mark runtime as running with the container status
@@ -82,6 +90,19 @@ impl Runtime {
         self.updated = Self::unix_timestamp();
     }
 
+    /// Update the last activity timestamp only when the previous value is stale enough.
+    /// This avoids a write lock on every hot-path execution while preserving second-level
+    /// liveness semantics for cleanup and keep-alive decisions.
+    pub fn touch_if_stale(&mut self, min_interval_secs: f64) -> bool {
+        let now = Self::unix_timestamp();
+        if now - self.updated >= min_interval_secs {
+            self.updated = now;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Check if the runtime is pending
     pub fn is_pending(&self) -> bool {
         self.status == "pending"
@@ -90,7 +111,7 @@ impl Runtime {
     /// Check if the runtime is running
     /// Docker inspect returns status like "running", "exited", "created", etc.
     pub fn is_running(&self) -> bool {
-        !self.is_pending() && self.status.to_lowercase() == "running"
+        !self.is_pending() && self.status.eq_ignore_ascii_case("running")
     }
 
     /// Get the runtime ID from the full name
@@ -116,12 +137,46 @@ impl Runtime {
         self.touch();
     }
 
+    pub fn refresh_cached_auth(&mut self) {
+        let auth = format!("opr:{}", self.key);
+        let auth_encoded = BASE64.encode(auth.as_bytes());
+        self.authorization_header = format!("Basic {}", auth_encoded);
+    }
+
+    pub fn authorization_header(&self) -> &str {
+        &self.authorization_header
+    }
+
     fn unix_timestamp() -> f64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs_f64()
     }
+}
+
+pub async fn wait_for_runtime_port(hostname: &str, port: u16, timeout: Duration) -> Result<()> {
+    let addr = format!("{}:{}", hostname, port);
+    let start = Instant::now();
+    let mut retry_delay = Duration::from_millis(50);
+    let max_retry_delay = Duration::from_millis(500);
+
+    while start.elapsed() < timeout {
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            _ => {
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(max_retry_delay);
+            }
+        }
+    }
+
+    Err(ExecutorError::RuntimeTimeout)
 }
 
 #[cfg(test)]
