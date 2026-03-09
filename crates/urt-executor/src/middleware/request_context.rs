@@ -7,7 +7,7 @@ use axum::{
     response::Response,
 };
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn, Level};
 use uuid::Uuid;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -32,12 +32,15 @@ fn sanitize_request_id(candidate: &str) -> Option<String> {
 
 /// Adds/propagates `x-request-id` and emits structured request completion logs.
 pub async fn request_context_middleware(mut request: Request, next: Next) -> Response {
-    let method = request.method().clone();
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+    let capture_debug_context = tracing::enabled!(Level::DEBUG);
+    let debug_method = capture_debug_context.then(|| request.method().clone());
+    let debug_path = capture_debug_context.then(|| {
+        request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| request.uri().path().to_string())
+    });
 
     let request_id = request
         .headers()
@@ -68,25 +71,25 @@ pub async fn request_context_middleware(mut request: Request, next: Next) -> Res
         .or_insert(HeaderValue::from_static("Executor"));
 
     if status >= 500 {
-        warn!(
-            request_id = %request_id,
-            method = %method,
-            path = %path,
-            status,
-            duration_ms,
-            "http_request_failed"
-        );
-    } else if path.starts_with("/v1/health") || path.starts_with("/v1/ping") {
+        if let (Some(method), Some(path)) = (debug_method.as_ref(), debug_path.as_ref()) {
+            warn!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                status,
+                duration_ms,
+                "http_request_failed"
+            );
+        } else {
+            warn!(
+                request_id = %request_id,
+                status,
+                duration_ms,
+                "http_request_failed"
+            );
+        }
+    } else if let (Some(method), Some(path)) = (debug_method.as_ref(), debug_path.as_ref()) {
         debug!(
-            request_id = %request_id,
-            method = %method,
-            path = %path,
-            status,
-            duration_ms,
-            "http_request"
-        );
-    } else {
-        info!(
             request_id = %request_id,
             method = %method,
             path = %path,

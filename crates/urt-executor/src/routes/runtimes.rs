@@ -7,7 +7,7 @@ use crate::docker::container::ContainerConfig;
 use crate::error::{ExecutorError, Result};
 use crate::platform;
 use crate::resilience::retry_with_backoff;
-use crate::runtime::{KeepAliveRegistry, Runtime};
+use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime};
 use crate::tasks;
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
@@ -1051,12 +1051,26 @@ pub async fn create_runtime(
 
         info!("Cleaned up runtime {} after build", req.runtime_id);
     } else {
-        // Update runtime status if keeping it running
-        if let Ok(info) = state.docker.inspect_container(&full_name).await {
-            let mut updated_runtime = runtime.clone();
-            updated_runtime.mark_running(&info.state);
-            state.registry.update(updated_runtime).await.ok();
+        let port_timeout_secs = u64::from(req.timeout.clamp(1, 30));
+        if let Err(error) =
+            wait_for_runtime_port(&full_name, 3000, Duration::from_secs(port_timeout_secs)).await
+        {
+            error!(
+                "Runtime {} failed port readiness: {}",
+                req.runtime_id, error
+            );
+            state.docker.remove_container(&full_name, true).await.ok();
+            tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+            state.registry.remove(&full_name).await;
+            return Err(ExecutorError::RuntimeFailed(
+                "Runtime port readiness check timed out".to_string(),
+            ));
         }
+
+        let mut updated_runtime = runtime.clone();
+        updated_runtime.mark_running("running");
+        updated_runtime.set_listening();
+        state.registry.update(updated_runtime).await.ok();
     }
 
     // If a keep-alive ID was transferred, clean up the previous owner now that

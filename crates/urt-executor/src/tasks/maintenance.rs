@@ -4,7 +4,7 @@ use crate::config::ExecutorConfig;
 use crate::docker::container::ContainerInfo;
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;
-use crate::runtime::{KeepAliveRegistry, Runtime, RuntimeRegistry};
+use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime, RuntimeRegistry};
 use crate::storage::{BuildCache, Storage};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -148,6 +148,8 @@ fn runtime_from_container(container: &ContainerInfo, hostname: &str) -> Option<R
         runtime.hostname = container.hostname.clone();
     }
 
+    runtime.refresh_cached_auth();
+
     Some(runtime)
 }
 
@@ -189,6 +191,14 @@ async fn adopt_inspected_container(
             return false;
         }
     };
+
+    let mut runtime = runtime;
+    if wait_for_runtime_port(&runtime.name, 3000, Duration::from_millis(200))
+        .await
+        .is_ok()
+    {
+        runtime.listening = 1;
+    }
 
     if let Err(e) = registry.insert(runtime.clone()).await {
         if matches!(e, ExecutorError::RuntimeConflict) {

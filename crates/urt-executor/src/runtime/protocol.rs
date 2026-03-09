@@ -5,7 +5,7 @@
 use crate::error::{ExecutorError, Result};
 use crate::runtime::Runtime;
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use bytes::Bytes;
 use memchr::memchr_iter;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -18,13 +18,13 @@ use tracing::debug;
 /// Maximum log file size (5MB, matching executor-main)
 const MAX_LOG_SIZE: usize = 5 * 1024 * 1024;
 const MAX_BUILD_LOG_SIZE: usize = 1_000_000;
-const LOG_FILE_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+const LOG_FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOG_FILE_WAIT_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Request to execute a function
 #[derive(Debug, Clone)]
 pub struct ExecuteRequest {
-    pub body: String,
+    pub body: Bytes,
     pub path: String,
     pub method: String,
     pub headers: HashMap<String, String>,
@@ -35,7 +35,7 @@ pub struct ExecuteRequest {
 impl Default for ExecuteRequest {
     fn default() -> Self {
         Self {
-            body: String::new(),
+            body: Bytes::new(),
             path: "/".to_string(),
             method: "GET".to_string(),
             headers: HashMap::new(),
@@ -52,7 +52,7 @@ pub struct ExecuteResponse {
     pub status_code: u16,
 
     #[serde(skip)]
-    pub body: Vec<u8>,
+    pub body: Bytes,
 
     pub logs: String,
     pub errors: String,
@@ -101,7 +101,7 @@ impl RuntimeProtocol for V2Protocol {
         // v2 payload format
         let payload = serde_json::json!({
             "variables": {},
-            "payload": request.body,
+            "payload": String::from_utf8_lossy(request.body.as_ref()),
             "headers": request.headers,
         });
 
@@ -141,7 +141,7 @@ impl RuntimeProtocol for V2Protocol {
 
         Ok(ExecuteResponse {
             status_code: status,
-            body: v2_resp.response.unwrap_or_default().into_bytes(),
+            body: Bytes::from(v2_resp.response.unwrap_or_default().into_bytes()),
             logs: truncate_build_logs(v2_resp.stdout.unwrap_or_default()),
             errors: truncate_build_logs(v2_resp.stderr.unwrap_or_default()),
             headers: HashMap::new(),
@@ -185,17 +185,12 @@ impl RuntimeProtocol for V5Protocol {
             )
         };
 
-        // Build Basic auth header
-        let auth = format!("opr:{}", runtime.key);
-        let auth_encoded = BASE64.encode(auth.as_bytes());
-        let auth_header = format!("Basic {}", auth_encoded);
-
         // Build the request
         let method: reqwest::Method = request.method.parse().unwrap_or(reqwest::Method::GET);
 
         let mut req_builder = client
             .request(method, &url)
-            .header("Authorization", &auth_header)
+            .header("Authorization", runtime.authorization_header())
             .header("x-open-runtimes-secret", &runtime.key)
             .header("x-open-runtimes-timeout", request.timeout.to_string())
             .header(
@@ -270,27 +265,33 @@ impl RuntimeProtocol for V5Protocol {
         let response_headers: HashMap<String, serde_json::Value> =
             response_headers_vec.into_iter().collect();
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ExecutorError::Network(e.to_string()))?
-            .to_vec();
-
-        // Read logs and errors from FILES on disk (matching executor-main Docker.php:1027-1063)
-        // The header x-open-runtimes-log-id contains a FILE ID, not the actual logs.
-        // Logs are stored at /tmp/{runtime.name}/logs/{file_id}_logs.log
-        // Errors are stored at /tmp/{runtime.name}/logs/{file_id}_errors.log
-        let (logs, errors) = if let Some(ref file_id) = log_id {
-            // URL decode the file ID
-            let decoded_id = urlencoding::decode(file_id)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| file_id.clone());
-
-            // Use runtime.name (container name) - logs are stored at /tmp/{runtime.name}/logs/
-            read_log_files(&runtime.name, &decoded_id).await
-        } else {
-            (String::new(), String::new())
+        let body_fut = async {
+            response
+                .bytes()
+                .await
+                .map_err(|e| ExecutorError::Network(e.to_string()))
         };
+        let logs_fut = async {
+            if !request.logging {
+                return (String::new(), String::new());
+            }
+
+            // Read logs and errors from FILES on disk (matching executor-main Docker.php:1027-1063)
+            // The header x-open-runtimes-log-id contains a FILE ID, not the actual logs.
+            // Logs are stored at /tmp/{runtime.name}/logs/{file_id}_logs.log
+            // Errors are stored at /tmp/{runtime.name}/logs/{file_id}_errors.log
+            if let Some(ref file_id) = log_id {
+                let decoded_id = urlencoding::decode(file_id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| file_id.clone());
+                read_log_files(&runtime.name, &decoded_id).await
+            } else {
+                (String::new(), String::new())
+            }
+        };
+
+        let (body, (logs, errors)) = tokio::join!(body_fut, logs_fut);
+        let body = body?;
 
         let duration = start_instant.elapsed().as_secs_f64();
 
@@ -333,11 +334,12 @@ async fn read_log_files(runtime_name: &str, file_id: &str) -> (String, String) {
         error_path.display()
     );
 
-    wait_for_log_file(&log_path).await;
-    wait_for_log_file(&error_path).await;
+    tokio::join!(wait_for_log_file(&log_path), wait_for_log_file(&error_path));
 
-    let logs = read_and_cleanup_log(&log_path, "Log").await;
-    let errors = read_and_cleanup_log(&error_path, "Error").await;
+    let (logs, errors) = tokio::join!(
+        read_and_cleanup_log(&log_path, "Log"),
+        read_and_cleanup_log(&error_path, "Error")
+    );
 
     (logs, errors)
 }
@@ -504,6 +506,7 @@ mod tests {
             image: "openruntimes/node:v5-22".to_string(),
             initialised: 1,
             keep_alive_id: None,
+            authorization_header: "Basic dummy".to_string(),
         };
 
         assert_eq!(
@@ -528,6 +531,7 @@ mod tests {
             image: "openruntimes/node:v5-22".to_string(),
             initialised: 1,
             keep_alive_id: None,
+            authorization_header: "Basic dummy".to_string(),
         };
 
         assert_eq!(runtime_network_host(&runtime), "exc1-myruntime123");
@@ -588,6 +592,17 @@ mod tests {
         assert!(!tokio::fs::try_exists(&error_path).await.unwrap());
 
         tokio::fs::remove_dir_all(base.parent().unwrap()).await.ok();
+    }
+
+    #[tokio::test]
+    async fn read_log_files_returns_empty_when_files_do_not_exist() {
+        let runtime_name = format!("urt-log-missing-{}", uuid::Uuid::new_v4());
+        let file_id = "missing";
+
+        let (logs, errors) = read_log_files(&runtime_name, file_id).await;
+
+        assert!(logs.is_empty());
+        assert!(errors.is_empty());
     }
 
     #[test]

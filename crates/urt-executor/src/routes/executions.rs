@@ -9,7 +9,7 @@ use super::AppState;
 use crate::error::{ExecutorError, Result};
 use crate::execution_counter::ExecutionGuard;
 use crate::resilience::retry_with_backoff;
-use crate::runtime::{get_protocol, ExecuteRequest, ExecuteResponse};
+use crate::runtime::{get_protocol, wait_for_runtime_port, ExecuteRequest, ExecuteResponse};
 use crate::tasks;
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
@@ -19,9 +19,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -121,20 +120,13 @@ pub enum HeadersInput {
 }
 
 impl HeadersInput {
-    /// Returns a reference or owned HashMap - avoids clone when already Object
-    /// Uses Cow for zero-copy when the data is already in the right format
-    #[inline]
-    pub fn to_map_cow(&self) -> Cow<'_, HashMap<String, String>> {
+    /// Consume the input into a HashMap, avoiding clones for object inputs.
+    pub fn into_map(self) -> HashMap<String, String> {
         match self {
-            HeadersInput::Empty => Cow::Owned(HashMap::new()),
-            HeadersInput::String(s) => Cow::Owned(serde_json::from_str(s).unwrap_or_default()),
-            HeadersInput::Object(m) => Cow::Borrowed(m),
+            HeadersInput::Empty => HashMap::new(),
+            HeadersInput::String(s) => serde_json::from_str(&s).unwrap_or_default(),
+            HeadersInput::Object(m) => m,
         }
-    }
-
-    /// Legacy method for compatibility - clones the data
-    pub fn to_map(&self) -> HashMap<String, String> {
-        self.to_map_cow().into_owned()
     }
 }
 
@@ -436,76 +428,10 @@ pub async fn create_execution(
 
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
-    // Sync status from Docker before getting runtime
-    state.registry.sync_status(&full_name, &state.docker).await;
+    let runtime = resolve_runtime(&state, &runtime_id, &full_name, &req).await?;
 
-    // If runtime metadata is missing (e.g., executor restart), attempt on-demand re-adoption.
-    if state.registry.get(&full_name).await.is_none() {
-        let _ = tasks::adopt_container_by_name(
-            &state.docker,
-            &state.registry,
-            &state.keep_alive_registry,
-            &state.config.hostname,
-            &full_name,
-        )
-        .await;
-    }
-
-    // Get or create runtime
-    let runtime = match state.registry.get(&full_name).await {
-        Some(rt) => {
-            // Check if runtime is ready
-            if rt.is_pending() {
-                return Err(ExecutorError::RuntimeTimeout);
-            }
-            rt
-        }
-        None => {
-            // On-the-fly creation if image is provided
-            if req.image.is_empty() {
-                return Err(ExecutorError::RuntimeNotFound);
-            }
-
-            debug!("Creating runtime on-the-fly: {}", runtime_id);
-
-            // Create runtime request as JSON for internal call
-            let create_req_json = serde_json::json!({
-                "runtimeId": runtime_id.clone(),
-                "image": req.image.clone(),
-                "entrypoint": req.entrypoint.clone(),
-                "source": req.source.clone(),
-                "destination": "",
-                "outputDirectory": "",
-                "variables": req.variables.to_map(),
-                "runtimeEntrypoint": req.runtime_entrypoint.clone(),
-                "command": "",
-                "timeout": default_timeout(),
-                "remove": false,
-                "cpus": req.cpus,
-                "memory": req.memory,
-                "version": req.version.clone(),
-                "restartPolicy": req.restart_policy.clone(),
-                "dockerCmd": []
-            });
-
-            // Call create_runtime internally
-            let _ = super::runtimes::create_runtime(
-                State(state.clone()),
-                serde_json::to_string(&create_req_json).unwrap_or_default(),
-            )
-            .await?;
-
-            // Get the created runtime
-            state
-                .registry
-                .get(&full_name)
-                .await
-                .ok_or(ExecutorError::RuntimeNotFound)?
-        }
-    };
-
-    // Touch runtime to update last activity
-    state.registry.touch(&full_name).await.ok();
+    // Coalesce activity updates to reduce write contention on the runtime registry.
+    state.registry.touch_if_stale(&full_name, 1.0).await.ok();
 
     // TCP port readiness check (matching executor-main Docker.php:1088-1115)
     // On first execution, wait for the runtime to start listening on port 3000
@@ -515,7 +441,7 @@ pub async fn create_execution(
             runtime.name
         );
         let port_timeout = Duration::from_secs(req.timeout as u64);
-        wait_for_port(&runtime.name, 3000, port_timeout).await?;
+        wait_for_runtime_port(&runtime.name, 3000, port_timeout).await?;
 
         // Mark runtime as listening so we skip this check on subsequent executions
         if let Err(e) = state.registry.set_listening(&full_name).await {
@@ -528,19 +454,29 @@ pub async fn create_execution(
     // IMPORTANT: Always force identity encoding when talking to the runtime.
     // If we forward an incoming `accept-encoding` (e.g. gzip), different HTTP clients/proxies may
     // transparently decode/encode which can lead to mismatched lengths / truncated bodies.
-    let mut exec_headers = req.headers.to_map();
+    let ExecutionRequest {
+        body,
+        path,
+        method,
+        headers: request_headers,
+        timeout,
+        logging,
+        ..
+    } = req;
+
+    let mut exec_headers = request_headers.into_map();
     exec_headers.insert("accept-encoding".to_string(), "identity".to_string());
 
-    let mut method = req.method;
+    let mut method = method;
     method.make_ascii_uppercase();
 
     let exec_req = ExecuteRequest {
-        body: req.body,
-        path: req.path,
+        body: Bytes::from(body),
+        path,
         method,
         headers: exec_headers,
-        timeout: req.timeout,
-        logging: req.logging,
+        timeout,
+        logging,
     };
 
     debug!("Executing with protocol {}", runtime.version);
@@ -592,7 +528,7 @@ pub async fn create_execution(
     }
 
     // JSON response - reject binary bodies like executor-main
-    let body = std::str::from_utf8(&response.body).map_err(|_| {
+    let body = std::str::from_utf8(response.body.as_ref()).map_err(|_| {
         ExecutorError::ExecutionBadJson(
             "Execution resulted in binary response, but JSON response does not allow binaries. Use \"Accept: multipart/form-data\" header to support binaries.".to_string(),
         )
@@ -601,7 +537,7 @@ pub async fn create_execution(
     operation_timer.mark_success();
     Ok(Json(JsonExecutionResponse {
         status_code: response.status_code,
-        body: body.to_string(),
+        body: body.to_owned(),
         logs: response.logs,
         errors: response.errors,
         headers: response.headers,
@@ -609,6 +545,87 @@ pub async fn create_execution(
         start_time: response.start_time,
     })
     .into_response())
+}
+
+async fn resolve_runtime(
+    state: &AppState,
+    runtime_id: &str,
+    full_name: &str,
+    req: &ExecutionRequest,
+) -> Result<crate::runtime::Runtime> {
+    if let Some(runtime) = state.registry.get(full_name).await {
+        if runtime.is_pending() {
+            state.registry.sync_status(full_name, &state.docker).await;
+            match state.registry.get(full_name).await {
+                Some(updated) if !updated.is_pending() => return Ok(updated),
+                Some(_) => return Err(ExecutorError::RuntimeTimeout),
+                None => {}
+            }
+        } else {
+            return Ok(runtime);
+        }
+    }
+
+    // If runtime metadata is missing (e.g., executor restart), attempt on-demand re-adoption.
+    let _ = tasks::adopt_container_by_name(
+        &state.docker,
+        &state.registry,
+        &state.keep_alive_registry,
+        &state.config.hostname,
+        full_name,
+    )
+    .await;
+
+    if let Some(runtime) = state.registry.get(full_name).await {
+        if runtime.is_pending() {
+            state.registry.sync_status(full_name, &state.docker).await;
+            return match state.registry.get(full_name).await {
+                Some(updated) if !updated.is_pending() => Ok(updated),
+                Some(_) => Err(ExecutorError::RuntimeTimeout),
+                None => Err(ExecutorError::RuntimeNotFound),
+            };
+        }
+
+        return Ok(runtime);
+    }
+
+    // On-the-fly creation if image is provided
+    if req.image.is_empty() {
+        return Err(ExecutorError::RuntimeNotFound);
+    }
+
+    debug!("Creating runtime on-the-fly: {}", runtime_id);
+
+    let create_req_json = serde_json::json!({
+        "runtimeId": runtime_id,
+        "image": req.image,
+        "entrypoint": req.entrypoint,
+        "source": req.source,
+        "destination": "",
+        "outputDirectory": "",
+        "variables": req.variables.to_map(),
+        "runtimeEntrypoint": req.runtime_entrypoint,
+        "command": "",
+        "timeout": default_timeout(),
+        "remove": false,
+        "cpus": req.cpus,
+        "memory": req.memory,
+        "version": req.version,
+        "restartPolicy": req.restart_policy,
+        "dockerCmd": []
+    });
+
+    let _ = super::runtimes::create_runtime(
+        State(state.clone()),
+        serde_json::to_string(&create_req_json).unwrap_or_default(),
+    )
+    .await?;
+
+    state
+        .registry
+        .get(full_name)
+        .await
+        .ok_or(ExecutorError::RuntimeNotFound)
 }
 
 fn parse_multipart_execution_request_bytes(
@@ -756,43 +773,6 @@ fn accepts_json(accept: &str) -> bool {
         })
 }
 
-/// Wait for a runtime to start listening on a TCP port
-/// (matching executor-main Docker.php:1088-1115 TCP validator)
-async fn wait_for_port(hostname: &str, port: u16, timeout: Duration) -> Result<()> {
-    let addr = format!("{}:{}", hostname, port);
-    let start = Instant::now();
-    let mut retry_delay = Duration::from_millis(50);
-    let max_retry_delay = Duration::from_millis(500);
-
-    debug!(
-        "Waiting for {} to be available (timeout: {:?})",
-        addr, timeout
-    );
-
-    while start.elapsed() < timeout {
-        // Try to connect using tokio's TcpStream which handles DNS resolution
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                debug!("Port {} is now available", addr);
-                return Ok(());
-            }
-            _ => {
-                // Fast retries reduce warm-start latency while still backing off under failures.
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(max_retry_delay);
-            }
-        }
-    }
-
-    debug!("Timeout waiting for {} after {:?}", addr, timeout);
-    Err(ExecutorError::RuntimeTimeout)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,7 +785,7 @@ mod tests {
         #[test]
         fn test_empty() {
             let headers = HeadersInput::Empty;
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert!(map.is_empty());
         }
 
@@ -816,7 +796,7 @@ mod tests {
             map.insert("accept".to_string(), "*/*".to_string());
 
             let headers = HeadersInput::Object(map.clone());
-            let result = headers.to_map();
+            let result = headers.into_map();
             assert_eq!(result.len(), 2);
             assert_eq!(
                 result.get("content-type"),
@@ -829,7 +809,7 @@ mod tests {
             let headers = HeadersInput::String(
                 r#"{"content-type": "text/html", "x-custom": "value"}"#.to_string(),
             );
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert_eq!(map.get("content-type"), Some(&"text/html".to_string()));
             assert_eq!(map.get("x-custom"), Some(&"value".to_string()));
         }
@@ -837,40 +817,15 @@ mod tests {
         #[test]
         fn test_string_invalid_json_returns_empty() {
             let headers = HeadersInput::String("not json".to_string());
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert!(map.is_empty());
         }
 
         #[test]
         fn test_string_empty_json() {
             let headers = HeadersInput::String("{}".to_string());
-            let map = headers.to_map();
+            let map = headers.into_map();
             assert!(map.is_empty());
-        }
-
-        #[test]
-        fn test_to_map_cow_empty() {
-            let headers = HeadersInput::Empty;
-            let cow = headers.to_map_cow();
-            assert!(cow.is_empty());
-        }
-
-        #[test]
-        fn test_to_map_cow_object_borrows() {
-            let mut map = HashMap::new();
-            map.insert("key".to_string(), "value".to_string());
-            let headers = HeadersInput::Object(map.clone());
-            let cow = headers.to_map_cow();
-            // Should be borrowed, not owned
-            assert!(matches!(cow, Cow::Borrowed(_)));
-        }
-
-        #[test]
-        fn test_to_map_cow_string_owned() {
-            let headers = HeadersInput::String(r#"{"key": "value"}"#.to_string());
-            let cow = headers.to_map_cow();
-            // Should be owned since we parsed from string
-            assert!(matches!(cow, Cow::Owned(_)));
         }
     }
 
@@ -1021,7 +976,7 @@ mod tests {
             assert!(result.is_ok());
             let req = result.unwrap();
             assert_eq!(req.body, r#"{"key":"value"}"#);
-            let headers = req.headers.to_map();
+            let headers = req.headers.into_map();
             assert_eq!(
                 headers.get("content-type"),
                 Some(&"application/json".to_string())
@@ -1231,7 +1186,7 @@ mod tests {
             assert_eq!(req.method, "POST");
             assert_eq!(req.timeout, 30);
             assert_eq!(
-                req.headers.to_map().get("content-type"),
+                req.headers.into_map().get("content-type"),
                 Some(&"application/json".to_string())
             );
             assert_eq!(
@@ -1257,7 +1212,7 @@ mod tests {
             }"#;
 
             let req: ExecutionRequest = serde_json::from_str(json).unwrap();
-            let headers = req.headers.to_map();
+            let headers = req.headers.into_map();
             assert_eq!(headers.get("content-type"), Some(&"text/html".to_string()));
         }
 
