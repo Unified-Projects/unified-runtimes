@@ -51,7 +51,7 @@ uuid = { version = "1.21", features = ["v4"] }
 bytes = "1.11"
 url = "2.5"
 http = "1.4"
-rand = "0.9"
+rand = "0.10"
 hex = "0.4"
 hostname = "0.4"
 base64 = "0.22"
