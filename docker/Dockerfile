@@ -6,7 +6,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Generate dependency recipe
 # -----------------------------------------------------------------------------
-FROM rust:1.93-alpine AS chef
+FROM rust:1.94-alpine AS chef
 
 RUN apk add --no-cache \
     musl-dev \
