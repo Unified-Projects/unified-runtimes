@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-09
+
+### Changed
+- **Automatic official runtime resolution**: Added `URT_AUTO_RUNTIME` (default `true`) to normalize official OpenRuntimes shorthands and resolve empty or mismatched official runtime requests to the newest verified runtime family based on the requested image, entrypoint, and build command.
+- **Runtime lifecycle reconciliation**: Runtime create, command, and log paths now re-adopt managed containers, clean stale runtime IDs before recreation, and tolerate brief create/log races instead of failing immediately with conflicts or missing-runtime errors.
+- **Network and protocol routing**: Runtime startup now advertises the executor hostname consistently for legacy and modern images, attaches containers to all configured networks, and routes protocol traffic through the runtime network host with a fallback to the container name.
+- **Build cache and storage handling**: Build cache scopes now include Dockerfiles and build args, cache cleanup prefers the oldest manifest `created` timestamp, and local/S3 storage listing now walks nested cache entries so cleanup sees full cache trees.
+- **Build and response log handling**: Modern runtime log streaming now follows generated `logging/logs.txt` and `timings.txt` output, waits for asynchronous log flushes, truncates oversized build logs to executor limits, and preserves legacy execution header formatting for clients older than `0.11.0`.
+
+### Fixed
+- **Portable tar extraction**: Replaced GNU-only tar extraction flags with BusyBox-compatible `--no-same-permissions -o` handling.
+- **Build source hardening**: Build context packaging is now deterministic, skips symlinks, and rejects tarballs that attempt path traversal or link-based escapes during extraction.
+- **Docker startup resilience**: Container creation now retries after pulling missing images and treats duplicate network-attach responses as non-fatal.
+- **Shutdown and maintenance cleanup**: Shutdown now removes per-runtime temp directories, keep-alive mode still cleans idle runtimes without a keep-alive ID, and maintenance removes untracked managed containers.
+
 ## [0.2.0] - 2026-02-25
 
 ### Changed

@@ -3,6 +3,7 @@
 use super::Storage;
 use crate::docker::build::hash_files;
 use crate::error::{ExecutorError, Result};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -12,6 +13,12 @@ use tracing::{debug, info, warn};
 pub struct BuildCache<S: Storage> {
     storage: S,
     cache_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct CacheManifestEntry {
+    path: String,
+    created: Option<DateTime<Utc>>,
 }
 
 impl<S: Storage> BuildCache<S> {
@@ -232,17 +239,7 @@ impl<S: Storage> BuildCache<S> {
             current_size, max_bytes
         );
 
-        let entries = self.storage.list(&self.cache_prefix).await?;
-
-        // Group entries by manifest to delete entire cache entries atomically
-        let mut manifests: Vec<String> = entries
-            .iter()
-            .filter(|e| e.ends_with("/manifest.json"))
-            .cloned()
-            .collect();
-
-        // Sort by name (older entries tend to have older timestamps in their hash paths)
-        manifests.sort();
+        let manifests = self.load_manifest_entries().await?;
 
         let mut deleted = 0u64;
         let mut freed_bytes = 0u64;
@@ -253,7 +250,7 @@ impl<S: Storage> BuildCache<S> {
             }
 
             // Get the cache key directory from manifest path
-            let cache_dir = manifest.trim_end_matches("/manifest.json");
+            let cache_dir = manifest.path.trim_end_matches("/manifest.json");
             let dir_entries = self.storage.list(cache_dir).await.unwrap_or_default();
 
             for entry in dir_entries {
@@ -274,6 +271,42 @@ impl<S: Storage> BuildCache<S> {
             deleted, freed_bytes
         );
         Ok(deleted)
+    }
+
+    async fn load_manifest_entries(&self) -> Result<Vec<CacheManifestEntry>> {
+        let entries = self.storage.list(&self.cache_prefix).await?;
+        let mut manifests = Vec::new();
+
+        for path in entries
+            .into_iter()
+            .filter(|entry| entry.ends_with("/manifest.json"))
+        {
+            let created = match self.storage.read(&path).await {
+                Ok(bytes) => serde_json::from_slice::<HashMap<String, serde_json::Value>>(&bytes)
+                    .ok()
+                    .and_then(|manifest| {
+                        manifest
+                            .get("created")
+                            .and_then(|value| value.as_str().map(str::to_string))
+                    })
+                    .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                    .map(|parsed| parsed.with_timezone(&Utc)),
+                Err(error) => {
+                    debug!("Failed to read manifest {}: {}", path, error);
+                    None
+                }
+            };
+
+            manifests.push(CacheManifestEntry { path, created });
+        }
+
+        manifests.sort_by(|left, right| {
+            left.created
+                .cmp(&right.created)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        Ok(manifests)
     }
 
     /// Create a compressed layer tarball
@@ -480,5 +513,54 @@ mod tests {
         assert_eq!(layers.len(), 2);
         assert!(layers[0].contains("layer1.tar.zst"));
         assert!(layers[1].contains("layer2.tar.zst"));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_prefers_oldest_manifest_created_timestamp() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+        let cache = BuildCache::new(storage.clone(), "builds");
+
+        storage
+            .write(
+                "builds/runtime/newer/manifest.json",
+                br#"{"layers":["layer.tar.zst"],"created":"2025-01-02T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .write("builds/runtime/newer/layer.tar.zst", &[0; 32])
+            .await
+            .unwrap();
+        storage
+            .write(
+                "builds/runtime/older/manifest.json",
+                br#"{"layers":["layer.tar.zst"],"created":"2025-01-01T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .write("builds/runtime/older/layer.tar.zst", &[0; 32])
+            .await
+            .unwrap();
+
+        let newer_total = storage
+            .size("builds/runtime/newer/manifest.json")
+            .await
+            .unwrap()
+            + storage
+                .size("builds/runtime/newer/layer.tar.zst")
+                .await
+                .unwrap();
+        let deleted = cache.cleanup(newer_total + 1).await.unwrap();
+        assert!(deleted >= 2);
+        assert!(!storage
+            .exists("builds/runtime/older/manifest.json")
+            .await
+            .unwrap());
+        assert!(storage
+            .exists("builds/runtime/newer/manifest.json")
+            .await
+            .unwrap());
     }
 }

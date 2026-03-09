@@ -78,6 +78,38 @@ fn default_logging() -> bool {
     true
 }
 
+const LEGACY_RESPONSE_FORMAT_CUTOFF: [u32; 3] = [0, 11, 0];
+
+fn should_flatten_headers_for_legacy_response_format(response_format: &str) -> bool {
+    let mut current = response_format.split('.');
+
+    for rhs in LEGACY_RESPONSE_FORMAT_CUTOFF {
+        let lhs = current
+            .next()
+            .and_then(|segment| segment.parse::<u32>().ok())
+            .unwrap_or(0);
+        if lhs != rhs {
+            return lhs < rhs;
+        }
+    }
+
+    false
+}
+
+fn flatten_headers_for_legacy_clients(headers: &mut HashMap<String, serde_json::Value>) {
+    for value in headers.values_mut() {
+        if let serde_json::Value::Array(items) = value {
+            let replacement = items
+                .iter()
+                .rev()
+                .find(|item| !item.is_null())
+                .cloned()
+                .unwrap_or(serde_json::Value::String(String::new()));
+            *value = replacement;
+        }
+    }
+}
+
 /// Headers can be a string (JSON) or object
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(untagged)]
@@ -477,8 +509,6 @@ pub async fn create_execution(
 
     // TCP port readiness check (matching executor-main Docker.php:1088-1115)
     // On first execution, wait for the runtime to start listening on port 3000
-    // NOTE: We use runtime.name (container name) for DNS resolution, not runtime.hostname
-    // Docker DNS resolves containers by name, not by internal hostname
     if !runtime.is_listening() {
         debug!(
             "Checking if runtime {} is listening on port 3000",
@@ -501,10 +531,13 @@ pub async fn create_execution(
     let mut exec_headers = req.headers.to_map();
     exec_headers.insert("accept-encoding".to_string(), "identity".to_string());
 
+    let mut method = req.method;
+    method.make_ascii_uppercase();
+
     let exec_req = ExecuteRequest {
         body: req.body,
         path: req.path,
-        method: req.method.to_uppercase(),
+        method,
         headers: exec_headers,
         timeout: req.timeout,
         logging: req.logging,
@@ -534,6 +567,16 @@ pub async fn create_execution(
             err
         }
     })?;
+
+    let response_format = headers
+        .get("x-executor-response-format")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("0.10.0");
+
+    let mut response = response;
+    if should_flatten_headers_for_legacy_response_format(response_format) {
+        flatten_headers_for_legacy_clients(&mut response.headers);
+    }
 
     // Determine response format based on Accept header
     // Matches executor-main: default to multipart unless JSON is explicitly requested.
@@ -572,6 +615,35 @@ fn parse_multipart_execution_request_bytes(
     body: &[u8],
     content_type: &str,
 ) -> Result<ExecutionRequest> {
+    fn parse_field_name(headers: &[u8]) -> Result<&str> {
+        let name_marker = b"name=\"";
+        let name_start = memchr::memmem::find(headers, name_marker)
+            .ok_or_else(|| ExecutorError::ExecutionBadRequest("Missing field name".into()))?
+            + name_marker.len();
+        let name_len = memchr::memchr(b'"', &headers[name_start..])
+            .ok_or_else(|| ExecutorError::ExecutionBadRequest("Missing field name".into()))?;
+
+        std::str::from_utf8(&headers[name_start..name_start + name_len]).map_err(|_| {
+            ExecutorError::ExecutionBadRequest("Multipart field name must be valid UTF-8".into())
+        })
+    }
+
+    fn parse_string(value: &[u8]) -> String {
+        String::from_utf8_lossy(value).into_owned()
+    }
+
+    fn parse_u32(value: &[u8]) -> Option<u32> {
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
+    fn parse_u64(value: &[u8]) -> Option<u64> {
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
+    fn parse_f64(value: &[u8]) -> Option<f64> {
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
     let boundary = content_type
         .split("boundary=")
         .nth(1)
@@ -581,7 +653,23 @@ fn parse_multipart_execution_request_bytes(
         })?;
 
     let boundary_bytes = format!("--{}", boundary).into_bytes();
-    let mut fields: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut request = ExecutionRequest {
+        body: String::new(),
+        path: default_path(),
+        method: default_method(),
+        headers: HeadersInput::default(),
+        timeout: default_exec_timeout(),
+        image: String::new(),
+        source: String::new(),
+        entrypoint: String::new(),
+        variables: VariablesInput::default(),
+        cpus: default_cpus(),
+        memory: default_memory(),
+        version: default_version(),
+        runtime_entrypoint: String::new(),
+        logging: default_logging(),
+        restart_policy: default_restart_policy(),
+    };
 
     let mut i = 0;
     while i < body.len() {
@@ -604,94 +692,55 @@ fn parse_multipart_execution_request_bytes(
             let headers = &body[i..i + headers_end];
             i += headers_end + 4;
 
-            let headers_str = String::from_utf8_lossy(headers);
-
-            let name = headers_str
-                .split("name=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .ok_or_else(|| ExecutorError::ExecutionBadRequest("Missing field name".into()))?
-                .to_string();
+            let name = parse_field_name(headers)?;
 
             let next_boundary = memchr::memmem::find(&body[i..], &boundary_bytes)
                 .ok_or_else(|| ExecutorError::ExecutionBadRequest("Malformed multipart".into()))?;
 
-            let mut value = body[i..i + next_boundary].to_vec();
+            let mut value = &body[i..i + next_boundary];
 
             // Trim trailing CRLF
             if value.ends_with(b"\r\n") {
-                value.truncate(value.len() - 2);
+                value = &value[..value.len() - 2];
             }
 
-            fields.insert(name, value);
+            match name {
+                "body" => request.body = parse_string(value),
+                "path" => request.path = parse_string(value),
+                "method" => request.method = parse_string(value),
+                "headers" => request.headers = HeadersInput::String(parse_string(value)),
+                "timeout" => {
+                    if let Some(timeout) = parse_u32(value) {
+                        request.timeout = timeout;
+                    }
+                }
+                "image" => request.image = parse_string(value),
+                "source" => request.source = parse_string(value),
+                "entrypoint" => request.entrypoint = parse_string(value),
+                "variables" => request.variables = VariablesInput::String(parse_string(value)),
+                "cpus" => {
+                    if let Some(cpus) = parse_f64(value) {
+                        request.cpus = cpus;
+                    }
+                }
+                "memory" => {
+                    if let Some(memory) = parse_u64(value) {
+                        request.memory = memory;
+                    }
+                }
+                "version" => request.version = parse_string(value),
+                "runtimeEntrypoint" => request.runtime_entrypoint = parse_string(value),
+                "logging" => request.logging = value == b"true" || value == b"1",
+                "restartPolicy" => request.restart_policy = parse_string(value),
+                _ => {}
+            }
             i += next_boundary;
         } else {
             i += 1;
         }
     }
 
-    Ok(ExecutionRequest {
-        body: fields
-            .get("body")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        path: fields
-            .get("path")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_path),
-        method: fields
-            .get("method")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_method),
-        headers: fields
-            .get("headers")
-            .map(|v| HeadersInput::String(String::from_utf8_lossy(v).into_owned()))
-            .unwrap_or_default(),
-        timeout: fields
-            .get("timeout")
-            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
-            .unwrap_or_else(default_exec_timeout),
-        image: fields
-            .get("image")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        source: fields
-            .get("source")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        entrypoint: fields
-            .get("entrypoint")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        variables: fields
-            .get("variables")
-            .map(|v| VariablesInput::String(String::from_utf8_lossy(v).into_owned()))
-            .unwrap_or_default(),
-        cpus: fields
-            .get("cpus")
-            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
-            .unwrap_or_else(default_cpus),
-        memory: fields
-            .get("memory")
-            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
-            .unwrap_or_else(default_memory),
-        version: fields
-            .get("version")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_version),
-        runtime_entrypoint: fields
-            .get("runtimeEntrypoint")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_default(),
-        logging: fields
-            .get("logging")
-            .map(|v| v == b"true" || v == b"1")
-            .unwrap_or_else(default_logging),
-        restart_policy: fields
-            .get("restartPolicy")
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .unwrap_or_else(default_restart_policy),
-    })
+    Ok(request)
 }
 
 /// Determine if the Accept header requests JSON.
@@ -1102,6 +1151,37 @@ mod tests {
             assert_eq!(parsed["errors"], "");
             assert_eq!(parsed["duration"], 0.123456);
             assert!(parsed["startTime"].is_number());
+        }
+
+        #[test]
+        fn test_legacy_response_format_requires_header_flattening() {
+            assert!(should_flatten_headers_for_legacy_response_format("0.10.0"));
+            assert!(should_flatten_headers_for_legacy_response_format("0.10.9"));
+            assert!(!should_flatten_headers_for_legacy_response_format("0.11.0"));
+            assert!(!should_flatten_headers_for_legacy_response_format("0.11"));
+            assert!(!should_flatten_headers_for_legacy_response_format(
+                "0.11.0.1"
+            ));
+            assert!(!should_flatten_headers_for_legacy_response_format("0.12.1"));
+        }
+
+        #[test]
+        fn test_flatten_headers_for_legacy_clients_keeps_last_value() {
+            let mut headers = HashMap::from([
+                (
+                    "set-cookie".to_string(),
+                    json!(["first=value", "second=value"]),
+                ),
+                ("content-type".to_string(), json!("application/json")),
+            ]);
+
+            flatten_headers_for_legacy_clients(&mut headers);
+
+            assert_eq!(headers.get("set-cookie"), Some(&json!("second=value")));
+            assert_eq!(
+                headers.get("content-type"),
+                Some(&json!("application/json"))
+            );
         }
     }
 

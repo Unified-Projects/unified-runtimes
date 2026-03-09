@@ -2,6 +2,8 @@
 
 use super::AppState;
 use crate::error::{ExecutorError, Result};
+use crate::runtime::Runtime;
+use crate::tasks;
 use axum::{
     extract::{Path, State},
     Json,
@@ -90,13 +92,9 @@ pub async fn exec_command(
         .map_err(|e| ExecutorError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
+    let runtime = resolve_runtime(&state, &full_name).await?;
 
     info!("Executing command in {}: {}", full_name, req.command);
-
-    // Check if runtime exists
-    if !state.registry.exists(&full_name).await {
-        return Err(ExecutorError::RuntimeNotFound);
-    }
 
     // Validate command length
     if req.command.is_empty() || req.command.len() > 1024 {
@@ -108,11 +106,24 @@ pub async fn exec_command(
     // Validate command for injection attacks
     validate_command(&req.command)?;
 
+    if runtime.is_pending() {
+        return Err(ExecutorError::RuntimeTimeout);
+    }
+
+    state.registry.touch(&full_name).await.ok();
+
     // Execute command
-    let result = state
-        .docker
-        .exec_shell(&full_name, &req.command, req.timeout as u64)
-        .await?;
+    let result = if runtime.version.eq_ignore_ascii_case("v2") {
+        state
+            .docker
+            .exec_shell(&full_name, &req.command, req.timeout as u64)
+            .await?
+    } else {
+        state
+            .docker
+            .exec_bash(&full_name, &req.command, req.timeout as u64)
+            .await?
+    };
 
     debug!("Command exited with code {}", result.exit_code);
 
@@ -126,4 +137,33 @@ pub async fn exec_command(
     Ok(Json(CommandResponse {
         output: result.stdout,
     }))
+}
+
+async fn resolve_runtime(state: &AppState, full_name: &str) -> Result<Runtime> {
+    if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
+        return Ok(runtime);
+    }
+
+    if let Some(runtime) = state.registry.get(full_name).await {
+        return Ok(runtime);
+    }
+
+    let _ = tasks::adopt_container_by_name(
+        &state.docker,
+        &state.registry,
+        &state.keep_alive_registry,
+        &state.config.hostname,
+        full_name,
+    )
+    .await;
+
+    if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
+        return Ok(runtime);
+    }
+
+    state
+        .registry
+        .get(full_name)
+        .await
+        .ok_or(ExecutorError::RuntimeNotFound)
 }

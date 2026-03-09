@@ -77,21 +77,34 @@ pub async fn connect_container(docker: &Docker, network: &str, container: &str) 
         endpoint_config: None,
     };
 
-    docker.connect_network(network, config).await.map_err(|e| {
-        let message = e.to_string();
-        if message.contains("No such container") {
-            debug!(
-                "Container {} not found while connecting to network {} (non-fatal)",
-                container, network
+    match docker.connect_network(network, config).await {
+        Ok(_) => {}
+        Err(e) => {
+            let message = e.to_string();
+            if message.contains("No such container") {
+                debug!(
+                    "Container {} not found while connecting to network {} (non-fatal)",
+                    container, network
+                );
+                return Err(ExecutorError::RuntimeNotFound);
+            }
+            if message.contains("already exists")
+                || message.contains("already been joined")
+                || message.contains("endpoint with name")
+            {
+                debug!(
+                    "Container {} already attached to network {} (non-fatal)",
+                    container, network
+                );
+                return Ok(());
+            }
+            warn!(
+                "Failed to connect {} to {}: {}",
+                container, network, message
             );
-            return ExecutorError::RuntimeNotFound;
+            return Err(ExecutorError::Docker(message));
         }
-        warn!(
-            "Failed to connect {} to {}: {}",
-            container, network, message
-        );
-        ExecutorError::Docker(message)
-    })?;
+    }
 
     Ok(())
 }

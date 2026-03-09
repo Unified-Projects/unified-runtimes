@@ -193,6 +193,97 @@ fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
     deduped
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OfficialRuntime {
+    family: &'static str,
+    latest_image: &'static str,
+}
+
+// Verified against Docker Hub on 2026-03-09.
+const OFFICIAL_RUNTIMES: &[OfficialRuntime] = &[
+    OfficialRuntime {
+        family: "bun",
+        latest_image: "openruntimes/bun:v5-1.3",
+    },
+    OfficialRuntime {
+        family: "dart",
+        latest_image: "openruntimes/dart:v5-3.10",
+    },
+    OfficialRuntime {
+        family: "deno",
+        latest_image: "openruntimes/deno:v5-2.6",
+    },
+    OfficialRuntime {
+        family: "dotnet",
+        latest_image: "openruntimes/dotnet:v5-10",
+    },
+    OfficialRuntime {
+        family: "node",
+        latest_image: "openruntimes/node:v5-25",
+    },
+    OfficialRuntime {
+        family: "php",
+        latest_image: "openruntimes/php:v5-8.4",
+    },
+    OfficialRuntime {
+        family: "python",
+        latest_image: "openruntimes/python:v5-3.14",
+    },
+    OfficialRuntime {
+        family: "ruby",
+        latest_image: "openruntimes/ruby:v5-4.0",
+    },
+    OfficialRuntime {
+        family: "static",
+        latest_image: "openruntimes/static:v5-1",
+    },
+];
+
+fn official_runtime_by_family(family: &str) -> Option<&'static OfficialRuntime> {
+    OFFICIAL_RUNTIMES
+        .iter()
+        .find(|runtime| runtime.family == family)
+}
+
+fn parse_supported_runtime_family(image: &str) -> Option<&'static str> {
+    let trimmed = image.trim();
+
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("openruntimes/") {
+        let repository = rest.split(':').next().unwrap_or(rest);
+        return official_runtime_by_family(repository).map(|runtime| runtime.family);
+    }
+
+    if trimmed.contains('/') || trimmed.contains(':') {
+        return None;
+    }
+
+    if let Some(runtime) = official_runtime_by_family(trimmed) {
+        return Some(runtime.family);
+    }
+
+    let (family, _) = trimmed.split_once('-')?;
+    official_runtime_by_family(family).map(|runtime| runtime.family)
+}
+
+fn is_official_runtime_image(image: &str) -> bool {
+    parse_supported_runtime_family(image).is_some()
+}
+
+fn image_tag_numbers(image: &str) -> Vec<u32> {
+    image
+        .rsplit_once(':')
+        .map(|(_, tag)| tag)
+        .unwrap_or("")
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
 /// Main configuration for the executor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -217,6 +308,7 @@ pub struct ExecutorConfig {
     #[allow(dead_code)]
     pub runtime_versions: Vec<String>,
     pub image_pull_enabled: bool,
+    pub auto_runtime: bool,
 
     // Resource overrides (URT enhancement)
     pub min_cpus: f64,
@@ -303,6 +395,9 @@ impl ExecutorConfig {
             image_pull_enabled: env_urt_or_opr("IMAGE_PULL")
                 .map(|v| v.to_lowercase() != "disabled")
                 .unwrap_or(true),
+            auto_runtime: env_urt_or_opr("AUTO_RUNTIME")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
 
             // Resource overrides
             min_cpus: env_urt_or_opr("MIN_CPUS")
@@ -382,6 +477,10 @@ impl ExecutorConfig {
     /// Matches against both raw allowed runtimes and their expanded forms
     /// e.g., if allowed_runtimes contains "node-22", it will match "openruntimes/node:v5-22"
     pub fn is_runtime_allowed(&self, image: &str) -> bool {
+        if self.auto_runtime && is_official_runtime_image(image) {
+            return true;
+        }
+
         // Always allow the official static runtime for sites/assets
         if Self::is_static_runtime_image(image) {
             return true;
@@ -432,11 +531,7 @@ impl ExecutorConfig {
     ///   "openruntimes/node:v5-22" -> "openruntimes/node:v5-22" (unchanged)
     ///   "myregistry/custom:latest" -> "myregistry/custom:latest" (unchanged)
     pub fn expand_runtime_name(&self, name: &str) -> String {
-        let default_version = self
-            .runtime_versions
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("v5");
+        let default_version = self.default_runtime_version();
 
         if name.contains(':') {
             // Already has a tag, use as-is
@@ -454,6 +549,196 @@ impl ExecutorConfig {
             // Just a runtime name without version, use as-is with version tag
             format!("openruntimes/{}:{}", name, default_version)
         }
+    }
+
+    fn default_runtime_version(&self) -> &str {
+        self.runtime_versions
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("v5")
+    }
+
+    fn latest_allowed_official_image(&self, family: &str) -> Option<String> {
+        let mut allowed_images: Vec<String> = self
+            .allowed_runtimes
+            .iter()
+            .map(|image| self.normalize_runtime_image(image))
+            .filter(|image| {
+                image.starts_with("openruntimes/")
+                    && parse_supported_runtime_family(image) == Some(family)
+            })
+            .collect();
+
+        allowed_images.sort_by_key(|left| image_tag_numbers(left));
+        allowed_images.pop()
+    }
+
+    fn preferred_official_image(&self, family: &str) -> Option<String> {
+        if self.auto_runtime || self.allowed_runtimes.is_empty() {
+            official_runtime_by_family(family).map(|runtime| runtime.latest_image.to_string())
+        } else {
+            self.latest_allowed_official_image(family)
+        }
+    }
+
+    fn detect_runtime_family(
+        &self,
+        requested_family: Option<&'static str>,
+        entrypoint: &str,
+        runtime_entrypoint: &str,
+        command: &str,
+    ) -> Option<&'static str> {
+        let command_context = format!(
+            " {} {} ",
+            runtime_entrypoint.to_ascii_lowercase(),
+            command.to_ascii_lowercase()
+        );
+
+        if requested_family.is_some()
+            && (command_context.contains("/usr/local/server/helpers/")
+                || command_context.contains("helpers/build.sh"))
+        {
+            return requested_family;
+        }
+
+        for (family, markers) in [
+            ("bun", &["bun ", "bunx "][..]),
+            ("deno", &["deno ", "denon "][..]),
+            (
+                "php",
+                &["composer ", "composer.phar", "php ", "artisan "][..],
+            ),
+            ("dotnet", &["dotnet ", "nuget "][..]),
+            (
+                "ruby",
+                &["bundle ", "bundler ", "gem ", "ruby ", "rake ", "rails "][..],
+            ),
+            (
+                "dart",
+                &["dart ", "flutter pub ", "flutter run ", "flutter build "][..],
+            ),
+            (
+                "python",
+                &[
+                    "python ",
+                    "python3 ",
+                    "pip ",
+                    "pip3 ",
+                    "pytest ",
+                    "uv ",
+                    "poetry ",
+                    "gunicorn ",
+                    "uvicorn ",
+                    "flask ",
+                    "django-admin ",
+                ][..],
+            ),
+            (
+                "node",
+                &[
+                    "npm ", "npx ", "pnpm ", "pnpx ", "yarn ", "node ", "tsx ", "ts-node ",
+                ][..],
+            ),
+        ] {
+            if markers
+                .iter()
+                .any(|marker| command_context.contains(marker))
+            {
+                return Some(family);
+            }
+        }
+
+        let entrypoint = entrypoint.trim().to_ascii_lowercase();
+
+        if entrypoint.ends_with(".php") {
+            return Some("php");
+        }
+        if entrypoint.ends_with(".py") {
+            return Some("python");
+        }
+        if entrypoint.ends_with(".rb") {
+            return Some("ruby");
+        }
+        if entrypoint.ends_with(".dart") {
+            return Some("dart");
+        }
+        if entrypoint.ends_with(".cs") || entrypoint.ends_with(".fs") || entrypoint.ends_with(".vb")
+        {
+            return Some("dotnet");
+        }
+        if entrypoint.ends_with(".js")
+            || entrypoint.ends_with(".cjs")
+            || entrypoint.ends_with(".mjs")
+        {
+            return match requested_family {
+                Some("bun") => Some("bun"),
+                Some("node") => Some("node"),
+                Some("static") => Some("static"),
+                _ => Some("node"),
+            };
+        }
+        if entrypoint.ends_with(".ts") {
+            return match requested_family {
+                Some("bun") => Some("bun"),
+                Some("deno") => Some("deno"),
+                Some("node") => Some("node"),
+                _ => None,
+            };
+        }
+
+        requested_family
+    }
+
+    pub fn normalize_runtime_image(&self, image: &str) -> String {
+        let trimmed = image.trim();
+
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        if (trimmed.starts_with("openruntimes/") || !trimmed.contains('/'))
+            && parse_supported_runtime_family(trimmed).is_some()
+        {
+            return self.expand_runtime_name(trimmed);
+        }
+
+        trimmed.to_string()
+    }
+
+    pub fn resolve_runtime_image(
+        &self,
+        image: &str,
+        entrypoint: &str,
+        runtime_entrypoint: &str,
+        command: &str,
+    ) -> String {
+        let normalized_image = self.normalize_runtime_image(image);
+
+        if !self.auto_runtime {
+            return normalized_image;
+        }
+
+        let requested_family = parse_supported_runtime_family(image)
+            .or_else(|| parse_supported_runtime_family(&normalized_image));
+        let auto_managed_image = image.trim().is_empty() || requested_family.is_some();
+        let detected_family =
+            self.detect_runtime_family(requested_family, entrypoint, runtime_entrypoint, command);
+
+        if auto_managed_image {
+            if let Some(family) = detected_family {
+                if let Some(image) = self.preferred_official_image(family) {
+                    return image;
+                }
+            }
+
+            if let Some(family) = requested_family {
+                if let Some(image) = self.preferred_official_image(family) {
+                    return image;
+                }
+            }
+        }
+
+        normalized_image
     }
 
     /// Get expanded runtime names for warmup
@@ -497,8 +782,20 @@ mod tests {
     }
 
     #[test]
+    fn test_is_runtime_allowed_auto_runtime_bypasses_allowlist_for_official_images() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec!["php-8.4".to_string()];
+
+        assert!(config.is_runtime_allowed("openruntimes/node:v5-25"));
+        assert!(config.is_runtime_allowed("openruntimes/bun:v5-1.3"));
+        assert!(!config.is_runtime_allowed("custom/runtime:latest"));
+    }
+
+    #[test]
     fn test_is_runtime_allowed_with_list() {
         let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = false;
         config.runtime_versions = vec!["v5".to_string()];
         config.allowed_runtimes = vec!["node-22".to_string(), "python-3.11".to_string()];
 
@@ -640,5 +937,113 @@ mod tests {
         assert_eq!(expanded.len(), 2);
         assert_eq!(expanded[0], "openruntimes/node:v5-22");
         assert_eq!(expanded[1], "openruntimes/python:v5-3.11");
+    }
+
+    #[test]
+    fn test_normalize_runtime_image_supported_shorthand() {
+        let mut config = ExecutorConfig::from_env();
+        config.runtime_versions = vec!["v5".to_string()];
+
+        assert_eq!(
+            config.normalize_runtime_image("node-22"),
+            "openruntimes/node:v5-22"
+        );
+        assert_eq!(
+            config.normalize_runtime_image("node"),
+            "openruntimes/node:v5"
+        );
+        assert_eq!(
+            config.normalize_runtime_image("openruntimes/php"),
+            "openruntimes/php:v5"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_image_auto_upgrades_requested_family() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec![];
+
+        assert_eq!(
+            config.resolve_runtime_image("node-22", "index.js", "", ""),
+            "openruntimes/node:v5-25"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_image_auto_switches_family_from_commands() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec![];
+
+        assert_eq!(
+            config.resolve_runtime_image("node-22", "index.js", "", "bun install"),
+            "openruntimes/bun:v5-1.3"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_image_keeps_requested_family_for_helper_scaffolded_builds() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec![];
+
+        assert_eq!(
+            config.resolve_runtime_image(
+                "node-22",
+                "index.js",
+                "",
+                "tar -zxf /tmp/code.tar.gz -C /mnt/code && helpers/build.sh 'source /usr/local/server/helpers/next-js/env.sh && bun install && bun run build'"
+            ),
+            "openruntimes/node:v5-25"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_image_prefers_latest_allowed_official_image() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = false;
+        config.allowed_runtimes = vec!["node-22".to_string(), "node-24".to_string()];
+
+        assert_eq!(
+            config.preferred_official_image("node").as_deref(),
+            Some("openruntimes/node:v5-24")
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_image_auto_runtime_ignores_allowlist_pin() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec!["node-22".to_string()];
+
+        assert_eq!(
+            config.resolve_runtime_image("node-22", "index.js", "", "npm install"),
+            "openruntimes/node:v5-25"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_image_keeps_custom_images() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec![];
+
+        assert_eq!(
+            config.resolve_runtime_image("custom/runtime:latest", "index.js", "", "bun install"),
+            "custom/runtime:latest"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_image_uses_entrypoint_when_image_missing() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec![];
+
+        assert_eq!(
+            config.resolve_runtime_image("", "index.php", "", ""),
+            "openruntimes/php:v5-8.4"
+        );
     }
 }

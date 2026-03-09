@@ -33,6 +33,7 @@ fn test_config() -> ExecutorConfig {
         allowed_runtimes: vec![],
         runtime_versions: vec!["v5".to_string()],
         image_pull_enabled: true,
+        auto_runtime: true,
         min_cpus: 0.0,
         min_memory: 0,
         keep_alive: true,

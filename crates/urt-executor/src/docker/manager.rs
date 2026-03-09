@@ -11,13 +11,13 @@ use crate::config::ExecutorConfig;
 use crate::error::{ExecutorError, Result};
 use crate::storage::{BuildCache, Storage};
 use bollard::auth::DockerCredentials;
-use bollard::container::LogOutput;
 use bollard::models::{ContainerCreateBody, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
-    LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::Docker;
+use bollard::API_DEFAULT_VERSION;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,6 +25,24 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::warn;
 use tracing::{debug, error, info};
+
+fn is_missing_image_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("no such image")
+        || normalized.contains("not found: openruntimes/")
+        || normalized.contains("pull access denied")
+}
+
+fn map_create_container_error(message: String) -> ExecutorError {
+    if message.contains("Conflict")
+        || message.contains("already in use")
+        || message.contains("is already in use")
+    {
+        return ExecutorError::RuntimeConflict;
+    }
+
+    ExecutorError::Docker(message)
+}
 
 /// Parse Docker environment format (`KEY=VALUE`) into a map.
 fn parse_env_vars(env: Option<Vec<String>>) -> HashMap<String, String> {
@@ -51,21 +69,30 @@ pub struct DockerManager {
 }
 
 impl DockerManager {
+    async fn create_container_inner(
+        &self,
+        options: CreateContainerOptions,
+        config: ContainerCreateBody,
+    ) -> std::result::Result<bollard::models::ContainerCreateResponse, bollard::errors::Error> {
+        self.docker.create_container(Some(options), config).await
+    }
+
     /// Stop and remove all containers managed by URT
     #[allow(dead_code)]
-    pub async fn cleanup_managed_containers(&self) {
+    pub async fn cleanup_managed_containers(&self) -> Vec<String> {
         use tracing::{info, warn};
 
         let containers = match self.list_containers(Some("urt.managed=true")).await {
             Ok(c) => c,
             Err(e) => {
                 warn!("Failed to list managed containers during shutdown: {}", e);
-                return;
+                return Vec::new();
             }
         };
 
         let mut containers = containers;
         containers.sort_by_key(|c| c.created);
+        let mut cleaned_names = Vec::with_capacity(containers.len());
 
         // Get executor container ID ONCE
         let self_id = self
@@ -83,20 +110,23 @@ impl DockerManager {
                 continue;
             }
 
-            let name = &container.name;
+            let name = container.name;
 
             info!("Cleaning up runtime {}", name);
 
-            if let Err(e) = self.remove_container(name, true).await {
+            if let Err(e) = self.remove_container(&name, true).await {
                 warn!("Failed to remove {}: {}", name, e);
             }
+
+            cleaned_names.push(name);
         }
+
+        cleaned_names
     }
 
     /// Create a new DockerManager
     pub async fn new(config: ExecutorConfig) -> Result<Self> {
-        let docker = Docker::connect_with_socket_defaults()
-            .map_err(|e| ExecutorError::Docker(e.to_string()))?;
+        let docker = connect_to_docker()?;
 
         // Verify connection
         docker
@@ -297,11 +327,28 @@ impl DockerManager {
         };
 
         // Create container
-        let response = self
-            .docker
-            .create_container(Some(options), config)
+        let response = match self
+            .create_container_inner(options.clone(), config.clone())
             .await
-            .map_err(|e| ExecutorError::Docker(e.to_string()))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let message = error.to_string();
+
+                if self.config.image_pull_enabled && is_missing_image_error(&message) {
+                    info!(
+                        "Image {} missing locally, pulling before retry",
+                        container_config.image
+                    );
+                    self.pull_image(&container_config.image).await?;
+                    self.create_container_inner(options.clone(), config.clone())
+                        .await
+                        .map_err(|e| map_create_container_error(e.to_string()))?
+                } else {
+                    return Err(map_create_container_error(message));
+                }
+            }
+        };
 
         debug!(
             "Created container {} with id {}",
@@ -496,33 +543,6 @@ impl DockerManager {
         &self.stats_cache
     }
 
-    /// Stream container logs
-    pub async fn stream_logs(
-        &self,
-        container: &str,
-        follow: bool,
-        tail: Option<&str>,
-    ) -> impl futures_util::Stream<Item = Result<String>> + '_ {
-        let options = LogsOptions {
-            follow,
-            stdout: true,
-            stderr: true,
-            tail: tail.unwrap_or("all").to_string(),
-            timestamps: true,
-            ..Default::default()
-        };
-
-        self.docker.logs(container, Some(options)).map(|result| {
-            result
-                .map(|output| match output {
-                    LogOutput::StdOut { message } => String::from_utf8_lossy(&message).to_string(),
-                    LogOutput::StdErr { message } => String::from_utf8_lossy(&message).to_string(),
-                    _ => String::new(),
-                })
-                .map_err(|e| ExecutorError::Docker(e.to_string()))
-        })
-    }
-
     /// Build a Docker image from source code
     ///
     /// # Arguments
@@ -539,10 +559,70 @@ impl DockerManager {
     }
 }
 
+fn connect_to_docker() -> Result<Docker> {
+    let mut attempts: Vec<(
+        &'static str,
+        std::result::Result<Docker, bollard::errors::Error>,
+    )> = vec![("socket_defaults", Docker::connect_with_socket_defaults())];
+
+    #[cfg(unix)]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let user_socket = Path::new(&home).join(".docker/run/docker.sock");
+            if user_socket.exists() {
+                if let Some(socket_path) = user_socket.to_str() {
+                    attempts.push((
+                        "user_socket",
+                        Docker::connect_with_unix(socket_path, 120, API_DEFAULT_VERSION),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut errors = Vec::new();
+    for (label, attempt) in attempts {
+        match attempt {
+            Ok(docker) => return Ok(docker),
+            Err(error) => errors.push(format!("{}: {}", label, error)),
+        }
+    }
+
+    Err(ExecutorError::Docker(errors.join("; ")))
+}
+
 impl std::fmt::Debug for DockerManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DockerManager")
             .field("config", &self.config)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_missing_image_error, map_create_container_error};
+    use crate::error::ExecutorError;
+
+    #[test]
+    fn test_is_missing_image_error_detects_docker_not_found() {
+        assert!(is_missing_image_error(
+            "Docker responded with status code 404: No such image: openruntimes/node:v5-25"
+        ));
+        assert!(is_missing_image_error(
+            "pull access denied for openruntimes/node, repository does not exist or may require authorization"
+        ));
+        assert!(!is_missing_image_error(
+            "Docker responded with status code 409: Conflict. The container name is already in use."
+        ));
+    }
+
+    #[test]
+    fn test_map_create_container_error_maps_conflict() {
+        let err = map_create_container_error(
+            "Docker responded with status code 409: Conflict. The container name is already in use."
+                .to_string(),
+        );
+        assert!(matches!(err, ExecutorError::RuntimeConflict));
     }
 }

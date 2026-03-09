@@ -5,7 +5,7 @@ use crate::error::{ExecutorError, Result};
 use async_trait::async_trait;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tar::Builder;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -109,21 +109,43 @@ impl Storage for LocalStorage {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let full_path = self.full_path(prefix);
+        let root_path = PathBuf::from(&full_path);
         let mut entries = Vec::new();
 
-        if !Path::new(&full_path).exists() {
+        if !root_path.exists() {
             return Ok(entries);
         }
 
-        let mut read_dir = fs::read_dir(&full_path)
-            .await
-            .map_err(|e| ExecutorError::Storage(format!("Failed to list {}: {}", full_path, e)))?;
+        if root_path.is_file() {
+            entries.push(prefix.trim_start_matches('/').to_string());
+            return Ok(entries);
+        }
 
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            if let Ok(name) = entry.file_name().into_string() {
-                entries.push(name);
+        let base_path = PathBuf::from(&self.base_path);
+        let mut stack = vec![root_path];
+
+        while let Some(dir) = stack.pop() {
+            let mut read_dir = fs::read_dir(&dir).await.map_err(|e| {
+                ExecutorError::Storage(format!("Failed to list {}: {}", dir.display(), e))
+            })?;
+
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                let path = entry.path();
+                let file_type = entry.file_type().await.map_err(|e| {
+                    ExecutorError::Storage(format!("Failed to stat {}: {}", path.display(), e))
+                })?;
+
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+
+                let relative = path.strip_prefix(&base_path).unwrap_or(&path);
+                entries.push(relative.to_string_lossy().to_string());
             }
         }
+
+        entries.sort();
 
         Ok(entries)
     }
@@ -290,7 +312,7 @@ mod tests {
         let files = storage.list("").await.unwrap();
         assert!(files.contains(&"file1.txt".to_string()));
         assert!(files.contains(&"file2.txt".to_string()));
-        // Note: list with empty prefix may or may not include subdir entries depending on implementation
+        assert!(files.contains(&"subdir/file3.txt".to_string()));
     }
 
     #[tokio::test]

@@ -132,17 +132,16 @@ impl RuntimeRegistry {
             Ok(info) => {
                 if let Some(mut runtime) = self.runtimes.get_mut(name) {
                     runtime.status = info.state;
-                    runtime.initialised = if runtime.status.eq_ignore_ascii_case("running") {
-                        1
-                    } else {
-                        0
-                    };
-                    runtime.touch();
                     return Some(runtime.clone());
                 }
                 None
             }
             Err(ExecutorError::RuntimeNotFound) => {
+                if let Some(runtime) = self.runtimes.get(name) {
+                    if runtime.is_pending() {
+                        return Some(runtime.clone());
+                    }
+                }
                 // Container was removed outside the registry - clean up stale metadata.
                 self.runtimes.remove(name);
                 None
