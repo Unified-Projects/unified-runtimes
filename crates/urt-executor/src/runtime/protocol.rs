@@ -12,14 +12,33 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::debug;
 
 /// Maximum log file size (5MB, matching executor-main)
 const MAX_LOG_SIZE: usize = 5 * 1024 * 1024;
 const MAX_BUILD_LOG_SIZE: usize = 1_000_000;
-const LOG_FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOG_FILE_WAIT_INTERVAL: Duration = Duration::from_millis(25);
+
+#[cfg(not(test))]
+fn log_file_wait_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let millis = std::env::var("URT_LOG_FILE_WAIT_MS")
+            .ok()
+            .or_else(|| std::env::var("OPR_EXECUTOR_LOG_FILE_WAIT_MS").ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        Duration::from_millis(millis)
+    })
+}
+
+#[cfg(test)]
+fn log_file_wait_timeout() -> Duration {
+    Duration::from_secs(1)
+}
 
 /// Request to execute a function
 #[derive(Debug, Clone)]
@@ -308,11 +327,7 @@ impl RuntimeProtocol for V5Protocol {
 }
 
 pub fn runtime_network_host(runtime: &Runtime) -> &str {
-    if runtime.hostname.trim().is_empty() {
-        &runtime.name
-    } else {
-        &runtime.hostname
-    }
+    &runtime.name
 }
 
 /// Read log files from disk and clean up (matching executor-main behavior)
@@ -345,7 +360,12 @@ async fn read_log_files(runtime_name: &str, file_id: &str) -> (String, String) {
 }
 
 async fn wait_for_log_file(path: &Path) {
-    let deadline = tokio::time::Instant::now() + LOG_FILE_WAIT_TIMEOUT;
+    let timeout = log_file_wait_timeout();
+    if timeout.is_zero() {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
         if tokio::fs::try_exists(path).await.unwrap_or(false)
@@ -493,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_network_host_prefers_hostname() {
+    fn test_runtime_network_host_uses_container_name_even_when_hostname_exists() {
         let runtime = Runtime {
             version: "v5".to_string(),
             created: 0.0,
@@ -509,12 +529,9 @@ mod tests {
             authorization_header: "Basic dummy".to_string(),
         };
 
-        assert_eq!(
-            runtime_network_host(&runtime),
-            "1ca14d56857971dfad412b32f66e6466"
-        );
+        assert_eq!(runtime_network_host(&runtime), "exc1-myruntime123");
         let url = build_runtime_url(runtime_network_host(&runtime), 3000, "/");
-        assert_eq!(url, "http://1ca14d56857971dfad412b32f66e6466:3000/");
+        assert_eq!(url, "http://exc1-myruntime123:3000/");
     }
 
     #[test]

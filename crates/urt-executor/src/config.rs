@@ -319,6 +319,7 @@ pub struct ExecutorConfig {
     pub inactive_threshold: u64,   // seconds
     pub maintenance_interval: u64, // seconds
     pub autoscale: bool,
+    pub eager_runtime_readiness: bool,
     pub max_concurrent_executions: Option<usize>,
     pub max_concurrent_runtime_creates: Option<usize>,
     pub execution_queue_wait_ms: u64,
@@ -418,6 +419,9 @@ impl ExecutorConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
             autoscale: env_urt_or_opr("AUTOSCALE")
+                .map(|v| parse_bool_flag(&v))
+                .unwrap_or(false),
+            eager_runtime_readiness: env_urt_or_opr("EAGER_RUNTIME_READINESS")
                 .map(|v| parse_bool_flag(&v))
                 .unwrap_or(false),
             max_concurrent_executions: env_urt_or_opr("MAX_CONCURRENT_EXECUTIONS")

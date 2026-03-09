@@ -502,7 +502,9 @@ pub async fn create_runtime(
     validate_image_name(&resolved_image)?;
 
     let full_name = format!("{}-{}", state.config.hostname, req.runtime_id);
-    reconcile_existing_runtime_id(&state, &req.runtime_id, &full_name).await?;
+    if state.registry.exists(&full_name).await {
+        reconcile_existing_runtime_id(&state, &req.runtime_id, &full_name).await?;
+    }
 
     // Check if image is allowed
     if !state.config.is_runtime_allowed(&resolved_image) {
@@ -1051,25 +1053,27 @@ pub async fn create_runtime(
 
         info!("Cleaned up runtime {} after build", req.runtime_id);
     } else {
-        let port_timeout_secs = u64::from(req.timeout.clamp(1, 30));
-        if let Err(error) =
-            wait_for_runtime_port(&full_name, 3000, Duration::from_secs(port_timeout_secs)).await
-        {
-            error!(
-                "Runtime {} failed port readiness: {}",
-                req.runtime_id, error
-            );
-            state.docker.remove_container(&full_name, true).await.ok();
-            tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-            state.registry.remove(&full_name).await;
-            return Err(ExecutorError::RuntimeFailed(
-                "Runtime port readiness check timed out".to_string(),
-            ));
-        }
-
         let mut updated_runtime = runtime.clone();
+        if state.config.eager_runtime_readiness {
+            let port_timeout_secs = u64::from(req.timeout.clamp(1, 30));
+            if let Err(error) =
+                wait_for_runtime_port(&full_name, 3000, Duration::from_secs(port_timeout_secs))
+                    .await
+            {
+                error!(
+                    "Runtime {} failed port readiness: {}",
+                    req.runtime_id, error
+                );
+                state.docker.remove_container(&full_name, true).await.ok();
+                tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+                state.registry.remove(&full_name).await;
+                return Err(ExecutorError::RuntimeFailed(
+                    "Runtime port readiness check timed out".to_string(),
+                ));
+            }
+            updated_runtime.set_listening();
+        }
         updated_runtime.mark_running("running");
-        updated_runtime.set_listening();
         state.registry.update(updated_runtime).await.ok();
     }
 

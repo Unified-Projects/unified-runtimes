@@ -81,6 +81,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Host: {}:{}", config.host, config.port);
     info!("  Keep-alive: {}", config.keep_alive);
     info!("  Autoscale: {}", config.autoscale);
+    info!(
+        "  Eager runtime readiness: {}",
+        config.eager_runtime_readiness
+    );
     info!("  Metrics endpoint: {}", config.metrics_enabled);
     info!("  Auto runtime: {}", config.auto_runtime);
     info!("  Min CPUs: {}", config.min_cpus);

@@ -40,6 +40,7 @@ fn test_config() -> ExecutorConfig {
         inactive_threshold: 60,
         maintenance_interval: 3600,
         autoscale: false,
+        eager_runtime_readiness: false,
         max_concurrent_executions: None,
         max_concurrent_runtime_creates: None,
         execution_queue_wait_ms: 2_000,

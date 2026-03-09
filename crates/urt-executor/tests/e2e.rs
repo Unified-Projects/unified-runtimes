@@ -119,6 +119,7 @@ fn test_config(network: String) -> ExecutorConfig {
         inactive_threshold: 300,
         maintenance_interval: 3600,
         autoscale: false,
+        eager_runtime_readiness: false,
         max_concurrent_executions: None,
         max_concurrent_runtime_creates: None,
         execution_queue_wait_ms: 2_000,
