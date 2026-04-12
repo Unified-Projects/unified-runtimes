@@ -515,6 +515,8 @@ mod tests {
     #[test]
     fn test_runtime_network_host_uses_container_name_even_when_hostname_exists() {
         let runtime = Runtime {
+            runtime_id: "myruntime123".to_string(),
+            executor_hostname: "exc1".to_string(),
             version: "v5".to_string(),
             created: 0.0,
             updated: 0.0,
@@ -537,6 +539,8 @@ mod tests {
     #[test]
     fn test_runtime_network_host_falls_back_to_container_name() {
         let runtime = Runtime {
+            runtime_id: "myruntime123".to_string(),
+            executor_hostname: "exc1".to_string(),
             version: "v5".to_string(),
             created: 0.0,
             updated: 0.0,
