@@ -500,7 +500,7 @@ fn build_cache_scope(request: &BuildRequest) -> String {
     hasher.update(request.build_id.as_bytes());
 
     let mut build_args: Vec<_> = request.build_args.iter().collect();
-    build_args.sort_by(|(left, _), (right, _)| left.cmp(right));
+    build_args.sort_by_key(|(left, _)| *left);
     for (key, value) in build_args {
         hasher.update(key.as_bytes());
         hasher.update([0]);
