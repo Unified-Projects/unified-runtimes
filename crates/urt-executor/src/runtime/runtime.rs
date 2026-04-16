@@ -10,6 +10,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Runtime state representing a containerized function instance
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Runtime {
+    /// Canonical runtime identifier from the API request
+    #[serde(default)]
+    pub runtime_id: String,
+    /// Executor hostname that owns this runtime
+    #[serde(default)]
+    pub executor_hostname: String,
     /// Runtime version (v2 or v5)
     pub version: String,
     /// Creation timestamp (Unix seconds)
@@ -61,6 +67,8 @@ impl Runtime {
             .expect("failed to read OS randomness for runtime hostname");
 
         let mut runtime = Self {
+            runtime_id: runtime_id.to_string(),
+            executor_hostname: executor_hostname.to_string(),
             version: version.to_string(),
             created: now,
             updated: now,
@@ -117,7 +125,7 @@ impl Runtime {
     /// Get the runtime ID from the full name
     #[allow(dead_code)]
     pub fn runtime_id(&self) -> &str {
-        self.name.split('-').next_back().unwrap_or(&self.name)
+        &self.runtime_id
     }
 
     /// Get seconds since last activity
@@ -225,6 +233,6 @@ mod tests {
     #[test]
     fn test_runtime_id() {
         let rt = Runtime::new("my-func-123", "executor", "img", "v5", None);
-        assert_eq!(rt.runtime_id(), "123");
+        assert_eq!(rt.runtime_id(), "my-func-123");
     }
 }

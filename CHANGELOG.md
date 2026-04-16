@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-16
+
+### Fixed
+- **Cold-start request handling**: `resolve_runtime` now polls runtime status with exponential backoff (50ms to 500ms) bounded by `req.timeout`, waiting for pending runtimes to become ready instead of returning immediately on the first sync check. Applies to both the registry-hit and post-adoption pending branches.
+- **Runtime timeout status code**: `ExecutorError::RuntimeTimeout` now maps to HTTP `504 Gateway Timeout` instead of `400 Bad Request`, matching the semantics of `LogsTimeout` and correctly signalling upstream readiness failures.
+
+### Security
+- **Advisory-driven dependency bumps**: `quinn-proto` 0.11.13 to 0.11.14 (RUSTSEC-2026-0037 DoS), `rustls-webpki` 0.103.9 to 0.103.12 (RUSTSEC-2026-0049 CRL matching), `tar` 0.4.44 to 0.4.45 (RUSTSEC-2026-0067 / RUSTSEC-2026-0068 symlink chmod and PAX size header handling), and `rand` 0.9.2 to 0.9.4 (RUSTSEC-2026-0097 unsoundness).
+
 ## [0.3.0] - 2026-03-09
 
 ### Changed

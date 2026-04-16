@@ -555,11 +555,22 @@ async fn resolve_runtime(
 ) -> Result<crate::runtime::Runtime> {
     if let Some(runtime) = state.registry.get(full_name).await {
         if runtime.is_pending() {
-            state.registry.sync_status(full_name, &state.docker).await;
-            match state.registry.get(full_name).await {
-                Some(updated) if !updated.is_pending() => return Ok(updated),
-                Some(_) => return Err(ExecutorError::RuntimeTimeout),
-                None => {}
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(req.timeout as u64);
+            let mut retry_delay = std::time::Duration::from_millis(50);
+            let max_retry_delay = std::time::Duration::from_millis(500);
+            loop {
+                state.registry.sync_status(full_name, &state.docker).await;
+                match state.registry.get(full_name).await {
+                    Some(updated) if !updated.is_pending() => return Ok(updated),
+                    Some(_) => {}
+                    None => break,
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ExecutorError::RuntimeTimeout);
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(max_retry_delay);
             }
         } else {
             return Ok(runtime);
@@ -578,12 +589,23 @@ async fn resolve_runtime(
 
     if let Some(runtime) = state.registry.get(full_name).await {
         if runtime.is_pending() {
-            state.registry.sync_status(full_name, &state.docker).await;
-            return match state.registry.get(full_name).await {
-                Some(updated) if !updated.is_pending() => Ok(updated),
-                Some(_) => Err(ExecutorError::RuntimeTimeout),
-                None => Err(ExecutorError::RuntimeNotFound),
-            };
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(req.timeout as u64);
+            let mut retry_delay = std::time::Duration::from_millis(50);
+            let max_retry_delay = std::time::Duration::from_millis(500);
+            loop {
+                state.registry.sync_status(full_name, &state.docker).await;
+                match state.registry.get(full_name).await {
+                    Some(updated) if !updated.is_pending() => return Ok(updated),
+                    Some(_) => {}
+                    None => return Err(ExecutorError::RuntimeNotFound),
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ExecutorError::RuntimeTimeout);
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(max_retry_delay);
+            }
         }
 
         return Ok(runtime);

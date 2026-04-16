@@ -111,7 +111,7 @@ impl ExecutorError {
             Self::RuntimeNotFound => StatusCode::NOT_FOUND,
             Self::RuntimeConflict => StatusCode::CONFLICT,
             Self::RuntimeFailed(_) => StatusCode::BAD_REQUEST,
-            Self::RuntimeTimeout => StatusCode::BAD_REQUEST,
+            Self::RuntimeTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RuntimeOverloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::LogsTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::CommandTimeout => StatusCode::INTERNAL_SERVER_ERROR,
@@ -312,7 +312,7 @@ mod tests {
         );
         assert_eq!(
             ExecutorError::RuntimeTimeout.status_code(),
-            StatusCode::BAD_REQUEST
+            StatusCode::GATEWAY_TIMEOUT
         );
         assert_eq!(
             ExecutorError::RuntimeOverloaded.status_code(),

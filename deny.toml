@@ -18,7 +18,10 @@ allow = [
     "Unicode-3.0",
     
     "CDLA-Permissive-2.0",
-    "CC0-1.0"
+    "CC0-1.0",
+
+    # Weak copyleft; used by attohttpc (transitive via rust-s3 -> aws-creds)
+    "MPL-2.0",
 ]
 
 confidence-threshold = 0.8
