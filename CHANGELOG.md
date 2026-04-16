@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-16
+
+### Fixed
+- **Cold-start request handling**: `resolve_runtime` now polls runtime status with exponential backoff (50ms to 500ms) bounded by `req.timeout`, waiting for pending runtimes to become ready instead of returning immediately on the first sync check. Applies to both the registry-hit and post-adoption pending branches.
+- **Runtime timeout status code**: `ExecutorError::RuntimeTimeout` now maps to HTTP `504 Gateway Timeout` instead of `400 Bad Request`, matching the semantics of `LogsTimeout` and correctly signalling upstream readiness failures.
+
 ## [0.3.0] - 2026-03-09
 
 ### Changed

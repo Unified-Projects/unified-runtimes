@@ -1402,3 +1402,141 @@ mod headers_handling {
         assert_eq!(response.status(), StatusCode::OK);
     }
 }
+
+mod cold_start {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use urt_executor::runtime::Runtime;
+
+    #[tokio::test]
+    async fn pending_runtime_past_timeout_returns_504() {
+        require_docker!(state);
+
+        let hostname = state.config.hostname.clone();
+        let runtime_id = "cold-start-timeout-test";
+        let _full_name = format!("{}-{}", hostname, runtime_id);
+
+        let pending_runtime = Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
+        state
+            .registry
+            .insert(pending_runtime)
+            .await
+            .expect("failed to insert pending runtime into registry");
+
+        let app = create_router(state);
+
+        let payload = serde_json::json!({
+            "body": "",
+            "path": "/",
+            "method": "GET",
+            "headers": {},
+            "timeout": 1
+        });
+
+        let start = Instant::now();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/runtimes/{}/executions", runtime_id))
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "Expected 504 when runtime stays pending past timeout, got {} (elapsed: {:?})",
+            response.status(),
+            elapsed
+        );
+
+        let body = parse_json_body(response.into_body()).await;
+        assert_eq!(
+            body["code"], 504,
+            "Error body 'code' must be 504, got: {}",
+            body
+        );
+        assert_eq!(
+            body["type"], "runtime_timeout",
+            "Error body 'type' must be 'runtime_timeout', got: {}",
+            body
+        );
+
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "Request resolved too quickly ({:?}); polling deadline may not have been honoured",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "Request hung for {:?}; possible infinite loop regression",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn already_running_runtime_skips_cold_start_polling() {
+        require_docker!(state);
+
+        let hostname = state.config.hostname.clone();
+        let runtime_id = "cold-start-running-test";
+        let full_name = format!("{}-{}", hostname, runtime_id);
+
+        let mut running_runtime =
+            Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
+        running_runtime.mark_running("running");
+        running_runtime.set_listening();
+
+        state
+            .registry
+            .insert(running_runtime)
+            .await
+            .expect("failed to insert running runtime into registry");
+
+        let app = create_router(state);
+
+        let payload = serde_json::json!({
+            "body": "",
+            "path": "/",
+            "method": "GET",
+            "headers": {},
+            "timeout": 5
+        });
+
+        let start = Instant::now();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/runtimes/{}/executions", runtime_id))
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let elapsed = start.elapsed();
+
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "Got 404: runtime was not resolved from the registry (full_name: {})",
+            full_name
+        );
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "Request took {:?}, suggesting cold-start polling fired for a running runtime",
+            elapsed
+        );
+    }
+}
