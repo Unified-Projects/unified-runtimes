@@ -2,6 +2,7 @@
 
 mod keep_alive;
 mod protocol;
+pub(crate) mod readiness;
 mod registry;
 #[allow(clippy::module_inception)]
 mod runtime;

@@ -190,6 +190,7 @@ impl DockerManager {
                     );
                 }
                 Err(e) => {
+                    crate::telemetry::metrics().inc_network_attach_failure(network, container);
                     warn!(
                         "Failed to connect container {} to network {}: {}",
                         container, network, e

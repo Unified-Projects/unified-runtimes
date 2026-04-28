@@ -340,6 +340,9 @@ pub struct ExecutorConfig {
     pub retry_attempts: u32,
     #[allow(dead_code)]
     pub retry_delay_ms: u64,
+
+    /// When true, the server waits for warmup to complete before accepting requests.
+    pub warmup_required: bool,
 }
 
 impl ExecutorConfig {
@@ -457,6 +460,11 @@ impl ExecutorConfig {
             retry_delay_ms: env_urt_or_opr("RETRY_DELAY_MS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
+
+            // Warmup
+            warmup_required: env_urt_or_opr("WARMUP_REQUIRED")
+                .map(|v| parse_bool_flag(&v))
+                .unwrap_or(false),
         }
     }
 

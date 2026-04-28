@@ -2,8 +2,13 @@
 
 use crate::config::ExecutorConfig;
 use crate::docker::DockerManager;
+use crate::resilience::retry_with_backoff;
+use futures_util::StreamExt;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+/// Maximum concurrent image pulls (matches the pull_semaphore inside DockerManager).
+const WARMUP_CONCURRENCY: usize = 4;
 
 /// Pre-pull allowed runtime images on startup
 pub async fn run_warmup(docker: Arc<DockerManager>, config: ExecutorConfig) {
@@ -26,41 +31,43 @@ pub async fn run_warmup(docker: Arc<DockerManager>, config: ExecutorConfig) {
         expanded_runtimes.len()
     );
 
-    // Pull images concurrently (Bollard's pull_image handles semaphore internally)
-    let mut handles = Vec::new();
+    let mut success_count = 0usize;
+    let mut fail_count = 0usize;
 
-    for image in expanded_runtimes {
-        let docker = docker.clone();
+    // Pull images with bounded concurrency and per-image retry (M5, W1).
+    let results: Vec<bool> =
+        futures_util::stream::iter(expanded_runtimes.into_iter().map(|image| {
+            let docker = docker.clone();
+            async move {
+                info!("Pulling image: {}", image);
+                let outcome = retry_with_backoff("warmup_pull", 3, 500, |_| {
+                    let docker = docker.clone();
+                    let image = image.clone();
+                    async move { docker.pull_image(&image).await }
+                })
+                .await;
 
-        let handle = tokio::spawn(async move {
-            info!("Pulling image: {}", image);
-            match docker.pull_image(&image).await {
-                Ok(_) => {
-                    info!("Successfully pulled: {}", image);
-                    true
-                }
-                Err(e) => {
-                    warn!("Failed to pull {}: {}", image, e);
-                    false
+                match outcome {
+                    Ok(_) => {
+                        info!("Successfully pulled: {}", image);
+                        true
+                    }
+                    Err(e) => {
+                        warn!("Failed to pull {} after retries: {}", image, e);
+                        false
+                    }
                 }
             }
-        });
+        }))
+        .buffer_unordered(WARMUP_CONCURRENCY)
+        .collect()
+        .await;
 
-        handles.push(handle);
-    }
-
-    // Wait for all pulls to complete
-    let mut success_count = 0;
-    let mut fail_count = 0;
-
-    for handle in handles {
-        match handle.await {
-            Ok(true) => success_count += 1,
-            Ok(false) => fail_count += 1,
-            Err(e) => {
-                error!("Pull task panicked: {}", e);
-                fail_count += 1;
-            }
+    for ok in results {
+        if ok {
+            success_count += 1;
+        } else {
+            fail_count += 1;
         }
     }
 

@@ -353,6 +353,7 @@ fn is_live_container_state(state: &str, status: &str) -> bool {
 }
 
 async fn cleanup_runtime_artifacts(state: &AppState, full_name: &str) {
+    state.readiness_notify_and_remove(full_name);
     state.registry.remove(full_name).await;
     let tmp_folder = platform::temp_dir().join(full_name);
     tokio::fs::remove_dir_all(&tmp_folder).await.ok();
@@ -543,8 +544,12 @@ pub async fn create_runtime(
         keep_alive_id.clone(),
     );
 
-    // Register as pending
+    // Register as pending. The 409 from a concurrent create_runtime surfaces here
+    // before any notifier or Docker resource is allocated (M8).
     state.registry.insert(runtime.clone()).await?;
+    // Insert readiness notifier AFTER successful registry insertion so that the
+    // 409 path never creates a dangling notifier entry.
+    state.readiness_notifier(&full_name);
 
     // Register keep-alive ownership (if applicable)
     // This also revokes protection from any previous owner with the same ID
@@ -623,15 +628,30 @@ pub async fn create_runtime(
     }
 
     // Volume mounts - exactly matches Docker.php lines 471-479
-    let tmp_base = platform::temp_dir();
-    let tmp_folder = tmp_base.join(&full_name);
     let code_mount_path = if is_legacy_v2(&req.version) {
         "/usr/code"
     } else {
         "/mnt/code"
     };
 
-    // Create mount directories (Docker.php line 448)
+    // Canonicalize tmp_base first (L1) so all derived paths are consistent and
+    // the cleanup target matches what was created.
+    let tmp_base_raw = platform::temp_dir();
+    let canonical_tmp_base = tokio::fs::canonicalize(&tmp_base_raw).await.map_err(|e| {
+        ExecutorError::RuntimeFailed(format!("Failed to canonicalize temp base path: {}", e))
+    })?;
+    let tmp_folder = canonical_tmp_base.join(&full_name);
+
+    // Verify containment to prevent path-traversal via crafted runtime IDs.
+    if !tmp_folder.starts_with(&canonical_tmp_base) {
+        state.readiness_notify_and_remove(&full_name);
+        state.registry.remove(&full_name).await;
+        return Err(ExecutorError::BadRequest(
+            "Invalid runtime id leads to unsafe path".to_string(),
+        ));
+    }
+
+    // Create mount directories (Docker.php line 448) — derived from canonical base.
     let src_dir: PathBuf = tmp_folder.join("src");
     let builds_dir: PathBuf = tmp_folder.join("builds");
     if let Err(e) = tokio::fs::create_dir_all(&src_dir).await {
@@ -640,6 +660,7 @@ pub async fn create_runtime(
             src_dir.display(),
             e
         );
+        state.readiness_notify_and_remove(&full_name);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create source directory: {}",
@@ -653,6 +674,7 @@ pub async fn create_runtime(
             src_dir.display(),
             e
         );
+        state.readiness_notify_and_remove(&full_name);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set source directory permissions: {}",
@@ -665,6 +687,7 @@ pub async fn create_runtime(
             builds_dir.display(),
             e
         );
+        state.readiness_notify_and_remove(&full_name);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create builds directory: {}",
@@ -674,30 +697,13 @@ pub async fn create_runtime(
     // Set directory permissions to 0777 to allow tar extraction with preserved permissions
     if let Err(e) = platform::set_permissions_open(&builds_dir).await {
         error!("Failed to set builds directory permissions: {}", e);
+        state.readiness_notify_and_remove(&full_name);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set builds directory permissions: {}",
             e
         )));
     }
-
-    // Canonicalize now that directories exist, and verify containment within temp dir
-    let canonical_tmp_base = tokio::fs::canonicalize(&tmp_base).await.map_err(|e| {
-        ExecutorError::RuntimeFailed(format!("Failed to canonicalize temp base path: {}", e))
-    })?;
-    let canonical_tmp = tokio::fs::canonicalize(&tmp_folder).await.map_err(|e| {
-        ExecutorError::RuntimeFailed(format!("Failed to canonicalize runtime path: {}", e))
-    })?;
-    if !canonical_tmp.starts_with(&canonical_tmp_base) {
-        tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-        state.registry.remove(&full_name).await;
-        return Err(ExecutorError::BadRequest(
-            "Invalid runtime id leads to unsafe path".to_string(),
-        ));
-    }
-    let tmp_folder = canonical_tmp;
-    let src_dir = tmp_folder.join("src");
-    let builds_dir = tmp_folder.join("builds");
 
     // Copy source file from storage to local tmp (Docker.php lines 439-443)
     // This is required because Docker can only mount local paths
@@ -721,6 +727,7 @@ pub async fn create_runtime(
         .await
         {
             error!("Failed to download source: {}", e);
+            state.readiness_notify_and_remove(&full_name);
             state.registry.remove(&full_name).await;
             return Err(ExecutorError::RuntimeFailed(format!(
                 "Failed to copy source code: {}",
@@ -812,7 +819,7 @@ pub async fn create_runtime(
         }
         Err(e) => {
             error!("Failed to create container: {}", e);
-            // Remove from registry on failure
+            state.readiness_notify_and_remove(&full_name);
             state.registry.remove(&full_name).await;
             return Err(ExecutorError::RuntimeFailed(format!(
                 "Failed to create container: {}",
@@ -853,6 +860,7 @@ pub async fn create_runtime(
                     // Terminal failure states — no point retrying.
                     error!("Container reached terminal state: {}", info.state);
                     state.docker.remove_container(&full_name, true).await.ok();
+                    state.readiness_notify_and_remove(&full_name);
                     state.registry.remove(&full_name).await;
                     return Err(ExecutorError::RuntimeFailed(format!(
                         "Container exited with status: {}",
@@ -883,6 +891,7 @@ pub async fn create_runtime(
 
         error!("Container startup timed out, last status: {}", last_status);
         state.docker.remove_container(&full_name, true).await.ok();
+        state.readiness_notify_and_remove(&full_name);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Container startup timed out (last status: {})",
@@ -953,6 +962,7 @@ pub async fn create_runtime(
                     // On failure, cleanup and return error
                     state.docker.remove_container(&full_name, true).await.ok();
                     tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+                    state.readiness_notify_and_remove(&full_name);
                     state.registry.remove(&full_name).await;
 
                     let error_msg = if output_logs.is_empty() {
@@ -971,6 +981,7 @@ pub async fn create_runtime(
                 error!("Failed to execute build command: {}", e);
                 state.docker.remove_container(&full_name, true).await.ok();
                 tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+                state.readiness_notify_and_remove(&full_name);
                 state.registry.remove(&full_name).await;
                 return Err(ExecutorError::RuntimeFailed(format!(
                     "Failed to execute command: {}",
@@ -1048,6 +1059,7 @@ pub async fn create_runtime(
         // Delete local tmp folder
         tokio::fs::remove_dir_all(&tmp_folder).await.ok();
 
+        state.readiness_notify_and_remove(&full_name);
         // Remove from registry
         state.registry.remove(&full_name).await;
 
@@ -1066,6 +1078,7 @@ pub async fn create_runtime(
                 );
                 state.docker.remove_container(&full_name, true).await.ok();
                 tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+                state.readiness_notify_and_remove(&full_name);
                 state.registry.remove(&full_name).await;
                 return Err(ExecutorError::RuntimeFailed(
                     "Runtime port readiness check timed out".to_string(),
@@ -1074,7 +1087,18 @@ pub async fn create_runtime(
             updated_runtime.set_listening();
         }
         updated_runtime.mark_running("running");
-        state.registry.update(updated_runtime).await.ok();
+        if let Err(e) = state.registry.update(updated_runtime).await {
+            // Entry was concurrently removed (e.g. a racing DELETE). Wake any
+            // parked waiters first so they re-check and return a deterministic
+            // 404 rather than waiting to deadline, then tear down the orphaned
+            // container and working directory before propagating the error.
+            state.readiness_notify_and_remove(&full_name);
+            state.docker.remove_container(&full_name, true).await.ok();
+            tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+            return Err(e);
+        }
+        // Notify after registry.update so that woken waiters find a non-pending entry.
+        state.readiness_notify_and_remove(&full_name);
     }
 
     // If a keep-alive ID was transferred, clean up the previous owner now that
@@ -1120,10 +1144,9 @@ pub async fn get_runtime(
 ) -> Result<Json<Runtime>> {
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
-    // Sync status from Docker before returning
-    // First try to sync, then fall back to registry lookup.
-    // If missing, attempt re-adoption for resilience after executor restarts.
-    let runtime = if let Some(rt) = state.registry.sync_status(&full_name, &state.docker).await {
+    // Sync status from Docker once, then fall back to registry lookup (M3).
+    let synced = state.registry.sync_status(&full_name, &state.docker).await;
+    let runtime = if let Some(rt) = synced {
         rt
     } else if let Some(rt) = state.registry.get(&full_name).await {
         rt
@@ -1137,12 +1160,15 @@ pub async fn get_runtime(
         )
         .await;
 
-        if let Some(rt) = state.registry.sync_status(&full_name, &state.docker).await {
-            rt
-        } else if let Some(rt) = state.registry.get(&full_name).await {
-            rt
-        } else {
-            return Err(ExecutorError::RuntimeNotFound);
+        {
+            let after_adopt_synced = state.registry.sync_status(&full_name, &state.docker).await;
+            if let Some(rt) = after_adopt_synced {
+                rt
+            } else if let Some(rt) = state.registry.get(&full_name).await {
+                rt
+            } else {
+                return Err(ExecutorError::RuntimeNotFound);
+            }
         }
     };
 
@@ -1199,6 +1225,7 @@ pub async fn delete_runtime(
     }
 
     // Registry is metadata only; remove last (idempotent)
+    state.readiness_notify_and_remove(&full_name);
     state.registry.remove(&full_name).await;
 
     info!("Delete runtime finished: {}", full_name);

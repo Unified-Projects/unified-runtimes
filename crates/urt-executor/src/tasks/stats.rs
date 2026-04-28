@@ -5,11 +5,15 @@
 
 use crate::docker::{DockerManager, StatsSnapshot};
 use crate::runtime::RuntimeRegistry;
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::debug;
+
+/// Maximum concurrent Docker stats calls (M7).
+const STATS_CONCURRENCY: usize = 20;
 
 /// Run the stats collector
 ///
@@ -43,29 +47,32 @@ pub async fn run_stats_collector(
 
 /// Collect stats for all active runtimes using batch updates
 ///
-/// This function collects all stats first, then performs a single
-/// atomic update to the cache. This is more efficient than multiple
-/// individual updates and ensures consistent reads.
+/// This function collects all stats first using bounded concurrency, then
+/// performs a single atomic update to the cache.
 async fn collect_stats(docker: &DockerManager, registry: &RuntimeRegistry) {
     // Collect host stats (use default if unavailable)
     let host_stats = docker.get_host_stats().await.unwrap_or_default();
 
-    // Collect all container stats into a map
+    // Collect all container stats with bounded concurrency (M7).
     let runtimes = registry.list().await;
-    let mut container_map = HashMap::new();
 
-    for runtime in runtimes {
-        if runtime.is_running() {
-            match docker.get_container_stats(&runtime.name).await {
-                Ok(stats) => {
-                    container_map.insert(runtime.name.clone(), stats);
-                }
-                Err(e) => {
-                    debug!("Failed to get stats for {}: {}", runtime.name, e);
+    let container_map: HashMap<String, _> =
+        futures_util::stream::iter(runtimes.into_iter().filter(|r| r.is_running()).map(|rt| {
+            let docker = docker.clone();
+            async move {
+                match docker.get_container_stats(&rt.name).await {
+                    Ok(stats) => Some((rt.name, stats)),
+                    Err(e) => {
+                        debug!("Failed to get stats for {}: {}", rt.name, e);
+                        None
+                    }
                 }
             }
-        }
-    }
+        }))
+        .buffer_unordered(STATS_CONCURRENCY)
+        .filter_map(|x| async move { x })
+        .collect()
+        .await;
 
     // Single atomic update - replaces entire snapshot at once
     let snapshot = StatsSnapshot::from_parts(host_stats, container_map);

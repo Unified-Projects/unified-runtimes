@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::collections::HashMap;
+use std::time::Duration;
 use tempfile::tempdir;
 use tracing::{debug, info};
 
@@ -37,6 +38,7 @@ pub struct BuildResponse {
 /// - dockerfile: (optional) Dockerfile content
 /// - buildArgs: (optional) JSON object of build arguments
 /// - cacheEnabled: (optional) Whether to enable layer caching (default: true)
+/// - timeout: (optional) Build timeout in seconds (1-900, default: 300)
 pub async fn build_runtime(
     State(state): State<AppState>,
     Path(runtime_id): Path<String>,
@@ -66,6 +68,7 @@ pub async fn build_runtime(
     let mut dockerfile: Option<String> = None;
     let mut build_args: HashMap<String, String> = HashMap::new();
     let mut cache_enabled = true;
+    let mut timeout_secs: u64 = 300;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         ExecutorError::ExecutionBadRequest(format!("Failed to read multipart field: {}", e))
@@ -109,6 +112,22 @@ pub async fn build_runtime(
                 })?;
                 cache_enabled = text.to_lowercase() != "false";
             }
+            "timeout" => {
+                let text = field.text().await.map_err(|e| {
+                    ExecutorError::ExecutionBadRequest(format!("Failed to read timeout: {}", e))
+                })?;
+                let parsed: u64 = text.trim().parse().map_err(|_| {
+                    ExecutorError::ExecutionBadRequest(
+                        "timeout must be a positive integer".to_string(),
+                    )
+                })?;
+                if !(1..=900).contains(&parsed) {
+                    return Err(ExecutorError::ExecutionBadRequest(
+                        "timeout must be between 1 and 900 seconds".to_string(),
+                    ));
+                }
+                timeout_secs = parsed;
+            }
             _ => {
                 debug!("Ignoring unknown field: {}", name);
             }
@@ -145,11 +164,18 @@ pub async fn build_runtime(
     // Create build cache using the configured storage backend
     let build_cache = BuildCache::new(state.storage.clone(), "builds");
 
-    // Build the image
-    let result = state
+    // Run build with per-request deadline (M2).
+    let build_path = build_dir.path().to_path_buf();
+    let build_fut = state
         .docker
-        .build_image(build_dir.path(), &request, Some(&build_cache))
-        .await?;
+        .build_image(&build_path, &request, Some(&build_cache));
+
+    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), build_fut).await {
+        Ok(inner) => inner?,
+        Err(_) => {
+            return Err(ExecutorError::BuildTimeout);
+        }
+    };
 
     info!(
         "Built image {} in {:.2}s (cache_hit={})",

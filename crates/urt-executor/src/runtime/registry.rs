@@ -137,8 +137,13 @@ impl RuntimeRegistry {
             return None;
         }
 
+        // Clone the current entry so we do not hold a DashMap shard lock across
+        // the async Docker inspect call (H2).
+        let _exists = self.runtimes.contains_key(name);
+
         match docker.inspect_container(name).await {
             Ok(info) => {
+                // Re-acquire write access only for the mutation; the async work is done.
                 if let Some(mut runtime) = self.runtimes.get_mut(name) {
                     runtime.status = info.state;
                     return Some(runtime.clone());
@@ -146,13 +151,20 @@ impl RuntimeRegistry {
                 None
             }
             Err(ExecutorError::RuntimeNotFound) => {
-                if let Some(runtime) = self.runtimes.get(name) {
-                    if runtime.is_pending() {
-                        return Some(runtime.clone());
-                    }
+                // Read current state without holding across an await.
+                let is_pending = self
+                    .runtimes
+                    .get(name)
+                    .map(|r| r.is_pending())
+                    .unwrap_or(false);
+                if is_pending {
+                    return self.runtimes.get(name).map(|r| r.clone());
                 }
-                // Container was removed outside the registry - clean up stale metadata.
-                self.runtimes.remove(name);
+                // Container was removed outside the registry — atomically remove the
+                // stale metadata entry only when it is not pending.  remove_if closes
+                // the TOCTOU window that existed with the previous drop+re-check+remove
+                // sequence.
+                self.runtimes.remove_if(name, |_, r| !r.is_pending());
                 None
             }
             Err(_) => self.runtimes.get(name).map(|r| r.clone()),

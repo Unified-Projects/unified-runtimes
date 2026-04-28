@@ -6,10 +6,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["Unified Runtimes Contributors"]
-license = "MIT"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/open-runtimes/unified-runtimes"
 
 [workspace.dependencies]

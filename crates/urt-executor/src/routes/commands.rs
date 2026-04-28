@@ -2,8 +2,8 @@
 
 use super::AppState;
 use crate::error::{ExecutorError, Result};
+use crate::runtime::readiness::resolve_runtime_with_readiness;
 use crate::runtime::Runtime;
-use crate::tasks;
 use axum::{
     extract::{Path, State},
     Json,
@@ -92,7 +92,7 @@ pub async fn exec_command(
         .map_err(|e| ExecutorError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
-    let runtime = resolve_runtime(&state, &full_name).await?;
+    let runtime = resolve_runtime(&state, &full_name, &req).await?;
 
     info!("Executing command in {}: {}", full_name, req.command);
 
@@ -105,10 +105,6 @@ pub async fn exec_command(
 
     // Validate command for injection attacks
     validate_command(&req.command)?;
-
-    if runtime.is_pending() {
-        return Err(ExecutorError::RuntimeTimeout);
-    }
 
     state.registry.touch(&full_name).await.ok();
 
@@ -139,31 +135,10 @@ pub async fn exec_command(
     }))
 }
 
-async fn resolve_runtime(state: &AppState, full_name: &str) -> Result<Runtime> {
-    if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
-        return Ok(runtime);
-    }
-
-    if let Some(runtime) = state.registry.get(full_name).await {
-        return Ok(runtime);
-    }
-
-    let _ = tasks::adopt_container_by_name(
-        &state.docker,
-        &state.registry,
-        &state.keep_alive_registry,
-        &state.config.hostname,
-        full_name,
-    )
-    .await;
-
-    if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
-        return Ok(runtime);
-    }
-
-    state
-        .registry
-        .get(full_name)
-        .await
-        .ok_or(ExecutorError::RuntimeNotFound)
+async fn resolve_runtime(
+    state: &AppState,
+    full_name: &str,
+    req: &CommandRequest,
+) -> Result<Runtime> {
+    resolve_runtime_with_readiness(state, full_name, req.timeout as u64, true).await
 }
