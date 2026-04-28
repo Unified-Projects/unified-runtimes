@@ -10,7 +10,6 @@ use crate::error::{ExecutorError, Result};
 use crate::execution_counter::ExecutionGuard;
 use crate::resilience::retry_with_backoff;
 use crate::runtime::{get_protocol, wait_for_runtime_port, ExecuteRequest, ExecuteResponse};
-use crate::tasks;
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
     body::Body,
@@ -553,62 +552,12 @@ async fn resolve_runtime(
     full_name: &str,
     req: &ExecutionRequest,
 ) -> Result<crate::runtime::Runtime> {
-    if let Some(runtime) = state.registry.get(full_name).await {
-        if runtime.is_pending() {
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(req.timeout as u64);
-            let mut retry_delay = std::time::Duration::from_millis(50);
-            let max_retry_delay = std::time::Duration::from_millis(500);
-            loop {
-                state.registry.sync_status(full_name, &state.docker).await;
-                match state.registry.get(full_name).await {
-                    Some(updated) if !updated.is_pending() => return Ok(updated),
-                    Some(_) => {}
-                    None => break,
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(ExecutorError::RuntimeTimeout);
-                }
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(max_retry_delay);
-            }
-        } else {
-            return Ok(runtime);
-        }
-    }
+    use crate::runtime::readiness::resolve_runtime_with_readiness;
 
-    // If runtime metadata is missing (e.g., executor restart), attempt on-demand re-adoption.
-    let _ = tasks::adopt_container_by_name(
-        &state.docker,
-        &state.registry,
-        &state.keep_alive_registry,
-        &state.config.hostname,
-        full_name,
-    )
-    .await;
-
-    if let Some(runtime) = state.registry.get(full_name).await {
-        if runtime.is_pending() {
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(req.timeout as u64);
-            let mut retry_delay = std::time::Duration::from_millis(50);
-            let max_retry_delay = std::time::Duration::from_millis(500);
-            loop {
-                state.registry.sync_status(full_name, &state.docker).await;
-                match state.registry.get(full_name).await {
-                    Some(updated) if !updated.is_pending() => return Ok(updated),
-                    Some(_) => {}
-                    None => return Err(ExecutorError::RuntimeNotFound),
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(ExecutorError::RuntimeTimeout);
-                }
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(max_retry_delay);
-            }
-        }
-
-        return Ok(runtime);
+    match resolve_runtime_with_readiness(state, full_name, req.timeout as u64, true).await {
+        Ok(rt) => return Ok(rt),
+        Err(ExecutorError::RuntimeNotFound) => {}
+        Err(e) => return Err(e),
     }
 
     // On-the-fly creation if image is provided
@@ -643,6 +592,8 @@ async fn resolve_runtime(
     )
     .await?;
 
+    // create_runtime completes synchronously (the runtime is already running or
+    // removed by the time it returns Ok). A single registry.get is sufficient.
     state
         .registry
         .get(full_name)

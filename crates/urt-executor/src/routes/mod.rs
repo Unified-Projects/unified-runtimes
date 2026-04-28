@@ -22,8 +22,9 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 /// Shared application state
 #[derive(Clone)]
@@ -38,6 +39,39 @@ pub struct AppState {
     pub runtime_create_limiter: Option<Arc<Semaphore>>,
     pub execution_limiter_capacity: Option<usize>,
     pub runtime_create_limiter_capacity: Option<usize>,
+    /// Per-runtime readiness notifiers. Inserted when a runtime enters pending state,
+    /// fired (notify_waiters) and removed when it leaves pending (success or failure).
+    pub readiness: Arc<DashMap<String, Arc<Notify>>>,
+}
+
+impl AppState {
+    /// Return the existing notifier for `name`, or create and insert a new one.
+    /// Used exclusively by the runtime *inserter* (create_runtime).  Callers
+    /// that need to park on a pending runtime acquire the notifier before
+    /// re-checking the registry so they cannot miss a wakeup that fires between
+    /// the check and the park.
+    pub fn readiness_notifier(&self, name: &str) -> Arc<Notify> {
+        self.readiness
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    /// Return the existing notifier for `name` without creating one.
+    /// Returns `None` when no pending entry exists for `name`, which prevents
+    /// dangling DashMap entries for requests targeting non-existent runtimes.
+    pub fn readiness_notifier_existing(&self, name: &str) -> Option<Arc<Notify>> {
+        self.readiness.get(name).map(|n| n.clone())
+    }
+
+    /// Wake all waiters parked on `name` and remove the entry from the map.
+    /// Must be called BEFORE removing the registry entry so that woken waiters
+    /// can observe the registry state (present-and-non-pending, or absent).
+    pub fn readiness_notify_and_remove(&self, name: &str) {
+        if let Some((_, notify)) = self.readiness.remove(name) {
+            notify.notify_waiters();
+        }
+    }
 }
 
 /// Create the main router with all routes

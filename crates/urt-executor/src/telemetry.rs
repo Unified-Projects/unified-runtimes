@@ -76,6 +76,9 @@ pub struct ExecutorMetrics {
     keep_alive_cleanup_total: IntCounterVec,
     retry_attempts_total: IntCounterVec,
     errors_total: IntCounterVec,
+    network_attach_failures_total: IntCounterVec,
+    readiness_wait_seconds: HistogramVec,
+    readiness_timeout_total: IntCounter,
 }
 
 impl ExecutorMetrics {
@@ -309,6 +312,32 @@ impl ExecutorMetrics {
         )
         .expect("failed to register errors_total");
 
+        let network_attach_failures_total = Self::register_int_counter_vec(
+            &registry,
+            "urt_executor_network_attach_failures_total",
+            "Number of secondary network attach failures",
+            &["network"],
+        )
+        .expect("failed to register network_attach_failures_total");
+
+        let readiness_wait_seconds = Self::register_histogram_vec(
+            &registry,
+            "urt_executor_readiness_wait_seconds",
+            "Time spent waiting for a runtime to leave pending state",
+            &["outcome"],
+            vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
+            ],
+        )
+        .expect("failed to register readiness_wait_seconds");
+
+        let readiness_timeout_total = Self::register_int_counter(
+            &registry,
+            "urt_executor_readiness_timeout_total",
+            "Number of readiness waits that timed out before the runtime was ready",
+        )
+        .expect("failed to register readiness_timeout_total");
+
         Self {
             registry,
             runtimes_total,
@@ -334,6 +363,9 @@ impl ExecutorMetrics {
             keep_alive_cleanup_total,
             retry_attempts_total,
             errors_total,
+            network_attach_failures_total,
+            readiness_wait_seconds,
+            readiness_timeout_total,
         }
     }
 
@@ -425,6 +457,22 @@ impl ExecutorMetrics {
 
     pub fn inc_error_class(&self, route: &str, class: &str) {
         self.errors_total.with_label_values(&[route, class]).inc();
+    }
+
+    pub fn inc_network_attach_failure(&self, network: &str, _container: &str) {
+        self.network_attach_failures_total
+            .with_label_values(&[network])
+            .inc();
+    }
+
+    pub fn observe_readiness_wait(&self, outcome: &str, duration: Duration) {
+        self.readiness_wait_seconds
+            .with_label_values(&[outcome])
+            .observe(duration.as_secs_f64());
+    }
+
+    pub fn inc_readiness_timeout(&self) {
+        self.readiness_timeout_total.inc();
     }
 
     pub fn encode(&self) -> Result<(String, Vec<u8>), String> {

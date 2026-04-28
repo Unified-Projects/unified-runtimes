@@ -129,6 +129,7 @@ fn test_config(network: String) -> ExecutorConfig {
         logging_config: None,
         retry_attempts: 5,
         retry_delay_ms: 500,
+        warmup_required: false,
     }
 }
 
@@ -343,6 +344,7 @@ async fn create_test_server_with(
         runtime_create_limiter: None,
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
+        readiness: std::sync::Arc::new(dashmap::DashMap::new()),
     };
 
     // Bind to random available port
@@ -1472,6 +1474,7 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
         runtime_create_limiter: None,
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
+        readiness: std::sync::Arc::new(dashmap::DashMap::new()),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")

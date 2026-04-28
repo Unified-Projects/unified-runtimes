@@ -4,8 +4,10 @@ use crate::config::ExecutorConfig;
 use crate::docker::container::ContainerInfo;
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;
+use crate::resilience::retry_with_backoff;
 use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime, RuntimeRegistry};
 use crate::storage::{BuildCache, Storage};
+use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -230,7 +232,12 @@ async fn adopt_inspected_container(
 }
 
 async fn remove_container_for_cleanup(docker: &DockerManager, name: &str, context: &str) -> bool {
-    match docker.remove_container(name, true).await {
+    let result = retry_with_backoff("remove_container_cleanup", 3, 100, |_| async {
+        docker.remove_container(name, true).await
+    })
+    .await;
+
+    match result {
         Ok(_) => true,
         Err(ExecutorError::RuntimeNotFound) => true,
         Err(e) => {
@@ -290,44 +297,70 @@ pub async fn adopt_existing_containers(
     // Oldest first so keep-alive ownership naturally settles on the newest runtime.
     containers.sort_by_key(|c| c.created);
 
+    // Filter to candidates before issuing any network calls.
+    let candidates: Vec<ContainerInfo> = containers
+        .into_iter()
+        .filter(|c| {
+            if !belongs_to_hostname(c, hostname) {
+                debug!(
+                    "Skipping managed container {} during adoption for hostname {}",
+                    c.name, hostname
+                );
+                return false;
+            }
+            if !is_container_running(c) {
+                debug!(
+                    "Skipping non-running container {} (state: {}, status: {})",
+                    c.name, c.state, c.status
+                );
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        debug!("No existing containers to adopt");
+        return;
+    }
+
+    // Fan out Docker inspect calls in parallel, capped to avoid overwhelming the socket (H3).
+    let concurrency = 16_usize.min(num_cpus::get().saturating_mul(2).max(4));
+
+    let results: Vec<(String, Option<ContainerInfo>)> =
+        futures_util::stream::iter(candidates.into_iter().map(|c| {
+            let docker = docker.clone();
+            async move {
+                // Skip if registry already has this container (checked again after fanout).
+                let name = c.name.clone();
+                match docker.inspect_container(&name).await {
+                    Ok(info) => (name, Some(info)),
+                    Err(e) => {
+                        warn!(
+                            "Failed to inspect container {} during adoption: {}",
+                            name, e
+                        );
+                        (name, None)
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
     let mut adopted_count = 0usize;
 
-    for container in containers {
-        let name = container.name.clone();
-
-        if !belongs_to_hostname(&container, hostname) {
-            debug!(
-                "Skipping managed container {} during adoption for hostname {}",
-                name, hostname
-            );
-            continue;
-        }
-
-        // Skip if already in registry
+    for (name, maybe_info) in results {
+        // Skip if already in registry (could have been inserted by a concurrent call).
         if registry.exists(&name).await {
             debug!("Container {} already in registry, skipping", name);
             continue;
         }
 
-        // Only adopt live containers.
-        if !is_container_running(&container) {
-            debug!(
-                "Skipping non-running container {} (state: {}, status: {})",
-                name, container.state, container.status
-            );
-            continue;
-        }
-
-        // Use inspect to recover runtime secrets/hostname/env used by active runtimes.
-        let inspected = match docker.inspect_container(&name).await {
-            Ok(info) => info,
-            Err(e) => {
-                warn!(
-                    "Failed to inspect container {} during adoption: {}",
-                    name, e
-                );
-                continue;
-            }
+        let inspected = match maybe_info {
+            Some(info) => info,
+            None => continue,
         };
 
         if !is_container_running(&inspected) {
@@ -377,12 +410,22 @@ pub async fn run_maintenance<S: Storage + 'static>(
                 }
             }
             _ = tokio::time::sleep(interval) => {
+                // Fetch the managed-container list once and share it across both
+                // cleanup functions to avoid duplicate Docker API calls (M4).
+                let managed_containers = match docker.list_containers(Some("urt.managed=true")).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to list managed containers for maintenance: {}", e);
+                        vec![]
+                    }
+                };
+
                 // Always check for orphaned keepalive containers (runs regardless of keep_alive setting)
                 // This catches cases where a container was replaced but previous owner wasn't cleaned up
-                cleanup_orphaned_keepalive(&docker, &registry, &keep_alive_registry, &config.hostname).await;
+                cleanup_orphaned_keepalive(&docker, &registry, &keep_alive_registry, &config.hostname, &managed_containers).await;
 
                 cleanup_idle(&docker, &registry, &keep_alive_registry, config.inactive_threshold).await;
-                cleanup_untracked_managed_containers(&docker, &registry, &config.hostname).await;
+                cleanup_untracked_managed_containers(&docker, &registry, &config.hostname, &managed_containers).await;
 
                 if config.keep_alive {
                     let count = registry.count().await;
@@ -443,10 +486,17 @@ async fn cleanup_idle(
         return;
     }
 
-    // Filter out runtimes that are protected by keep-alive ownership
+    // Filter out runtimes that are protected by keep-alive ownership or still pending
     let runtimes_to_cleanup: Vec<_> = idle_runtimes
         .into_iter()
         .filter(|runtime| {
+            if runtime.is_pending() {
+                debug!(
+                    "Skipping cleanup of {} - still in pending state",
+                    runtime.name
+                );
+                return false;
+            }
             // If runtime has a keep_alive_id AND owns it, skip cleanup
             if let Some(ref ka_id) = runtime.keep_alive_id {
                 if keep_alive_registry.is_owner(ka_id, &runtime.name) {
@@ -509,20 +559,10 @@ async fn cleanup_untracked_managed_containers(
     docker: &DockerManager,
     registry: &RuntimeRegistry,
     hostname: &str,
+    containers: &[ContainerInfo],
 ) {
-    let containers = match docker.list_containers(Some("urt.managed=true")).await {
-        Ok(containers) => containers,
-        Err(error) => {
-            warn!(
-                "Failed to list containers for untracked managed cleanup: {}",
-                error
-            );
-            return;
-        }
-    };
-
     for container in containers {
-        if !belongs_to_hostname(&container, hostname) {
+        if !belongs_to_hostname(container, hostname) {
             continue;
         }
 
@@ -530,7 +570,7 @@ async fn cleanup_untracked_managed_containers(
             continue;
         }
 
-        if let Some(keep_alive_id) = keep_alive_id_from_container(&container) {
+        if let Some(keep_alive_id) = keep_alive_id_from_container(container) {
             debug!(
                 "Skipping untracked managed container {} because it carries keep-alive ID '{}'",
                 container.name, keep_alive_id
@@ -556,23 +596,14 @@ async fn cleanup_untracked_managed_containers(
 ///
 /// This function handles cases where a container with a keep_alive_id was
 /// replaced by a new runtime but the previous owner wasn't cleaned up.
-/// It queries Docker directly for managed containers and compares against
-/// the keep_alive registry to find orphaned containers.
+/// It uses the pre-fetched container list from the maintenance cycle (M4).
 async fn cleanup_orphaned_keepalive(
     docker: &DockerManager,
     registry: &RuntimeRegistry,
     keep_alive_registry: &KeepAliveRegistry,
     hostname: &str,
+    containers: &[ContainerInfo],
 ) {
-    // Get all managed containers from Docker
-    let containers = match docker.list_containers(Some("urt.managed=true")).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Failed to list containers for orphaned cleanup: {}", e);
-            return;
-        }
-    };
-
     if containers.is_empty() {
         return;
     }
@@ -581,7 +612,7 @@ async fn cleanup_orphaned_keepalive(
     let mut by_keep_alive: HashMap<String, Vec<ContainerInfo>> = HashMap::new();
 
     for container in containers {
-        if !belongs_to_hostname(&container, hostname) {
+        if !belongs_to_hostname(container, hostname) {
             continue;
         }
 
@@ -592,7 +623,10 @@ async fn cleanup_orphaned_keepalive(
             .cloned()
             .filter(|v| !v.is_empty())
         {
-            by_keep_alive.entry(ka_id).or_default().push(container);
+            by_keep_alive
+                .entry(ka_id)
+                .or_default()
+                .push(container.clone());
         }
     }
 
@@ -653,6 +687,19 @@ async fn cleanup_orphaned_keepalive(
             if !owner.is_empty() && container.name == owner {
                 // Keep live owner.
                 continue;
+            }
+
+            // Skip containers whose registry entry is actively pending — they are
+            // in the middle of create_runtime and must not be torn down here.
+            // This mirrors the invariant established in cleanup_idle.
+            if let Some(rt) = registry.get(&container.name).await {
+                if rt.is_pending() {
+                    debug!(
+                        "Skipping orphaned keep-alive cleanup of {} — still pending in registry",
+                        container.name
+                    );
+                    continue;
+                }
             }
 
             info!(

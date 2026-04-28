@@ -3,6 +3,7 @@
 //! A high-performance executor for managing containerized function runtimes
 //! with full API compatibility with the PHP OpenRuntimes Executor.
 
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -81,6 +82,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Host: {}:{}", config.host, config.port);
     info!("  Keep-alive: {}", config.keep_alive);
     info!("  Autoscale: {}", config.autoscale);
+    info!("  Warmup required: {}", config.warmup_required);
     info!(
         "  Eager runtime readiness: {}",
         config.eager_runtime_readiness
@@ -152,6 +154,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Aggressively tuned for maximum throughput and minimum latency
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
+        .connect_timeout(Duration::from_secs(5))
         .pool_max_idle_per_host(500)
         .pool_idle_timeout(Duration::from_secs(300))
         .tcp_keepalive(Duration::from_secs(15))
@@ -221,26 +224,37 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let (runtime_create_limiter, runtime_create_limiter_capacity): (
         Option<Arc<Semaphore>>,
         Option<usize>,
-    ) = if config.autoscale {
-        let default_limit = num_cpus::get().saturating_mul(4).max(4);
+    ) = {
+        let default_limit = if config.autoscale {
+            num_cpus::get().saturating_mul(4).max(4)
+        } else {
+            // Always apply a static cap when autoscale is off to prevent unbounded
+            // concurrent runtime creates (M10).
+            num_cpus::get().max(4)
+        };
         let limit = config
             .max_concurrent_runtime_creates
             .unwrap_or(default_limit)
             .max(1);
         (Some(Arc::new(Semaphore::new(limit))), Some(limit))
-    } else {
-        (None, None)
     };
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Spawn background tasks
+    // Spawn warmup task. When warmup_required=true, await it before binding the
+    // listener so the server only accepts requests once all images are pulled (W1).
     let warmup_docker = docker.clone();
     let warmup_config = config.clone();
-    tokio::spawn(async move {
+    let warmup_handle = tokio::spawn(async move {
         tasks::run_warmup(warmup_docker, warmup_config).await;
     });
+
+    if config.warmup_required {
+        info!("Waiting for warmup to complete (URT_WARMUP_REQUIRED=true)...");
+        warmup_handle.await.ok();
+        info!("Warmup complete, proceeding to bind listener");
+    }
 
     let maintenance_docker = docker.clone();
     let maintenance_registry = registry.clone();
@@ -279,6 +293,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_create_limiter,
         execution_limiter_capacity,
         runtime_create_limiter_capacity,
+        readiness: Arc::new(DashMap::new()),
     };
 
     // Create router

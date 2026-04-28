@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-28
+
+### Fixed
+- **Notify-based readiness gate (replaces poll-based fix from 0.3.1)**: `resolve_runtime` now parks waiters on a per-runtime `tokio::sync::Notify` keyed in a new `AppState.readiness` map and wakes them when `create_runtime` transitions the registry entry out of pending. Eliminates per-request Docker `inspect_container` polling on the hot path. Concurrent first-execution storms (50+ waiters) wake from a single `notify_waiters()` call, no fan-out to the Docker daemon. Pre-insert (R1) waiters are handled by a bounded sub-deadline plain-poll fallback.
+- **Readiness gate applied to commands and logs routes**: `routes/commands.rs::resolve_runtime` previously returned `RuntimeTimeout` immediately when the registry entry was pending; now waits up to the request `timeout`. `routes/logs.rs::resolve_runtime` previously had a hardcoded 2-second grace window; now uses the validated `timeout_secs` query parameter and the shared readiness helper. Both routes now route through `runtime::readiness::resolve_runtime_with_readiness`.
+- **DashMap shard locks no longer held across `await`**: `runtime::registry::sync_status` previously held a `get_mut` shard guard across `docker.inspect_container().await`, serialising every key on the same shard for the duration of the Docker RPC. Restructured to release the guard before the await and re-acquire only for the synchronous mutation.
+- **Pending runtimes never removed by maintenance**: `cleanup_idle`, `cleanup_orphaned_keepalive`, and `sync_status` now skip entries with `is_pending() == true`, preventing parked execution waiters from observing a spurious `RuntimeNotFound` while `create_runtime` is still in flight. `sync_status` uses an atomic `DashMap::remove_if` to close the prior TOCTOU window.
+- **`registry.update` errors no longer swallowed**: `routes/runtimes.rs::create_runtime` previously called `.ok()` on the success-path `registry.update`, which silently orphaned the Docker container if the registry entry had been concurrently removed. Errors now propagate; the failure path tears down the container, removes the tmp folder, and fires `readiness_notify_and_remove` so any parked waiters get a deterministic 404 instead of waiting to deadline.
+- **Atomic check-and-insert in `create_runtime`**: `registry.insert` now runs before `readiness_notifier(name)`, so a duplicate concurrent create returns `RuntimeConflict` (409) before any notifier or container resource is allocated. The R1 fallback in the readiness helper continues to handle waiters that arrive in the narrow window between `insert` and `notifier`.
+- **`tmp_folder` path canonicalisation**: moved to the top of the volume-mount setup in `routes/runtimes.rs` so cleanup paths derive from the canonical base on hosts where `/var` is symlinked to `/private/var` (macOS), preventing stray temp directories on extraction failure.
+
+### Changed
+- **Parallel container adoption on startup**: `tasks::maintenance::adopt_existing_containers` previously issued `docker.inspect_container` calls for every managed container in series; now fans out via `futures::stream::buffer_unordered(min(16, num_cpus*2).max(4))`. Restart adoption time scales O(n / concurrency) instead of O(n).
+- **Parallel runtime stats collection**: `tasks::stats::collect_stats` parallelises `get_container_stats` calls via `buffer_unordered(20)`.
+- **Concurrency-bounded warmup**: `tasks::warmup::run_warmup` no longer spawns one task per image; uses `buffer_unordered(4)` with `resilience::retry_with_backoff` (3 attempts) per pull, matching the existing `pull_semaphore` capacity.
+- **Single `list_containers` per maintenance cycle**: `run_maintenance` now calls `docker.list_containers(Some("urt.managed=true"))` once and threads `&[ContainerInfo]` to both `cleanup_orphaned_keepalive` and `cleanup_untracked_managed_containers`, halving the cycle's Docker RPC count.
+- **Lower-cadence `sync_status` in log streaming**: `routes/logs.rs` log-buffer polling continues at 100ms but `sync_status` is only called every 3s (`LOG_SYNC_STATUS_INTERVAL`), eliminating the 2 RPC/100ms hot path under many concurrent streams.
+- **`runtime_create_limiter` is always `Some`**: when `autoscale=false`, the create-runtime semaphore now holds `max(4, num_cpus)` permits instead of being unset, providing default backpressure against Docker daemon overload from create bursts.
+- **Connect timeout on the runtime HTTP client**: `reqwest::Client::builder()` in `main.rs` now sets `.connect_timeout(Duration::from_secs(5))` so dead containers cannot hold connection slots open up to the full request deadline.
+- **Per-request build timeout**: `routes/build.rs` accepts an optional `timeout` multipart field (1-900s, default 300s) and wraps `docker.build_image` in `tokio::time::timeout`. New `ExecutorError::BuildTimeout` variant maps to HTTP 504; existing build response schema preserved.
+- **Retry-wrapped maintenance container removal**: `remove_container_for_cleanup` wraps `docker.remove_container` in `resilience::retry_with_backoff` (3 attempts, 100ms base). `RuntimeNotFound` is treated as terminal-success and not retried.
+
+### Added
+- **Optional blocking warmup**: `URT_WARMUP_REQUIRED` (default `false`). When `true`, the executor awaits image pre-pulls before binding the listener, eliminating cold-pull latency from the first wave of requests after startup. When `false`, warmup remains a background task as before.
+- **Readiness-gate observability**: new histogram `urt_executor_readiness_wait_seconds` (label `outcome`=`ready`|`timeout`|`absent`), counter `urt_executor_readiness_timeout_total`, counter `urt_executor_network_attach_failures_total`. `wait_for_pending` records on every exit path so wait-time distribution and 504-from-readiness can be alerted on independently of network-side 504s.
+- **Network-attach failure metric**: `docker::manager::connect_container_to_networks` increments `urt_executor_network_attach_failures_total{network, container}` on secondary network attach failure (existing best-effort behaviour preserved, now observable).
+- **Shared readiness helper module**: new `crates/urt-executor/src/runtime/readiness.rs` exposing `pub(crate) wait_for_pending` and `pub(crate) async fn resolve_runtime_with_readiness`. Used by `executions.rs`, `commands.rs`, and `logs.rs` to deduplicate the readiness-gate logic.
+- **18 new integration tests** under `tests/integration.rs` (`mod readiness_gate` and `mod audit_fixes`) covering: cold-start readiness, 504 timeout, 50-waiter storm, removal-while-waiting, pending-not-cleaned, notifier consistency, R1 pre-insert wake, commands/logs readiness wait, build-timeout error mapping, parallel adoption fan-out primitive, atomic create-runtime insert, readiness metric increment, `URT_WARMUP_REQUIRED` config parsing, retry-wrap transient handling.
+
 ## [0.3.1] - 2026-04-16
 
 ### Fixed

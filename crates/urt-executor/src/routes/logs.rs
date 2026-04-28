@@ -6,8 +6,8 @@
 use super::AppState;
 use crate::error::{ExecutorError, Result};
 use crate::platform;
+use crate::runtime::readiness::resolve_runtime_with_readiness;
 use crate::runtime::Runtime;
-use crate::tasks;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -26,7 +26,10 @@ use tracing::{debug, warn};
 const MAX_BUILD_LOG_SIZE: usize = 1_000_000;
 const LOG_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LOG_SEGMENT_WAIT_CAP: Duration = Duration::from_millis(750);
-const LOG_RUNTIME_LOOKUP_GRACE: Duration = Duration::from_secs(2);
+
+/// How often to re-sync Docker container status inside the log-streaming loop.
+/// The 100ms tick is for log-buffer polling; Docker re-inspect happens much less often.
+const LOG_SYNC_STATUS_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A parsed log entry with timestamp and content
 /// Matches executor-main's log chunk format
@@ -207,9 +210,6 @@ pub async fn stream_logs(
 ) -> Result<Response> {
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
 
-    debug!("Streaming logs for: {}", full_name);
-    let runtime = resolve_runtime(&state, &full_name).await?;
-
     // Parse timeout with validation
     let timeout_secs: u64 = query.timeout.parse().unwrap_or(600);
     if timeout_secs == 0 {
@@ -218,6 +218,9 @@ pub async fn stream_logs(
     if timeout_secs > 3600 {
         return Err(ExecutorError::LogsTimeout);
     }
+
+    debug!("Streaming logs for: {}", full_name);
+    let runtime = resolve_runtime(&state, &full_name, timeout_secs).await?;
 
     let stream = if runtime.version.eq_ignore_ascii_case("v2") {
         create_empty_log_stream()
@@ -234,45 +237,14 @@ pub async fn stream_logs(
 
 type EventStream = BoxStream<'static, std::result::Result<Bytes, Infallible>>;
 
-async fn resolve_runtime(state: &AppState, full_name: &str) -> Result<Runtime> {
-    let deadline = tokio::time::Instant::now() + LOG_RUNTIME_LOOKUP_GRACE;
-
-    loop {
-        if let Some(runtime) = current_runtime(state, full_name).await {
-            return Ok(runtime);
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ExecutorError::RuntimeNotFound);
-        }
-
-        tokio::time::sleep(LOG_STREAM_POLL_INTERVAL).await;
-    }
-}
-
-async fn current_runtime(state: &AppState, full_name: &str) -> Option<Runtime> {
-    if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
-        return Some(runtime);
-    }
-
-    if let Some(runtime) = state.registry.get(full_name).await {
-        return Some(runtime);
-    }
-
-    let _ = tasks::adopt_container_by_name(
-        &state.docker,
-        &state.registry,
-        &state.keep_alive_registry,
-        &state.config.hostname,
-        full_name,
-    )
-    .await;
-
-    if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
-        return Some(runtime);
-    }
-
-    state.registry.get(full_name).await
+async fn resolve_runtime(state: &AppState, full_name: &str, timeout_secs: u64) -> Result<Runtime> {
+    resolve_runtime_with_readiness(state, full_name, timeout_secs, true)
+        .await
+        .map_err(|e| match e {
+            crate::error::ExecutorError::RuntimeNotFound => ExecutorError::RuntimeNotFound,
+            crate::error::ExecutorError::RuntimeTimeout => ExecutorError::RuntimeNotFound,
+            other => other,
+        })
 }
 
 fn create_empty_log_stream() -> EventStream {
@@ -295,13 +267,33 @@ fn create_build_log_stream(
         let mut intro_offset: Option<usize> = None;
         let mut log_offset = 0usize;
 
+        // Track the last time we re-inspected Docker for container status.
+        let mut last_sync = std::time::Instant::now();
+        // Cached runtime from the last Docker sync; initially resolved from registry.
+        let mut cached_runtime: Option<Runtime> = state.registry.get(&container_name).await;
+
         loop {
             if start.elapsed() > timeout {
                 yield Ok(Bytes::from_static(b"Timeout reached\n"));
                 break;
             }
 
-            let runtime = match current_runtime(&state, &container_name).await {
+            // Re-sync Docker container status periodically (not on every 100ms tick).
+            let runtime = if last_sync.elapsed() >= LOG_SYNC_STATUS_INTERVAL {
+                last_sync = std::time::Instant::now();
+                let synced = state.registry.sync_status(&container_name, &state.docker).await;
+                let resolved = if synced.is_some() {
+                    synced
+                } else {
+                    state.registry.get(&container_name).await
+                };
+                cached_runtime = resolved.clone();
+                resolved
+            } else {
+                cached_runtime.clone()
+            };
+
+            let runtime = match runtime {
                 Some(runtime) => runtime,
                 None => break,
             };

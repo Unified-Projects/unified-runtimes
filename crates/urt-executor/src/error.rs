@@ -69,6 +69,9 @@ pub enum ExecutorError {
 
     #[error("Network error: {0}")]
     Network(String),
+
+    #[error("Build timed out")]
+    BuildTimeout,
 }
 
 impl ExecutorError {
@@ -94,6 +97,7 @@ impl ExecutorError {
             Self::Docker(_) => "general_unknown",
             Self::Storage(_) => "general_unknown",
             Self::Network(_) => "general_unknown",
+            Self::BuildTimeout => "build_timeout",
         }
     }
 
@@ -119,6 +123,7 @@ impl ExecutorError {
             Self::Docker(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Network(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::BuildTimeout => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }
