@@ -1427,13 +1427,21 @@ mod readiness_gate {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Build a minimal execution payload with the given timeout (seconds).
+    ///
+    /// Under the v0.4.1 design, `image.is_empty()` is the discriminator that
+    /// tells `executions::resolve_runtime` whether the caller "owns the build"
+    /// and should park on a pending notifier (non-empty) or fast-fail (empty).
+    /// Every readiness_gate test exercises the parking path, so we always set
+    /// a non-empty image here.  Tests verifying the fast-fail / scan-request
+    /// path live in `regression_pending_wait` and build their own payloads.
     fn exec_payload(timeout_secs: u32) -> String {
         serde_json::json!({
             "body": "",
             "path": "/",
             "method": "GET",
             "headers": {},
-            "timeout": timeout_secs
+            "timeout": timeout_secs,
+            "image": "openruntimes/node:v5-25"
         })
         .to_string()
     }
@@ -2049,28 +2057,6 @@ mod audit_fixes {
     // Shared helpers (mirroring readiness_gate style)
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn cmd_payload(timeout_secs: u32) -> String {
-        serde_json::json!({ "command": "echo hello", "timeout": timeout_secs }).to_string()
-    }
-
-    async fn post_command(
-        app: axum::Router,
-        runtime_id: &str,
-        timeout_secs: u32,
-    ) -> axum::http::Response<axum::body::Body> {
-        app.oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(format!("/v1/runtimes/{}/commands", runtime_id))
-                .header("Authorization", "Bearer test-secret-key")
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(cmd_payload(timeout_secs)))
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-    }
-
     async fn get_logs(
         app: axum::Router,
         runtime_id: &str,
@@ -2092,285 +2078,90 @@ mod audit_fixes {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Test 1: commands route parks on readiness gate and wakes when running
+    // Tests 1-3 (commands_resolve_waits_for_pending_runtime,
+    // commands_resolve_returns_504_on_timeout, logs_resolve_waits_for_pending_runtime)
+    // were removed in v0.4.1.  They asserted the v0.4.0 design where commands
+    // and logs resolve_runtime would park on a pending notifier; v0.4.1 changed
+    // both routes to fast-fail on pending so bot scans cannot hold workers.
+    //
+    // The v0.4.1 fast-fail behaviour is locked in by:
+    //   regression_pending_wait::commands_route_does_not_wait_on_pending
+    //   regression_pending_wait::logs_route_does_not_wait_on_pending
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// A pending runtime inserted before the commands request arrives must
-    /// cause the handler to park on the readiness Notify and wake once the
-    /// runtime is marked running.  After waking, resolve_runtime returns the
-    /// runtime and the command handler attempts to exec — that attempt fails
-    /// (no real Docker), but the response arrives well before the deadline.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 4: logs handler honours the create-race appear-wait window
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Under the v0.4.1 logs design the handler discriminates on system state:
+    ///   - registry entry / notifier already known  → fast-fail on pending
+    ///   - nothing known yet (race-with-create)     → appear-wait until the
+    ///     entry is inserted, then return whatever state is current (even
+    ///     pending, so the SSE stream can begin tailing the build log).
+    ///
+    /// This test exercises the second path:
+    ///   1. Spawn a logs request for a runtime that does not yet exist.
+    ///   2. After 100 ms (well inside LOG_RUNTIME_APPEAR_WAIT_CAP = 2 s),
+    ///      insert a pending registry entry — simulating the create request
+    ///      racing in just behind the logs request.
+    ///   3. Assert the logs request resolves the (still pending) runtime and
+    ///      returns a non-404 SSE response well under the caller timeout.
     #[tokio::test]
-    async fn commands_resolve_waits_for_pending_runtime() {
+    async fn logs_resolve_appear_wait_resolves_when_create_races_in() {
         require_docker!(state);
 
         tokio::time::timeout(Duration::from_secs(8), async move {
             let hostname = state.config.hostname.clone();
-            let runtime_id = "af-cmd-wait";
+            let runtime_id = "af-logs-appear-wait";
             let full_name = format!("{}-{}", hostname, runtime_id);
 
-            let pending = Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
-            state
-                .registry
-                .insert(pending)
-                .await
-                .expect("insert pending");
-
-            let _notifier = state.readiness_notifier(&full_name);
+            // No registry entry, no notifier — the logs request must observe
+            // the "nothing known" case and enter the appear-wait poll loop.
+            assert!(state.registry.get(&full_name).await.is_none());
+            assert!(state.readiness_notifier_existing(&full_name).is_none());
 
             let app = create_router(state.clone());
             let rid = runtime_id.to_string();
-
             let start = Instant::now();
-            // Long timeout so the only fast-exit path is wakeup + exec failure.
-            let handle = tokio::spawn(async move { post_command(app, &rid, 30).await });
-
-            tokio::time::sleep(Duration::from_millis(150)).await;
-
-            let mut running = state
-                .registry
-                .get(&full_name)
-                .await
-                .expect("runtime must be in registry");
-            running.mark_running("running");
-            running.set_listening();
-            state.registry.update(running).await.expect("update");
-
-            state.readiness_notify_and_remove(&full_name);
-
-            let response = handle.await.expect("task panicked");
-            let elapsed = start.elapsed();
-
-            // Response must arrive well before the 30-second command deadline —
-            // wakeup happens at ~150 ms and exec fails fast (no real container).
-            assert!(
-                elapsed < Duration::from_secs(3),
-                "Response took {:?}; expected < 3 s — commands resolve may not have \
-                 woken on the readiness notify",
-                elapsed
-            );
-
-            // A 404 would mean the runtime was never resolved after notification.
-            assert_ne!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "Got 404: runtime was not found after wakeup (elapsed: {:?})",
-                elapsed
-            );
-        })
-        .await
-        .expect("test timed out after 8 s");
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Test 2: commands route returns 504 when pending runtime never becomes ready
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// When the runtime stays pending and the command timeout expires, the
-    /// handler must return HTTP 504 with type "runtime_timeout".
-    #[tokio::test]
-    async fn commands_resolve_returns_504_on_timeout() {
-        require_docker!(state);
-
-        tokio::time::timeout(Duration::from_secs(5), async move {
-            let hostname = state.config.hostname.clone();
-            let runtime_id = "af-cmd-timeout";
-            let full_name = format!("{}-{}", hostname, runtime_id);
-
-            let pending = Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
-            state
-                .registry
-                .insert(pending)
-                .await
-                .expect("insert pending");
-
-            let _notifier = state.readiness_notifier(&full_name);
-
-            let app = create_router(state.clone());
-
-            let start = Instant::now();
-            // 1-second command timeout so the test completes quickly.
-            let response = post_command(app, runtime_id, 1).await;
-            let elapsed = start.elapsed();
-
-            assert_eq!(
-                response.status(),
-                StatusCode::GATEWAY_TIMEOUT,
-                "Expected 504, got {} (elapsed: {:?})",
-                response.status(),
-                elapsed
-            );
-
-            let body = parse_json_body(response.into_body()).await;
-            assert_eq!(body["code"], 504, "code must be 504, got: {}", body);
-            assert_eq!(
-                body["type"], "runtime_timeout",
-                "type must be 'runtime_timeout', got: {}",
-                body
-            );
-
-            // Must have spent at least the deadline amount of time waiting.
-            assert!(
-                elapsed >= Duration::from_millis(900),
-                "Response arrived too quickly ({:?}); deadline may not have been honoured",
-                elapsed
-            );
-        })
-        .await
-        .expect("test timed out after 5 s");
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Test 3: logs route parks on readiness gate and wakes when running
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// The logs handler uses `resolve_runtime_with_readiness` with the
-    /// `timeout_secs` from the query parameter.  A pending runtime must cause
-    /// the handler to park and then wake once the runtime is marked running,
-    /// delivering a response well before the 30-second deadline.
-    #[tokio::test]
-    async fn logs_resolve_waits_for_pending_runtime() {
-        require_docker!(state);
-
-        tokio::time::timeout(Duration::from_secs(8), async move {
-            let hostname = state.config.hostname.clone();
-            let runtime_id = "af-logs-wait";
-            let full_name = format!("{}-{}", hostname, runtime_id);
-
-            let pending = Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
-            state
-                .registry
-                .insert(pending)
-                .await
-                .expect("insert pending");
-
-            let _notifier = state.readiness_notifier(&full_name);
-
-            let app = create_router(state.clone());
-            let rid = runtime_id.to_string();
-
-            let start = Instant::now();
-            let handle = tokio::spawn(async move { get_logs(app, &rid, 30).await });
-
-            tokio::time::sleep(Duration::from_millis(150)).await;
-
-            let mut running = state
-                .registry
-                .get(&full_name)
-                .await
-                .expect("runtime must be in registry");
-            running.mark_running("running");
-            running.set_listening();
-            state.registry.update(running).await.expect("update");
-
-            state.readiness_notify_and_remove(&full_name);
-
-            let response = handle.await.expect("task panicked");
-            let elapsed = start.elapsed();
-
-            // Logs handler wakes, resolves the runtime, then returns the SSE
-            // stream (or 404/error) quickly.
-            assert!(
-                elapsed < Duration::from_secs(3),
-                "Response took {:?}; expected < 3 s — logs resolve may not have \
-                 woken on the readiness notify",
-                elapsed
-            );
-
-            // A 404 would mean the runtime was not resolved after wakeup.
-            assert_ne!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "Got 404: runtime was not found in logs handler after wakeup (elapsed: {:?})",
-                elapsed
-            );
-        })
-        .await
-        .expect("test timed out after 8 s");
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Test 4: logs resolve is no longer capped at 2 seconds
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Previously `logs::resolve_runtime` used a hardcoded 2-second grace
-    /// period.  The fix uses the `timeout_secs` query param.  This test
-    /// verifies the new behaviour by:
-    ///   1. Starting a pending runtime with NO readiness transition.
-    ///   2. Asserting that a logs request with `timeout=10` has NOT returned
-    ///      at the 2.5-second mark (proving the 2-second cap was removed).
-    ///   3. Then transitioning the runtime to running and notifying.
-    ///   4. Asserting the request returns successfully shortly after.
-    #[tokio::test]
-    async fn logs_resolve_no_longer_capped_at_2s() {
-        require_docker!(state);
-
-        // Outer timeout is generous; real assertion is timing.
-        tokio::time::timeout(Duration::from_secs(10), async move {
-            let hostname = state.config.hostname.clone();
-            let runtime_id = "af-logs-no-2s-cap";
-            let full_name = format!("{}-{}", hostname, runtime_id);
-
-            let pending = Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
-            state
-                .registry
-                .insert(pending)
-                .await
-                .expect("insert pending");
-
-            let _notifier = state.readiness_notifier(&full_name);
-
-            let app = create_router(state.clone());
-            let rid = runtime_id.to_string();
-
-            let start = Instant::now();
-            // 10-second timeout passed via query param — previously the handler
-            // would cap at 2 s; now it must wait the full 10 s (or until notified).
             let handle = tokio::spawn(async move { get_logs(app, &rid, 10).await });
 
-            // Verify that at 2.5 s the request has NOT yet returned.
-            tokio::time::sleep(Duration::from_millis(2500)).await;
-
-            // If the task already completed, it hit the old 2-second cap.
-            assert!(
-                !handle.is_finished(),
-                "Logs request finished at ~2.5 s — the 2-second hardcoded cap \
-                 appears to still be in place (regression)"
-            );
-
-            // Now notify: transition to running and wake the waiter.
-            let mut running = state
+            // Simulate the racing create request: after 100 ms, insert a
+            // pending registry entry.  The appear-wait poll (25 ms) sees it on
+            // the next tick and the handler returns even though the runtime is
+            // still pending (case b).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let pending = Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
+            state
                 .registry
-                .get(&full_name)
+                .insert(pending)
                 .await
-                .expect("runtime must still be in registry");
-            running.mark_running("running");
-            running.set_listening();
-            state.registry.update(running).await.expect("update");
-            state.readiness_notify_and_remove(&full_name);
+                .expect("insert pending");
+            let _notifier = state.readiness_notifier(&full_name);
 
-            // The handler must wake and return within a generous window.
             let response = handle.await.expect("task panicked");
             let elapsed = start.elapsed();
 
+            // A 404 would mean the appear-wait timed out without seeing the
+            // entry — i.e. the race window was too short.
             assert_ne!(
                 response.status(),
                 StatusCode::NOT_FOUND,
-                "Got 404: runtime not resolved after notification in logs handler \
-                 (elapsed: {:?})",
+                "Got 404 after racing create: appear-wait poll did not pick up \
+                 the entry within {:?}",
                 elapsed
             );
 
-            // Response must have arrived after the 2.5 s mark (proved above)
-            // but well before the 10 s deadline.
+            // Must complete well inside both LOG_RUNTIME_APPEAR_WAIT_CAP (2 s)
+            // and the caller's 10 s timeout.
             assert!(
-                elapsed < Duration::from_secs(6),
-                "Response took {:?}; expected between 2.5 s and 6 s",
+                elapsed < Duration::from_secs(3),
+                "Logs response took {:?}; expected < 3 s — appear-wait may be \
+                 polling too slowly or hitting the cap unnecessarily",
                 elapsed
             );
         })
         .await
-        .expect("test timed out after 10 s");
+        .expect("test timed out after 8 s");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2639,8 +2430,13 @@ mod audit_fixes {
             let app = create_router(state.clone());
 
             // 1-second execution timeout triggers the RuntimeTimeout path.
+            // Non-empty `image` is required under the v0.4.1 design so the
+            // request takes the wait_for_pending=true branch (caller-owns-build);
+            // a scan request with an empty image would fast-fail to 404 and
+            // never increment the timeout counter.
             let payload = serde_json::json!({
-                "body": "", "path": "/", "method": "GET", "headers": {}, "timeout": 1
+                "body": "", "path": "/", "method": "GET", "headers": {},
+                "timeout": 1, "image": "openruntimes/node:v5-25"
             })
             .to_string();
 
@@ -3712,12 +3508,16 @@ mod cold_start {
 
         let app = create_router(state);
 
+        // Non-empty `image` so the request takes the caller-owns-build path
+        // (wait_for_pending=true) and parks until the timeout fires.  Without
+        // this, the v0.4.1 fast-fail-on-pending design returns 404 immediately.
         let payload = serde_json::json!({
             "body": "",
             "path": "/",
             "method": "GET",
             "headers": {},
-            "timeout": 1
+            "timeout": 1,
+            "image": "openruntimes/node:v5-25"
         });
 
         let start = Instant::now();

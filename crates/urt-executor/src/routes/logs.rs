@@ -247,43 +247,65 @@ pub async fn stream_logs(
 type EventStream = BoxStream<'static, std::result::Result<Bytes, Infallible>>;
 
 async fn resolve_runtime(state: &AppState, full_name: &str, timeout_secs: u64) -> Result<Runtime> {
-    // Logs never create runtimes (adopt = false), but a logs request may legitimately
-    // race ahead of the create request that owns the build.  The shared resolver's
-    // R1 (no-entry, no-notifier) window is intentionally short (~10ms) so unknown
-    // IDs fast-fail; that is too short for the logs-vs-create pipelining race.
+    // The logs route services two distinct callers:
     //
-    // Step 1 (here): wait up to LOG_RUNTIME_APPEAR_WAIT_CAP for the registry entry
-    // or its readiness notifier to appear.  Bounded short so bot-scan exposure
-    // stays small even when the caller passes a large `timeout`.
+    //   (a) Bot scans / random-ID probes against runtimes the executor already
+    //       knows about (registry entry exists, possibly with notifier).  These
+    //       must fast-fail on a pending entry — they must NOT park for the full
+    //       caller `timeout`, because a 30 s park per scan is a trivial DoS.
     //
-    // Step 2: hand off to the standard resolver with the remaining caller budget;
-    // it will park on the notifier until the runtime transitions out of pending,
-    // bounded by `pending_wait_max_secs`.
+    //   (b) Legitimate clients that pipeline `GET .../logs` immediately before
+    //       (or in parallel with) `POST /v1/runtimes`.  At request start there
+    //       is no registry entry and no notifier; one will appear once the
+    //       create request is dispatched.  These must wait briefly for the
+    //       entry to appear and then return whatever state is current — even
+    //       pending — so the SSE stream can begin tailing the build log.
+    //
+    // We discriminate on the system state visible at request start:
+    //   - entry/notifier already known  → fast-fail path  (case a)
+    //   - nothing known yet             → appear-wait path (case b)
+    let already_known = state.readiness_notifier_existing(full_name).is_some()
+        || state.registry.get(full_name).await.is_some();
+
+    if already_known {
+        // Case (a): fast-fail on pending.  The shared resolver with
+        // wait_for_pending=false returns RuntimeNotFound when the entry is
+        // pending; we also map RuntimeTimeout → RuntimeNotFound so the route's
+        // public contract for unresolvable runtimes is a single 404.
+        return resolve_runtime_with_readiness(state, full_name, timeout_secs, false, false)
+            .await
+            .map_err(|e| match e {
+                ExecutorError::RuntimeNotFound | ExecutorError::RuntimeTimeout => {
+                    ExecutorError::RuntimeNotFound
+                }
+                other => other,
+            });
+    }
+
+    // Case (b): poll for the entry/notifier to appear.  Bounded by both the
+    // local appear-wait cap (so unknown-ID scans cannot hold a worker for the
+    // full caller timeout) and the caller's own deadline.
     let request_start = tokio::time::Instant::now();
     let caller_deadline = request_start + Duration::from_secs(timeout_secs.max(1));
     let appear_deadline = (request_start + LOG_RUNTIME_APPEAR_WAIT_CAP).min(caller_deadline);
 
-    while state.readiness_notifier_existing(full_name).is_none()
-        && state.registry.get(full_name).await.is_none()
-    {
+    loop {
+        if let Some(runtime) = state.registry.get(full_name).await {
+            // Even if pending, return it.  `create_build_log_stream` handles
+            // pending runtimes by tailing the build's log files and re-syncing
+            // Docker status until the runtime transitions to running or
+            // disappears.
+            return Ok(runtime);
+        }
+
+        // Notifier appeared but the registry entry is not yet inserted: the
+        // create path is racing.  Keep polling; on the next tick the registry
+        // get will succeed.
         if tokio::time::Instant::now() >= appear_deadline {
             return Err(ExecutorError::RuntimeNotFound);
         }
         tokio::time::sleep(LOG_RUNTIME_APPEAR_POLL_INTERVAL).await;
     }
-
-    let remaining_secs = caller_deadline
-        .saturating_duration_since(tokio::time::Instant::now())
-        .as_secs()
-        .max(1);
-
-    resolve_runtime_with_readiness(state, full_name, remaining_secs, true, false)
-        .await
-        .map_err(|e| match e {
-            crate::error::ExecutorError::RuntimeNotFound => ExecutorError::RuntimeNotFound,
-            crate::error::ExecutorError::RuntimeTimeout => ExecutorError::RuntimeNotFound,
-            other => other,
-        })
 }
 
 fn create_empty_log_stream() -> EventStream {
