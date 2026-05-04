@@ -549,7 +549,14 @@ pub async fn create_runtime(
     state.registry.insert(runtime.clone()).await?;
     // Insert readiness notifier AFTER successful registry insertion so that the
     // 409 path never creates a dangling notifier entry.
+    // Wrap in a ReadinessGuard so any error path between here and the explicit
+    // success-path notify automatically fires notify_waiters() and removes the
+    // entry, preventing the DashMap leak (Fix D).
     state.readiness_notifier(&full_name);
+    let mut readiness_guard = crate::runtime::readiness::ReadinessGuard::new(
+        full_name.clone(),
+        std::sync::Arc::clone(&state.readiness),
+    );
 
     // Register keep-alive ownership (if applicable)
     // This also revokes protection from any previous owner with the same ID
@@ -644,7 +651,8 @@ pub async fn create_runtime(
 
     // Verify containment to prevent path-traversal via crafted runtime IDs.
     if !tmp_folder.starts_with(&canonical_tmp_base) {
-        state.readiness_notify_and_remove(&full_name);
+        // readiness_guard Drop will fire notify_waiters; explicit registry remove follows.
+        drop(readiness_guard);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::BadRequest(
             "Invalid runtime id leads to unsafe path".to_string(),
@@ -660,7 +668,8 @@ pub async fn create_runtime(
             src_dir.display(),
             e
         );
-        state.readiness_notify_and_remove(&full_name);
+        // readiness_guard Drop fires notify_waiters automatically.
+        drop(readiness_guard);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create source directory: {}",
@@ -674,7 +683,7 @@ pub async fn create_runtime(
             src_dir.display(),
             e
         );
-        state.readiness_notify_and_remove(&full_name);
+        drop(readiness_guard);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set source directory permissions: {}",
@@ -687,7 +696,7 @@ pub async fn create_runtime(
             builds_dir.display(),
             e
         );
-        state.readiness_notify_and_remove(&full_name);
+        drop(readiness_guard);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create builds directory: {}",
@@ -697,7 +706,7 @@ pub async fn create_runtime(
     // Set directory permissions to 0777 to allow tar extraction with preserved permissions
     if let Err(e) = platform::set_permissions_open(&builds_dir).await {
         error!("Failed to set builds directory permissions: {}", e);
-        state.readiness_notify_and_remove(&full_name);
+        drop(readiness_guard);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set builds directory permissions: {}",
@@ -727,7 +736,7 @@ pub async fn create_runtime(
         .await
         {
             error!("Failed to download source: {}", e);
-            state.readiness_notify_and_remove(&full_name);
+            drop(readiness_guard);
             state.registry.remove(&full_name).await;
             return Err(ExecutorError::RuntimeFailed(format!(
                 "Failed to copy source code: {}",
@@ -819,7 +828,7 @@ pub async fn create_runtime(
         }
         Err(e) => {
             error!("Failed to create container: {}", e);
-            state.readiness_notify_and_remove(&full_name);
+            drop(readiness_guard);
             state.registry.remove(&full_name).await;
             return Err(ExecutorError::RuntimeFailed(format!(
                 "Failed to create container: {}",
@@ -860,7 +869,7 @@ pub async fn create_runtime(
                     // Terminal failure states — no point retrying.
                     error!("Container reached terminal state: {}", info.state);
                     state.docker.remove_container(&full_name, true).await.ok();
-                    state.readiness_notify_and_remove(&full_name);
+                    drop(readiness_guard);
                     state.registry.remove(&full_name).await;
                     return Err(ExecutorError::RuntimeFailed(format!(
                         "Container exited with status: {}",
@@ -891,7 +900,7 @@ pub async fn create_runtime(
 
         error!("Container startup timed out, last status: {}", last_status);
         state.docker.remove_container(&full_name, true).await.ok();
-        state.readiness_notify_and_remove(&full_name);
+        drop(readiness_guard);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Container startup timed out (last status: {})",
@@ -962,7 +971,7 @@ pub async fn create_runtime(
                     // On failure, cleanup and return error
                     state.docker.remove_container(&full_name, true).await.ok();
                     tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-                    state.readiness_notify_and_remove(&full_name);
+                    drop(readiness_guard);
                     state.registry.remove(&full_name).await;
 
                     let error_msg = if output_logs.is_empty() {
@@ -981,7 +990,7 @@ pub async fn create_runtime(
                 error!("Failed to execute build command: {}", e);
                 state.docker.remove_container(&full_name, true).await.ok();
                 tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-                state.readiness_notify_and_remove(&full_name);
+                drop(readiness_guard);
                 state.registry.remove(&full_name).await;
                 return Err(ExecutorError::RuntimeFailed(format!(
                     "Failed to execute command: {}",
@@ -1059,6 +1068,9 @@ pub async fn create_runtime(
         // Delete local tmp folder
         tokio::fs::remove_dir_all(&tmp_folder).await.ok();
 
+        // Disarm the guard then manually notify so we control ordering:
+        // notify_waiters fires here, then the registry entry is removed.
+        readiness_guard.disarm();
         state.readiness_notify_and_remove(&full_name);
         // Remove from registry
         state.registry.remove(&full_name).await;
@@ -1078,7 +1090,7 @@ pub async fn create_runtime(
                 );
                 state.docker.remove_container(&full_name, true).await.ok();
                 tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-                state.readiness_notify_and_remove(&full_name);
+                drop(readiness_guard);
                 state.registry.remove(&full_name).await;
                 return Err(ExecutorError::RuntimeFailed(
                     "Runtime port readiness check timed out".to_string(),
@@ -1092,12 +1104,15 @@ pub async fn create_runtime(
             // parked waiters first so they re-check and return a deterministic
             // 404 rather than waiting to deadline, then tear down the orphaned
             // container and working directory before propagating the error.
+            readiness_guard.disarm();
             state.readiness_notify_and_remove(&full_name);
             state.docker.remove_container(&full_name, true).await.ok();
             tokio::fs::remove_dir_all(&tmp_folder).await.ok();
             return Err(e);
         }
-        // Notify after registry.update so that woken waiters find a non-pending entry.
+        // Disarm the guard and then explicitly notify AFTER registry.update so
+        // that woken waiters find a non-pending entry.
+        readiness_guard.disarm();
         state.readiness_notify_and_remove(&full_name);
     }
 

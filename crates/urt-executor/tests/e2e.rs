@@ -130,6 +130,7 @@ fn test_config(network: String) -> ExecutorConfig {
         retry_attempts: 5,
         retry_delay_ms: 500,
         warmup_required: false,
+        pending_wait_max_secs: 60,
     }
 }
 

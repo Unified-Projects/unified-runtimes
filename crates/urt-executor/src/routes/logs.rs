@@ -238,7 +238,9 @@ pub async fn stream_logs(
 type EventStream = BoxStream<'static, std::result::Result<Bytes, Infallible>>;
 
 async fn resolve_runtime(state: &AppState, full_name: &str, timeout_secs: u64) -> Result<Runtime> {
-    resolve_runtime_with_readiness(state, full_name, timeout_secs, true)
+    // Logs never create runtimes: do not block on someone else's build
+    // (wait_for_pending = false) and do not attempt Docker adoption (adopt = false).
+    resolve_runtime_with_readiness(state, full_name, timeout_secs, false, false)
         .await
         .map_err(|e| match e {
             crate::error::ExecutorError::RuntimeNotFound => ExecutorError::RuntimeNotFound,
