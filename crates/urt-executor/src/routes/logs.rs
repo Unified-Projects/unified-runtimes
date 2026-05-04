@@ -31,6 +31,15 @@ const LOG_SEGMENT_WAIT_CAP: Duration = Duration::from_millis(750);
 /// The 100ms tick is for log-buffer polling; Docker re-inspect happens much less often.
 const LOG_SYNC_STATUS_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Upper bound on how long a logs request will wait for a *not-yet-existent*
+/// runtime entry to appear in the registry. Covers the race where a client
+/// pipelines `GET .../logs` immediately before / in parallel with `POST /v1/runtimes`.
+/// Bounded short so unknown-ID scans cannot hold a worker for the full caller
+/// timeout. Once the entry appears we hand off to the standard pending-readiness
+/// resolver, which has its own (longer) cap governed by `pending_wait_max_secs`.
+const LOG_RUNTIME_APPEAR_WAIT_CAP: Duration = Duration::from_secs(2);
+const LOG_RUNTIME_APPEAR_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// A parsed log entry with timestamp and content
 /// Matches executor-main's log chunk format
 #[derive(Debug, Clone, Serialize)]
@@ -239,11 +248,36 @@ type EventStream = BoxStream<'static, std::result::Result<Bytes, Infallible>>;
 
 async fn resolve_runtime(state: &AppState, full_name: &str, timeout_secs: u64) -> Result<Runtime> {
     // Logs never create runtimes (adopt = false), but a logs request may legitimately
-    // race ahead of the create request that owns the build, so we wait for a pending
-    // entry to transition.  The pending wait is bounded by `pending_wait_max_secs`,
-    // which keeps bot-scan exposure in check; the R1 (no-entry) path still
-    // short-circuits truly unknown IDs in ~10ms.
-    resolve_runtime_with_readiness(state, full_name, timeout_secs, true, false)
+    // race ahead of the create request that owns the build.  The shared resolver's
+    // R1 (no-entry, no-notifier) window is intentionally short (~10ms) so unknown
+    // IDs fast-fail; that is too short for the logs-vs-create pipelining race.
+    //
+    // Step 1 (here): wait up to LOG_RUNTIME_APPEAR_WAIT_CAP for the registry entry
+    // or its readiness notifier to appear.  Bounded short so bot-scan exposure
+    // stays small even when the caller passes a large `timeout`.
+    //
+    // Step 2: hand off to the standard resolver with the remaining caller budget;
+    // it will park on the notifier until the runtime transitions out of pending,
+    // bounded by `pending_wait_max_secs`.
+    let request_start = tokio::time::Instant::now();
+    let caller_deadline = request_start + Duration::from_secs(timeout_secs.max(1));
+    let appear_deadline = (request_start + LOG_RUNTIME_APPEAR_WAIT_CAP).min(caller_deadline);
+
+    while state.readiness_notifier_existing(full_name).is_none()
+        && state.registry.get(full_name).await.is_none()
+    {
+        if tokio::time::Instant::now() >= appear_deadline {
+            return Err(ExecutorError::RuntimeNotFound);
+        }
+        tokio::time::sleep(LOG_RUNTIME_APPEAR_POLL_INTERVAL).await;
+    }
+
+    let remaining_secs = caller_deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_secs()
+        .max(1);
+
+    resolve_runtime_with_readiness(state, full_name, remaining_secs, true, false)
         .await
         .map_err(|e| match e {
             crate::error::ExecutorError::RuntimeNotFound => ExecutorError::RuntimeNotFound,
