@@ -554,7 +554,19 @@ async fn resolve_runtime(
 ) -> Result<crate::runtime::Runtime> {
     use crate::runtime::readiness::resolve_runtime_with_readiness;
 
-    match resolve_runtime_with_readiness(state, full_name, req.timeout as u64, true).await {
+    // wait_for_pending is true only when the caller supplied an image (i.e. it is
+    // the owner of a build it triggered).  Pure-execution requests with no image
+    // must fail fast on a pending entry rather than park for the full timeout.
+    let caller_owns_build = !req.image.is_empty();
+    match resolve_runtime_with_readiness(
+        state,
+        full_name,
+        req.timeout as u64,
+        caller_owns_build,
+        true,
+    )
+    .await
+    {
         Ok(rt) => return Ok(rt),
         Err(ExecutorError::RuntimeNotFound) => {}
         Err(e) => return Err(e),

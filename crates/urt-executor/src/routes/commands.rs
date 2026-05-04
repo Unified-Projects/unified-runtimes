@@ -140,5 +140,7 @@ async fn resolve_runtime(
     full_name: &str,
     req: &CommandRequest,
 ) -> Result<Runtime> {
-    resolve_runtime_with_readiness(state, full_name, req.timeout as u64, true).await
+    // Commands never create runtimes: do not block on someone else's build
+    // (wait_for_pending = false) and do not attempt Docker adoption (adopt = false).
+    resolve_runtime_with_readiness(state, full_name, req.timeout as u64, false, false).await
 }

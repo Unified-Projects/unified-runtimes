@@ -343,6 +343,11 @@ pub struct ExecutorConfig {
 
     /// When true, the server waits for warmup to complete before accepting requests.
     pub warmup_required: bool,
+
+    /// Maximum seconds a request is allowed to block waiting for a pending
+    /// runtime to become ready.  Applies as a cap on top of (not instead of)
+    /// the per-request deadline.  Defaults to 60 seconds.
+    pub pending_wait_max_secs: u64,
 }
 
 impl ExecutorConfig {
@@ -465,6 +470,12 @@ impl ExecutorConfig {
             warmup_required: env_urt_or_opr("WARMUP_REQUIRED")
                 .map(|v| parse_bool_flag(&v))
                 .unwrap_or(false),
+
+            // Pending-runtime readiness wait cap
+            pending_wait_max_secs: env_urt_or_opr("PENDING_WAIT_MAX_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60)
+                .max(1),
         }
     }
 

@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-04
+
+### Fixed
+- **Bot-scan-induced 30s 504 storm against pending runtimes**: `runtime::readiness::resolve_runtime_with_readiness` previously parked every caller on the runtime's `Arc<Notify>` for the full caller-supplied `req.timeout` whenever the registry entry was in pending state. Bot scanners targeting nonexistent paths (`/.env`, `/.git/config`, `/api`, `/graphql`, `/.DS_Store`, `/ecp/...`) that Appwrite forwards as function executions on a runtime ID currently being built would each block 30s and return `RuntimeTimeout` -> 504. The full caller deadline is no longer the wait bound for callers who did not initiate the build.
+- **Readiness map leak on `create_runtime` error paths**: `routes/runtimes.rs::create_runtime` inserted into the `AppState.readiness` notifier map at the start and only removed on the explicit success-path call to `readiness_notify_and_remove`. Any error branch between those two points (registry insert race, container start failure, network attach error, build extraction failure, registry update failure) left the entry in the map; subsequent requests for that runtime ID would park on a `Notify` that nothing would ever wake, blocking until their own deadlines. Every error path now drops the new `ReadinessGuard` which calls `notify_waiters()` and removes the map entry.
+- **R1 unknown-ID poll burned 200ms per scan**: the pre-insert race fallback in `resolve_runtime_with_readiness` polled with exponential backoff (10ms -> 20ms -> 40ms) up to a 200ms ceiling for every request whose runtime ID was neither in the registry nor in the readiness map. Reduced to a single ~10ms poll iteration; the legitimate notifier-creation race (notifier appears within ~10ms of request entry) is still covered by the post-sleep branch, with up to 200ms of additional wait once the notifier is observed.
+- **`commands` and `logs` routes no longer block on someone else's build**: both routes previously called `resolve_runtime_with_readiness` with the wait path enabled. They now pass `should_wait_for_pending = false` and `adopt = false`, returning `RuntimeNotFound` immediately when the registry entry is pending. Neither route can legitimately wait for a build it did not initiate.
+
+### Added
+- **`ReadinessGuard` RAII type** in `runtime::readiness`: wraps the `AppState.readiness` insertion site so any error path between insertion and the explicit success-path notify automatically calls `notify_waiters()` and removes the DashMap entry on drop. Provides `disarm()` for the success path so the explicit removal call remains the single load-bearing operation. Panic-safe; relies only on infallible DashMap and Notify operations.
+- **`Config::pending_wait_max_secs`** (env `URT_PENDING_WAIT_MAX_SECS`, default 60s): caps the pending-runtime wait duration independently of the caller's `req.timeout`. Applied as `min(cap, deadline_remaining)` so the caller's deadline still shortens when smaller than the cap; the cap only ever bounds the wait, never extends it.
+- **`should_wait_for_pending: bool` parameter** on `resolve_runtime_with_readiness`: routes opt in to waiting only when the caller legitimately owns the build. `routes/executions.rs` passes `!req.image.is_empty()` (creation-style requests wait for their own build); `routes/commands.rs` and `routes/logs.rs` pass `false`. The notify-based wait, R1 race fallback, and adoption path are all preserved for callers that opt in.
+- **8 new integration tests** under `tests/integration.rs` `mod regression_pending_wait`: `scan_request_does_not_park_on_pending_runtime`, `legitimate_creation_request_still_waits_on_pending`, `pending_wait_capped_by_config` (uses `tokio::time::pause`), `commands_route_does_not_wait_on_pending`, `logs_route_does_not_wait_on_pending`, `readiness_guard_fires_on_error_path`, `unknown_id_r1_poll_short_circuits_fast`, `bot_scan_concurrent_with_build_does_not_block_build` (50 concurrent scans + live build, asserts all scans 404 in <1s, build completes, scan p99 <500ms).
+
 ## [0.4.0] - 2026-04-28
 
 ### Fixed
