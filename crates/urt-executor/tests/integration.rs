@@ -1727,15 +1727,19 @@ mod readiness_gate {
     // Test 4: removing the registry entry while waiters are parked is deterministic
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// When the runtime is removed while executions are waiting (e.g. due to a
-    /// create_runtime failure path), the waiters must receive a deterministic
-    /// outcome — either RuntimeNotFound (404) or RuntimeTimeout (504) — within
-    /// the execution deadline.  They must NOT panic or hang past the deadline.
+    /// When the runtime is removed while a request is in flight, the caller
+    /// must receive a deterministic outcome — RuntimeNotFound (404) or
+    /// RuntimeTimeout (504) — within the request deadline.  Never a panic,
+    /// hang, or 5xx.
     ///
-    /// Production ordering: readiness_notify_and_remove THEN registry.remove.
-    /// After wake, wait_for_pending re-checks the registry, finds None, and
-    /// returns None → resolve_runtime falls through to adoption → adoption
-    /// fails (no Docker) → RuntimeNotFound.
+    /// Under the v0.4.1 design the empty-image (scan-style) request fast-fails
+    /// on a pending entry without parking, so the "removal-while-waiting"
+    /// ordering reduces to "removal-then-resolve" — the resolver still has to
+    /// produce one of the two legal errors.  We use the empty-image payload
+    /// here to exercise the fast-fail branch deterministically; the
+    /// caller-owns-build wait/wake path is covered by
+    /// `legitimate_creation_request_still_waits_on_pending` in
+    /// `regression_pending_wait`.
     #[tokio::test]
     async fn runtime_removed_while_waiting_yields_deterministic_error() {
         require_docker!(state);
@@ -1758,9 +1762,33 @@ mod readiness_gate {
 
             let app = create_router(state.clone());
             let rid = runtime_id.to_string();
-            let exec_handle = tokio::spawn(async move { post_execution(app, &rid, 2).await });
 
-            // Give the execution task a moment to park on the Notify.
+            // Build an empty-image payload inline so we hit the fast-fail
+            // branch instead of the on-the-fly create path that the
+            // module-level `exec_payload` now drives.
+            let empty_image_payload = serde_json::json!({
+                "body": "",
+                "path": "/",
+                "method": "GET",
+                "headers": {},
+                "timeout": 2
+            })
+            .to_string();
+            let exec_handle = tokio::spawn(async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/runtimes/{}/executions", rid))
+                        .header("Authorization", "Bearer test-secret-key")
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(empty_image_payload))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            });
+
+            // Give the execution task a moment to enter resolve_runtime.
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             // Production failure-path ordering: notify BEFORE remove.
@@ -1770,7 +1798,7 @@ mod readiness_gate {
             let response = exec_handle.await.expect("execution task panicked");
 
             // The outcome must be one of the two legal deterministic errors.
-            // Anything else (200, 500, panic, hang) is a regression.
+            // Anything else (200, 5xx, panic, hang) is a regression.
             let status = response.status();
             assert!(
                 status == StatusCode::NOT_FOUND || status == StatusCode::GATEWAY_TIMEOUT,
@@ -1912,114 +1940,18 @@ mod readiness_gate {
         .expect("consistency test timed out");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Test 7: waiter that arrives before the registry insert still wakes (R1)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// The R1 fix: resolve_runtime acquires a Notify future *before* the first
-    /// registry check.  If the entry does not yet exist it parks on that future
-    /// for up to 200 ms (the R1 sub-deadline configured in executions.rs) before
-    /// falling through to the adoption path.
-    ///
-    /// Race window under test:
-    ///   Task A  — calls the execution endpoint when the runtime is NOT yet in
-    ///             the registry.  The R1 path parks on the pre-acquired Notify.
-    ///   Task B  — after 50 ms inserts the runtime as pending, then after
-    ///             another 50 ms marks it running and calls
-    ///             readiness_notify_and_remove.
-    ///
-    /// Task B's total delay (~100 ms) is inside the 200 ms R1 sub-deadline, so
-    /// task A must observe the notification and proceed through resolve_runtime.
-    ///
-    /// Assertion strategy: timing.  The execution payload uses a 30-second
-    /// deadline so a pending-timeout regression would not respond for 30 s.
-    /// A correct wakeup + fast network failure returns within ~1 s.
-    ///
-    /// Sub-deadline note: the R1 sub-deadline is `min(200ms, remaining)`.
-    /// With a 30-second execution deadline the effective bound is 200 ms.
-    /// The test pre-creates the notifier entry so the notification fired by
-    /// task B is stored in the DashMap entry that task A's resolve_runtime
-    /// will use when it calls readiness_notifier.
-    #[tokio::test]
-    async fn waiter_arrived_before_insert_still_wakes() {
-        require_docker!(state);
-
-        // Outer timeout is generous to catch hangs; the real assertion is elapsed.
-        tokio::time::timeout(Duration::from_secs(8), async move {
-            let hostname = state.config.hostname.clone();
-            let runtime_id = "rg-r1-preinsert";
-            let full_name = format!("{}-{}", hostname, runtime_id);
-
-            // Pre-create the notifier entry in the readiness map BEFORE the
-            // execution task starts.  This mirrors the production ordering in
-            // create_runtime (readiness_notifier before registry.insert) and
-            // ensures the DashMap entry exists when resolve_runtime calls
-            // readiness_notifier on its own.
-            let _notifier = state.readiness_notifier(&full_name);
-
-            // Task A: post an execution for a runtime that does not yet exist.
-            // Long deadline so the only fast path is wakeup → network failure.
-            let app = create_router(state.clone());
-            let rid = runtime_id.to_string();
-            let start = Instant::now();
-            let exec_handle = tokio::spawn(async move { post_execution(app, &rid, 30).await });
-
-            // Give task A a moment to reach the R1 park inside resolve_runtime.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            // Task B step 1: insert the runtime as pending.
-            let pending = Runtime::new(runtime_id, &hostname, "test-image:latest", "v5", None);
-            state
-                .registry
-                .insert(pending)
-                .await
-                .expect("insert pending");
-
-            // Task B step 2: 50 ms later, transition to running and notify.
-            // Total task-B delay = 100 ms < 200 ms R1 sub-deadline.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let mut running = state
-                .registry
-                .get(&full_name)
-                .await
-                .expect("runtime must still be present");
-            running.mark_running("running");
-            running.set_listening();
-            state
-                .registry
-                .update(running)
-                .await
-                .expect("update to running");
-            state.readiness_notify_and_remove(&full_name);
-
-            let response = exec_handle.await.expect("execution task panicked");
-            let elapsed = start.elapsed();
-
-            // A response within 3 seconds proves task A woke via the
-            // notification (not via the 30-second deadline or the R1 200 ms
-            // timeout followed by adoption failure).
-            assert!(
-                elapsed < Duration::from_secs(3),
-                "Response took {:?}; expected < 3 s — R1 waiter may not have caught \
-                 the notification within the 200 ms sub-deadline",
-                elapsed
-            );
-
-            // After R1 wakeup task A re-checks the registry, finds the running
-            // runtime, and proceeds past resolve_runtime.  A 404 here means
-            // task A fell through to adoption and Docker returned nothing.
-            assert_ne!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "Got 404 ({:?}): R1 waiter did not observe the notification; \
-                 task A may have fallen through to adoption",
-                elapsed
-            );
-        })
-        .await
-        .expect("R1 pre-insert test timed out after 8 seconds");
-    }
+    // The v0.4.0-era `waiter_arrived_before_insert_still_wakes` test was
+    // removed: it asserted that a request which finds a notifier but no
+    // registry entry would park for the (then) 200 ms R1 sub-deadline and
+    // wake when the entry was inserted ~50 ms later.  v0.4.1 Fix E
+    // intentionally reduced that speculative wait to 10 ms so unknown-ID
+    // bot scans cannot hold a worker, making the >50 ms insert-then-wake
+    // pattern incompatible with the resolver by design.  The legitimate
+    // race (caller pipelines GET .../logs ahead of POST /v1/runtimes) is
+    // covered by `audit_fixes::logs_resolve_appear_wait_resolves_when_create_races_in`
+    // and `tests/e2e.rs::test_logs_waits_briefly_for_runtime_creation`;
+    // the legitimate executions-with-image park-and-wake path is covered
+    // by `regression_pending_wait::legitimate_creation_request_still_waits_on_pending`.
 }
 
 mod audit_fixes {
