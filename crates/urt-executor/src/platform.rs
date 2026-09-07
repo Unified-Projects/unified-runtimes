@@ -44,7 +44,7 @@ pub async fn set_permissions_recursive(_path: &std::path::Path) -> std::io::Resu
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

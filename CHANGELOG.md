@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`OPEN_RUNTIMES_CODE_PATH` not set on created runtimes**: openruntimes runtime images from September 2026 read `OPEN_RUNTIMES_CODE_PATH` in `/usr/local/server/helpers/lifecycle/extract.sh` to locate the code archive, falling back to scanning `/mnt/code` only when the variable is unset. URT mounted the downloaded source under the runtime's `/tmp` but never advertised its path, so serve-mode runtimes created with a source archive failed with "Code archive not found" unless the caller passed the variable by hand. `apply_runtime_env_vars` now sets `OPEN_RUNTIMES_CODE_PATH` to `/tmp/<mount file name>` whenever `source` is non-empty and the version is not legacy `v2`, matching executor-main 0.29 `Docker.php::createRuntime`. A value supplied in the request `variables` is left untouched. On-the-fly runtime creation from `routes/executions.rs` inherits the fix because it delegates to `create_runtime`.
+- **Unix-only permission tests broke the whole test binary on Windows**: `platform.rs`'s test module imports `std::os::unix::fs::PermissionsExt` under a plain `#[cfg(test)]`, so `cargo test -p urt-executor` failed to compile on Windows hosts. Gated on `#[cfg(all(test, unix))]`.
+
+### Changed
+- **Source archives keep their real extension in the `/tmp` mount**: the mount name is now derived by a single `source_mount_file_name` helper shared by the download path and the `OPEN_RUNTIMES_CODE_PATH` value, so the two cannot drift. `.tar.gz`, `.tgz`, `.tar`, `.sqfs` and `.gz` sources map to `code.tar.gz`, `code.tgz`, `code.tar`, `code.sqfs` and `code.gz` respectively; anything else keeps the previous `code.tar.gz` default. Previously only `.tar` was special-cased and every other source, squashfs included, was mounted as `code.tar.gz`. Build commands that hardcode `/tmp/code.tar.gz` (including the built-in Next.js build command) therefore only work with gzipped-tar sources, which matches executor-main.
+
 ## [0.4.1] - 2026-05-04
 
 ### Fixed
