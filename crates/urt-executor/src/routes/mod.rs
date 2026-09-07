@@ -8,6 +8,8 @@ mod logs;
 mod metrics;
 mod runtimes;
 
+pub(crate) use runtimes::{DEFAULT_RUNTIME_BIND_HOSTNAME, RUNTIME_BIND_HOSTNAME_VAR};
+
 use crate::config::ExecutorConfig;
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;

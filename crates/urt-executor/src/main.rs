@@ -281,6 +281,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         tasks::run_stats_collector(stats_docker, stats_registry, stats_shutdown).await;
     });
 
+    let listening_watch_registry = registry.clone();
+    let listening_watch_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        tasks::run_listening_watch(listening_watch_registry, listening_watch_shutdown).await;
+    });
+
     // Create application state
     let state = AppState {
         config: config.clone(),

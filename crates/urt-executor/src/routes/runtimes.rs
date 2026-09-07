@@ -90,6 +90,15 @@ fn uses_modern_runtime_layout(version: &str) -> bool {
     !is_legacy_v2(version)
 }
 
+/// Docker seeds this variable with the container identity. Server scripts that
+/// treat it as a bind address (Next.js standalone `server.js` reads
+/// `process.env.HOSTNAME || '0.0.0.0'`) then bind to a single per-container
+/// address, which the executor cannot reach from the runtimes network.
+pub(crate) const RUNTIME_BIND_HOSTNAME_VAR: &str = "HOSTNAME";
+
+/// Wildcard bind address, so a runtime answers on every network it is attached to.
+pub(crate) const DEFAULT_RUNTIME_BIND_HOSTNAME: &str = "0.0.0.0";
+
 struct RuntimeEnvVars<'a> {
     version: &'a str,
     entrypoint: &'a str,
@@ -141,6 +150,25 @@ fn apply_runtime_env_vars(
         env.insert(
             "OPEN_RUNTIMES_OUTPUT_DIRECTORY".to_string(),
             config.output_directory.to_string(),
+        );
+    }
+
+    apply_default_bind_hostname(env);
+}
+
+/// Seed the wildcard bind address unless the caller supplied a non-blank value
+/// of its own, which stays the escape hatch for a runtime that needs something
+/// else. A runtime that wants its container identity can read `/etc/hostname`,
+/// which this does not touch.
+fn apply_default_bind_hostname(env: &mut std::collections::HashMap<String, String>) {
+    let caller_supplied = env
+        .get(RUNTIME_BIND_HOSTNAME_VAR)
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if !caller_supplied {
+        env.insert(
+            RUNTIME_BIND_HOSTNAME_VAR.to_string(),
+            DEFAULT_RUNTIME_BIND_HOSTNAME.to_string(),
         );
     }
 }
@@ -1344,6 +1372,7 @@ mod tests {
     use super::{
         apply_runtime_env_vars, is_legacy_v2, is_live_container_state, sanitize_tar_flags,
         uses_modern_runtime_layout, KeepAliveRegistrationGuard, RuntimeEnvVars,
+        DEFAULT_RUNTIME_BIND_HOSTNAME, RUNTIME_BIND_HOSTNAME_VAR,
     };
     use crate::runtime::{KeepAliveRegistry, Runtime};
     use std::collections::HashMap;
@@ -1548,6 +1577,98 @@ mod tests {
         assert_eq!(
             env.get("INERNAL_EXECUTOR_HOSTNAME"),
             Some(&"executor-a".to_string())
+        );
+    }
+
+    fn modern_env_with(variables: &[(&str, &str)]) -> HashMap<String, String> {
+        let runtime = Runtime::new("rt-bind", "executor-a", "img", "v5", None);
+        let mut env: HashMap<String, String> = variables
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        apply_runtime_env_vars(
+            &mut env,
+            &runtime,
+            RuntimeEnvVars {
+                version: "v5",
+                entrypoint: "index.js",
+                executor_hostname: "executor-a",
+                cpus: 1.0,
+                memory: 512,
+                output_directory: "",
+            },
+        );
+
+        env
+    }
+
+    #[test]
+    fn test_apply_runtime_env_vars_defaults_bind_hostname_to_wildcard() {
+        let env = modern_env_with(&[]);
+
+        assert_eq!(
+            env.get(RUNTIME_BIND_HOSTNAME_VAR),
+            Some(&DEFAULT_RUNTIME_BIND_HOSTNAME.to_string()),
+            "runtimes must bind to the wildcard address so the executor can reach them"
+        );
+    }
+
+    #[test]
+    fn test_apply_runtime_env_vars_keeps_caller_supplied_bind_hostname() {
+        let env = modern_env_with(&[(RUNTIME_BIND_HOSTNAME_VAR, "127.0.0.1")]);
+
+        assert_eq!(
+            env.get(RUNTIME_BIND_HOSTNAME_VAR),
+            Some(&"127.0.0.1".to_string()),
+            "a caller-supplied HOSTNAME is the escape hatch and must survive"
+        );
+    }
+
+    #[test]
+    fn test_apply_runtime_env_vars_replaces_blank_bind_hostname() {
+        let env = modern_env_with(&[(RUNTIME_BIND_HOSTNAME_VAR, "   ")]);
+
+        assert_eq!(
+            env.get(RUNTIME_BIND_HOSTNAME_VAR),
+            Some(&DEFAULT_RUNTIME_BIND_HOSTNAME.to_string()),
+            "a blank value is not a bind address and must not defeat the default"
+        );
+    }
+
+    #[test]
+    fn test_apply_runtime_env_vars_does_not_set_bind_hostname_for_legacy_v2() {
+        let runtime = Runtime::new("rt-legacy-bind", "executor-a", "img", "v2", None);
+        let mut env = HashMap::new();
+
+        apply_runtime_env_vars(
+            &mut env,
+            &runtime,
+            RuntimeEnvVars {
+                version: "v2",
+                entrypoint: "index.php",
+                executor_hostname: "executor-a",
+                cpus: 1.0,
+                memory: 512,
+                output_directory: "",
+            },
+        );
+
+        assert_eq!(
+            env.get(RUNTIME_BIND_HOSTNAME_VAR),
+            None,
+            "legacy v2 images keep the Docker-provided container identity"
+        );
+    }
+
+    #[test]
+    fn test_apply_runtime_env_vars_leaves_executor_hostname_variables_untouched() {
+        let env = modern_env_with(&[]);
+
+        assert_eq!(
+            env.get("OPEN_RUNTIMES_HOSTNAME"),
+            Some(&"executor-a".to_string()),
+            "OPEN_RUNTIMES_HOSTNAME addresses the executor and is unrelated to the bind address"
         );
     }
 }

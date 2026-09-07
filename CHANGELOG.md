@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Next.js standalone runtimes bound to their container address and were unreachable**: Next's standalone `server.js` reads `process.env.HOSTNAME || '0.0.0.0'` as its bind address, and Docker seeds `HOSTNAME` with the container identity, which resolves to a single bridge address. The runtime bound there and nowhere else, so the executor on the runtimes network got an immediate connection refusal on every request while the registry reported `status=running, initialised=1, listening=0` indefinitely. `routes/runtimes.rs::apply_runtime_env_vars` now seeds `HOSTNAME=0.0.0.0` into the environment of every runtime container on the modern (non-v2) layout. A caller-supplied `HOSTNAME` still wins, so the per-site variable remains the escape hatch; a blank value is treated as unset. Legacy v2 containers keep the Docker-provided identity. `OPEN_RUNTIMES_HOSTNAME` is a different variable (it carries the executor's hostname to the runtime) and is unchanged, as are the container's own hostname, `/etc/hostname` and the `urt.*` labels.
+- **Unix-only permission tests broke the test build on Windows**: `platform.rs` gated its test module on `#[cfg(test)]` while every test body uses `std::os::unix::fs::PermissionsExt`, so `cargo test -p urt-executor` failed to compile off Unix. Now gated on `#[cfg(all(test, unix))]`, matching the production functions it exercises.
+
+### Added
+- **Non-listening runtime watchdog** (`tasks::listening_watch`, spawned from `main.rs`): scans the registry every 30s and logs a warning naming any runtime that has been running and initialised for at least 120s without ever having been observed listening on port 3000, pointing at a container-address bind as the likely cause. Each runtime is reported once; names that leave the registry are forgotten, so a runtime recreated under the same name is reported again. This fault class was previously only visible by reading `listening` out of the registry by hand.
+
 ## [0.4.1] - 2026-05-04
 
 ### Fixed
