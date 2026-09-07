@@ -29,7 +29,7 @@ use docker::DockerManager;
 use execution_counter::active_executions;
 use platform::temp_dir;
 use routes::{create_router, AppState};
-use runtime::{KeepAliveRegistry, RuntimeRegistry};
+use runtime::{CreateTracker, KeepAliveRegistry, RuntimeRegistry};
 use storage::{Storage, StorageFileCache};
 
 /// Main entry point with optimized Tokio runtime configuration
@@ -256,17 +256,24 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Warmup complete, proceeding to bind listener");
     }
 
-    let maintenance_docker = docker.clone();
-    let maintenance_registry = registry.clone();
-    let maintenance_keep_alive = keep_alive_registry.clone();
+    // Shared with the maintenance worker so it can tell a pending registry entry
+    // that still has a build behind it from one that was orphaned.
+    let readiness: Arc<DashMap<String, Arc<tokio::sync::Notify>>> = Arc::new(DashMap::new());
+    let create_tracker = CreateTracker::new();
+
+    let maintenance_handles = tasks::MaintenanceHandles {
+        docker: docker.clone(),
+        registry: registry.clone(),
+        keep_alive_registry: keep_alive_registry.clone(),
+        readiness: readiness.clone(),
+        create_tracker: create_tracker.clone(),
+    };
     let maintenance_config = config.clone();
     let maintenance_storage = storage.clone();
     let maintenance_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         tasks::run_maintenance(
-            maintenance_docker,
-            maintenance_registry,
-            maintenance_keep_alive,
+            maintenance_handles,
             maintenance_config,
             maintenance_storage,
             maintenance_shutdown,
@@ -293,7 +300,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_create_limiter,
         execution_limiter_capacity,
         runtime_create_limiter_capacity,
-        readiness: Arc::new(DashMap::new()),
+        readiness,
+        create_tracker,
     };
 
     // Create router

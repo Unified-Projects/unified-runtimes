@@ -5,13 +5,16 @@ use crate::docker::container::ContainerInfo;
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;
 use crate::resilience::retry_with_backoff;
-use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime, RuntimeRegistry};
+use crate::runtime::{
+    wait_for_runtime_port, CreateTracker, KeepAliveRegistry, Runtime, RuntimeRegistry,
+};
 use crate::storage::{BuildCache, Storage};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tracing::{debug, info, warn};
 
 /// Maximum build cache size in bytes (1GB)
@@ -381,18 +384,33 @@ pub async fn adopt_existing_containers(
     }
 }
 
+/// The state the maintenance worker shares with the request path.
+#[derive(Clone)]
+pub struct MaintenanceHandles {
+    pub docker: Arc<DockerManager>,
+    pub registry: RuntimeRegistry,
+    pub keep_alive_registry: KeepAliveRegistry,
+    pub readiness: Arc<DashMap<String, Arc<Notify>>>,
+    pub create_tracker: CreateTracker,
+}
+
 /// Run the maintenance worker
 ///
 /// Idle runtimes are always eligible for cleanup, but runtimes that currently
 /// own a keep-alive ID stay protected.
 pub async fn run_maintenance<S: Storage + 'static>(
-    docker: Arc<DockerManager>,
-    registry: RuntimeRegistry,
-    keep_alive_registry: KeepAliveRegistry,
+    handles: MaintenanceHandles,
     config: ExecutorConfig,
     storage: S,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let MaintenanceHandles {
+        docker,
+        registry,
+        keep_alive_registry,
+        readiness,
+        create_tracker,
+    } = handles;
     let interval = Duration::from_secs(config.maintenance_interval);
     let build_cache = BuildCache::new(storage, "builds");
 
@@ -425,6 +443,11 @@ pub async fn run_maintenance<S: Storage + 'static>(
                 cleanup_orphaned_keepalive(&docker, &registry, &keep_alive_registry, &config.hostname, &managed_containers).await;
 
                 cleanup_idle(&docker, &registry, &keep_alive_registry, config.inactive_threshold).await;
+
+                // Runs before the untracked-container sweep so a container left
+                // behind by a reaped entry is cleaned up in the same cycle.
+                cleanup_stale_pending(&registry, &readiness, &create_tracker, config.pending_max_age_secs).await;
+
                 cleanup_untracked_managed_containers(&docker, &registry, &config.hostname, &managed_containers).await;
 
                 if config.keep_alive {
@@ -553,6 +576,68 @@ async fn cleanup_idle(
         // Remove from registry AFTER Docker is done
         registry.remove(name).await;
     }
+}
+
+/// Whether a registry entry is a pending entry that nothing will ever resolve.
+///
+/// Pending entries are only produced by `create_runtime`, which keeps its build
+/// registered in the `CreateTracker` for the whole time it runs. An entry that
+/// is pending with no create behind it is therefore orphaned, and once it is
+/// past `max_age_secs` it is not a create that has only just registered either.
+fn is_orphaned_pending(
+    runtime: &Runtime,
+    create_tracker: &CreateTracker,
+    max_age_secs: u64,
+) -> bool {
+    runtime.is_pending()
+        && !create_tracker.is_in_flight(&runtime.name)
+        && runtime.age_seconds() >= max_age_secs
+}
+
+/// Reap pending registry entries whose create is no longer in flight.
+///
+/// An orphaned pending entry is what wedges a runtime ID: every later create
+/// trips the existing-runtime guard and gets `RuntimeConflict`, and every
+/// execution parks on a readiness notifier that nothing will fire. This is the
+/// safety net for the cases the create path cannot clean up itself, such as a
+/// build task that panicked. Returns the number of entries reaped.
+pub async fn cleanup_stale_pending(
+    registry: &RuntimeRegistry,
+    readiness: &DashMap<String, Arc<Notify>>,
+    create_tracker: &CreateTracker,
+    max_age_secs: u64,
+) -> usize {
+    let orphaned: Vec<Runtime> = registry
+        .list()
+        .await
+        .into_iter()
+        .filter(|runtime| is_orphaned_pending(runtime, create_tracker, max_age_secs))
+        .collect();
+
+    for runtime in &orphaned {
+        warn!(
+            "Reaping orphaned pending runtime {} ({}s old, no create in flight)",
+            runtime.name,
+            runtime.age_seconds()
+        );
+
+        // Wake parked waiters before the entry disappears so they re-check and
+        // return a deterministic 404 instead of waiting out their deadline.
+        if let Some((_, notify)) = readiness.remove(&runtime.name) {
+            notify.notify_waiters();
+        }
+        registry.remove(&runtime.name).await;
+
+        let tmp_folder = crate::platform::temp_dir().join(&runtime.name);
+        if let Err(e) = tokio::fs::remove_dir_all(&tmp_folder).await {
+            debug!(
+                "No temp directory removed for reaped runtime {}: {}",
+                runtime.name, e
+            );
+        }
+    }
+
+    orphaned.len()
 }
 
 async fn cleanup_untracked_managed_containers(
@@ -771,11 +856,16 @@ async fn cleanup_temp_dirs(hostname: &str, registry: &RuntimeRegistry) {
 #[cfg(test)]
 mod tests {
     use super::{
-        belongs_to_hostname, infer_runtime_version, is_container_running,
+        belongs_to_hostname, cleanup_stale_pending, infer_runtime_version, is_container_running,
         keep_alive_id_from_container, runtime_id_from_container,
     };
     use crate::docker::container::ContainerInfo;
+    use crate::runtime::create_tracker::BeginCreate;
+    use crate::runtime::{CreateTracker, Runtime, RuntimeRegistry};
+    use dashmap::DashMap;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     fn container(name: &str) -> ContainerInfo {
         ContainerInfo {
@@ -867,5 +957,107 @@ mod tests {
 
         let runtime = super::runtime_from_container(&container, "executor").unwrap();
         assert_eq!(runtime.hostname, "runtime-host-123");
+    }
+
+    /// A pending entry aged `age_secs` seconds.
+    fn aged_pending(runtime_id: &str, age_secs: f64) -> Runtime {
+        let mut runtime = Runtime::new(runtime_id, "executor", "img", "v5", None);
+        runtime.created -= age_secs;
+        runtime.updated -= age_secs;
+        runtime
+    }
+
+    #[tokio::test]
+    async fn reaps_pending_entries_with_no_create_in_flight() {
+        let registry = RuntimeRegistry::new();
+        let readiness: DashMap<String, Arc<Notify>> = DashMap::new();
+        let create_tracker = CreateTracker::new();
+
+        registry
+            .insert(aged_pending("wedged", 600.0))
+            .await
+            .unwrap();
+        readiness.insert("executor-wedged".to_string(), Arc::new(Notify::new()));
+
+        let reaped = cleanup_stale_pending(&registry, &readiness, &create_tracker, 300).await;
+
+        assert_eq!(reaped, 1);
+        assert!(
+            registry.get("executor-wedged").await.is_none(),
+            "an orphaned pending entry must be reaped so later creates stop getting 409"
+        );
+        assert!(
+            !readiness.contains_key("executor-wedged"),
+            "the readiness notifier must go with the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_reap_a_pending_entry_whose_build_is_still_running() {
+        let registry = RuntimeRegistry::new();
+        let readiness: DashMap<String, Arc<Notify>> = DashMap::new();
+        let create_tracker = CreateTracker::new();
+
+        registry
+            .insert(aged_pending("building", 6_000.0))
+            .await
+            .unwrap();
+
+        // Hold the create slot for the whole check, as a running build does.
+        let _slot = match create_tracker.begin("executor-building") {
+            BeginCreate::Started(slot) => slot,
+            BeginCreate::Joined(_) => panic!("slot must be free"),
+        };
+
+        let reaped = cleanup_stale_pending(&registry, &readiness, &create_tracker, 300).await;
+
+        assert_eq!(reaped, 0);
+        assert!(
+            registry.get("executor-building").await.is_some(),
+            "a build that is still running must keep its pending entry, however long it takes"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_reap_young_pending_or_running_entries() {
+        let registry = RuntimeRegistry::new();
+        let readiness: DashMap<String, Arc<Notify>> = DashMap::new();
+        let create_tracker = CreateTracker::new();
+
+        registry.insert(aged_pending("fresh", 5.0)).await.unwrap();
+
+        let mut running = aged_pending("live", 6_000.0);
+        running.mark_running("running");
+        registry.insert(running).await.unwrap();
+
+        let reaped = cleanup_stale_pending(&registry, &readiness, &create_tracker, 300).await;
+
+        assert_eq!(reaped, 0);
+        assert!(registry.get("executor-fresh").await.is_some());
+        assert!(registry.get("executor-live").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reaping_wakes_readiness_waiters() {
+        let registry = RuntimeRegistry::new();
+        let readiness: DashMap<String, Arc<Notify>> = DashMap::new();
+        let create_tracker = CreateTracker::new();
+
+        registry
+            .insert(aged_pending("wedged", 600.0))
+            .await
+            .unwrap();
+        let notify = Arc::new(Notify::new());
+        readiness.insert("executor-wedged".to_string(), notify.clone());
+
+        let waiter = tokio::spawn(async move { notify.notified().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        cleanup_stale_pending(&registry, &readiness, &create_tracker, 300).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("a parked waiter must be woken by the reap, not left to its deadline")
+            .unwrap();
     }
 }

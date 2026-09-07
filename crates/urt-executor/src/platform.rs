@@ -44,7 +44,9 @@ pub async fn set_permissions_recursive(_path: &std::path::Path) -> std::io::Resu
     Ok(())
 }
 
-#[cfg(test)]
+// The permission assertions below are Unix-only; Windows has no mode bits and
+// the helpers under test are no-ops there.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

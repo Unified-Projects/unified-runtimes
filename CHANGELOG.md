@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Runtime IDs wedged permanently by a cancelled create**: `routes/runtimes.rs::create_runtime` inserted the registry entry as `pending` and then downloaded the source and created the container on the handler future. axum drops that future when the client disconnects, and cancellation is not an error path, so a caller that gave up mid-download (a 180 MB cold start over a slow link, for instance) left a `pending` entry that nothing removed: every later create for that runtime ID hit the existing-runtime guard and returned `RuntimeConflict`, which Appwrite surfaces as a 500, until the entry was deleted by hand. The build now runs on a detached task that the handler only observes, so a disconnect no longer cancels the download or the container creation, and the pending entry is always resolved by the work behind it.
+- **A create already in flight is joined instead of refused**: a second create for the same runtime ID now waits on the running build and returns its result, rather than being rejected outright by the conflict guard. A slow first attempt no longer poisons every request behind it.
+- **Working directory and container left behind on create failure**: the source-download, container-creation, container-startup and temp-path failure branches removed the registry entry but not the runtime's tmp folder, and the temp-base canonicalisation failure returned through `?` without removing the pending entry at all. All create failure paths now go through `abandon_pending_create`, which removes the container if one reached Docker, deletes the working directory, wakes readiness waiters and removes the registry entry.
+- **Unix-only permission tests broke the Windows test build**: `platform.rs` gated its test module on `cfg(test)` while using `std::os::unix`, so `cargo test -p urt-executor` could not compile the library test target on Windows. Gated on `cfg(all(test, unix))`.
+
+### Added
+- **`runtime::CreateTracker`**: records every create for the duration of its build, keyed by container name. Backs both the join-in-flight behaviour and the maintenance reaper. `CreateSlot::drop` publishes a failure when a build task ends without an outcome, so no caller can park on a slot that nothing will resolve.
+- **Maintenance reaper for orphaned pending entries** (`tasks::cleanup_stale_pending`): removes pending registry entries that are past `pending_max_age_secs` and have no create in flight, waking any parked readiness waiters first so they get a deterministic 404 rather than waiting out their deadline. Entries whose build is still running are never reaped, however long the build takes. Runs before the untracked-container sweep so a container left by a reaped entry is cleaned up in the same cycle.
+- **`Config::pending_max_age_secs`** (env `URT_PENDING_MAX_AGE_SECS`, default 300s): age bound for the reaper above.
+- **13 tests**: `runtime::create_tracker` unit tests cover a cancelled caller not aborting the build, a cancelled create leaving no pending entry, a retry joining the in-flight build instead of conflicting, and a panicking build releasing its slot; `tasks::maintenance` unit tests and the `cold_start_wedge` integration module cover reaping orphaned pending entries, leaving in-flight and recent entries alone, waking waiters on reap, and the config knob. None require Docker.
+
+### Changed
+- **`tasks::run_maintenance` takes a `MaintenanceHandles` struct** rather than five positional handles, now that it also needs the readiness map and the create tracker.
+
 ## [0.4.1] - 2026-05-04
 
 ### Fixed
