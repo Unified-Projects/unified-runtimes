@@ -1,13 +1,14 @@
-//! Load testing benchmark suite for URT Executor
+//! Load testing primitives for the executor benchmark suite.
 //!
-//! This module provides high-performance load testing:
 //! - Open-loop benchmarking (no artificial throttling)
 //! - Concurrent warmup for proper connection pooling
-//! - Accurate latency measurement (request time only)
+//! - Latency measured per request, including body read
 //! - Pooled results with percentile calculation
+//! - Container resource sampling via the Docker CLI
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-/// Benchmark configuration
+/// Benchmark configuration for one executor target
 #[derive(Debug, Clone)]
 pub struct BenchmarkConfig {
     /// Base URL of the executor
@@ -35,7 +36,7 @@ pub struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:9901".to_string(),
+            base_url: "http://localhost:9900".to_string(),
             secret: "benchmark-secret".to_string(),
             concurrency: 50,
             duration: Duration::from_secs(30),
@@ -69,10 +70,20 @@ pub struct BenchmarkResults {
     pub duration_secs: f64,
     /// Latency statistics in milliseconds
     pub latency: LatencyStats,
-    /// HTTP status code distribution
+    /// Status code distribution
     pub status_codes: HashMap<u16, u64>,
     /// Error messages
     pub errors: Vec<String>,
+}
+
+impl BenchmarkResults {
+    pub fn success_pct(&self) -> f64 {
+        if self.total_requests == 0 {
+            0.0
+        } else {
+            self.successful_requests as f64 / self.total_requests as f64 * 100.0
+        }
+    }
 }
 
 /// Latency statistics
@@ -87,6 +98,24 @@ pub struct LatencyStats {
     pub p999_ms: f64,
 }
 
+/// Function source handed to both executors when creating a runtime
+#[derive(Debug, Clone)]
+pub struct FunctionSpec {
+    pub image: String,
+    /// Path to the code archive as seen by the executor's storage device
+    pub source: Option<String>,
+    pub entrypoint: String,
+    pub runtime_entrypoint: String,
+    pub variables: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Outcome of one request, as judged by the benchmark
+pub struct Outcome {
+    /// Effective status code (HTTP status, or the function status for executions)
+    pub status: u16,
+    pub success: bool,
+}
+
 /// High-performance load tester using open-loop benchmarking
 pub struct LoadTester {
     config: BenchmarkConfig,
@@ -97,6 +126,39 @@ pub fn apply_auth_headers(builder: RequestBuilder, secret: &str) -> RequestBuild
     builder
         .header("Authorization", format!("Bearer {}", secret))
         .header("x-open-runtimes-secret", secret)
+}
+
+/// Build the execution request body
+fn execution_payload(path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "body": "{}",
+        "path": path,
+        "method": "GET",
+        "headers": {}
+    })
+}
+
+/// Read an execution response and judge it by the function's own status code,
+/// so a runtime that answers 503 to every call is not counted as a success just
+/// because the executor wrapped it in an HTTP 200.
+async fn judge_execution(resp: reqwest::Response) -> Result<Outcome, reqwest::Error> {
+    let http_status = resp.status().as_u16();
+    let body = resp.bytes().await?;
+    if !(200..300).contains(&http_status) {
+        return Ok(Outcome {
+            status: http_status,
+            success: false,
+        });
+    }
+    let function_status = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("statusCode").and_then(|s| s.as_u64()))
+        .map(|s| s as u16)
+        .unwrap_or(http_status);
+    Ok(Outcome {
+        status: function_status,
+        success: (200..300).contains(&function_status),
+    })
 }
 
 impl LoadTester {
@@ -112,6 +174,21 @@ impl LoadTester {
         Self { config, client }
     }
 
+    pub fn with_concurrency(&self, concurrency: usize) -> Self {
+        Self::new(BenchmarkConfig {
+            concurrency,
+            ..self.config.clone()
+        })
+    }
+
+    pub fn with_timing(&self, duration: Duration, warmup: Duration) -> Self {
+        Self::new(BenchmarkConfig {
+            duration,
+            warmup,
+            ..self.config.clone()
+        })
+    }
+
     /// Run a benchmark against the health endpoint
     pub async fn benchmark_health(&self) -> BenchmarkResults {
         let url = format!("{}/v1/health", self.config.base_url);
@@ -119,7 +196,14 @@ impl LoadTester {
         self.run_benchmark("health_endpoint", move |client| {
             let url = url.clone();
             let secret = secret.clone();
-            async move { apply_auth_headers(client.get(&url), &secret).send().await }
+            async move {
+                let resp = apply_auth_headers(client.get(&url), &secret).send().await?;
+                let status = resp.status();
+                Ok(Outcome {
+                    status: status.as_u16(),
+                    success: status.is_success(),
+                })
+            }
         })
         .await
     }
@@ -129,7 +213,14 @@ impl LoadTester {
         let url = format!("{}/v1/ping", self.config.base_url);
         self.run_benchmark("ping_endpoint", move |client| {
             let url = url.clone();
-            async move { client.get(&url).send().await }
+            async move {
+                let resp = client.get(&url).send().await?;
+                let status = resp.status();
+                Ok(Outcome {
+                    status: status.as_u16(),
+                    success: status.is_success(),
+                })
+            }
         })
         .await
     }
@@ -141,7 +232,14 @@ impl LoadTester {
         self.run_benchmark("list_runtimes", move |client| {
             let url = url.clone();
             let secret = secret.clone();
-            async move { apply_auth_headers(client.get(&url), &secret).send().await }
+            async move {
+                let resp = apply_auth_headers(client.get(&url), &secret).send().await?;
+                let status = resp.status();
+                Ok(Outcome {
+                    status: status.as_u16(),
+                    success: status.is_success(),
+                })
+            }
         })
         .await
     }
@@ -162,12 +260,7 @@ impl LoadTester {
             self.config.base_url, runtime_id
         );
         let secret = self.config.secret.clone();
-        let payload = serde_json::json!({
-            "body": "{}",
-            "path": path,
-            "method": "GET",
-            "headers": {}
-        });
+        let payload = execution_payload(path);
 
         let bench_name = if path == "/" {
             "function_execution".to_string()
@@ -183,11 +276,12 @@ impl LoadTester {
             let secret = secret.clone();
             let payload = payload.clone();
             async move {
-                apply_auth_headers(client.post(&url), &secret)
+                let resp = apply_auth_headers(client.post(&url), &secret)
                     .header("Content-Type", "application/json")
                     .json(&payload)
                     .send()
-                    .await
+                    .await?;
+                judge_execution(resp).await
             }
         })
         .await
@@ -197,10 +291,9 @@ impl LoadTester {
     async fn run_benchmark<F, Fut>(&self, name: &str, request_fn: F) -> BenchmarkResults
     where
         F: Fn(Client) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + Send,
+        Fut: std::future::Future<Output = Result<Outcome, reqwest::Error>> + Send,
     {
         // Phase 1: Concurrent warmup
-        println!("Warming up for {:?}...", self.config.warmup);
         let warmup_handles: Vec<_> = (0..self.config.concurrency)
             .map(|_| {
                 let client = self.client.clone();
@@ -217,21 +310,14 @@ impl LoadTester {
         futures::future::join_all(warmup_handles).await;
 
         // Phase 2: Main benchmark - fire as fast as possible
-        println!(
-            "Running benchmark for {:?} with {} workers...",
-            self.config.duration, self.config.concurrency
-        );
-
         let total_requests = Arc::new(AtomicU64::new(0));
         let successful_requests = Arc::new(AtomicU64::new(0));
         let failed_requests = Arc::new(AtomicU64::new(0));
         let results = Arc::new(Mutex::new(Vec::with_capacity(100_000)));
-        let status_codes = Arc::new(Mutex::new(HashMap::new()));
         let errors = Arc::new(Mutex::new(Vec::new()));
 
         let benchmark_start = Instant::now();
 
-        // Spawn workers that hammer the endpoint
         let handles: Vec<_> = (0..self.config.concurrency)
             .map(|_| {
                 let client = self.client.clone();
@@ -241,7 +327,6 @@ impl LoadTester {
                 let successful_requests = successful_requests.clone();
                 let failed_requests = failed_requests.clone();
                 let results = results.clone();
-                let status_codes = status_codes.clone();
                 let errors = errors.clone();
 
                 tokio::spawn(async move {
@@ -249,7 +334,6 @@ impl LoadTester {
                     let mut local_results = Vec::with_capacity(10_000);
 
                     while worker_start.elapsed() < duration {
-                        // Measure ONLY the request time
                         let req_start = Instant::now();
                         let response = request_fn(client.clone()).await;
                         let latency_ns = req_start.elapsed().as_nanos() as u64;
@@ -257,22 +341,16 @@ impl LoadTester {
                         total_requests.fetch_add(1, Ordering::Relaxed);
 
                         match response {
-                            Ok(resp) => {
-                                let status = resp.status().as_u16();
-
-                                if resp.status().is_success() {
+                            Ok(outcome) => {
+                                if outcome.success {
                                     successful_requests.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     failed_requests.fetch_add(1, Ordering::Relaxed);
                                 }
-
-                                local_results.push(RequestResult { latency_ns, status });
-
-                                // Update status codes less frequently
-                                if local_results.len() % 100 == 0 {
-                                    let mut codes = status_codes.lock().await;
-                                    *codes.entry(status).or_insert(0) += 100;
-                                }
+                                local_results.push(RequestResult {
+                                    latency_ns,
+                                    status: outcome.status,
+                                });
                             }
                             Err(e) => {
                                 failed_requests.fetch_add(1, Ordering::Relaxed);
@@ -284,14 +362,12 @@ impl LoadTester {
                         }
                     }
 
-                    // Merge local results at end
                     let mut global_results = results.lock().await;
                     global_results.extend(local_results);
                 })
             })
             .collect();
 
-        // Wait for all workers
         futures::future::join_all(handles).await;
 
         let actual_duration = benchmark_start.elapsed();
@@ -302,11 +378,10 @@ impl LoadTester {
         let failed = failed_requests.load(Ordering::Relaxed);
         let rps = total as f64 / actual_duration.as_secs_f64();
 
-        // Calculate latency percentiles
         let results_guard = results.lock().await;
         let mut latencies: Vec<f64> = results_guard
             .iter()
-            .map(|r| r.latency_ns as f64 / 1_000_000.0) // Convert to ms
+            .map(|r| r.latency_ns as f64 / 1_000_000.0)
             .collect();
         latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -333,7 +408,6 @@ impl LoadTester {
             }
         };
 
-        // Rebuild accurate status code counts from collected results
         let mut status_codes_map = HashMap::new();
         for result in results_guard.iter() {
             *status_codes_map.entry(result.status).or_insert(0) += 1;
@@ -355,32 +429,36 @@ impl LoadTester {
     }
 }
 
-/// Create a runtime for benchmarking
+/// Create a runtime for benchmarking. Returns the time the create call took.
 pub async fn create_benchmark_runtime(
     base_url: &str,
     secret: &str,
     runtime_id: &str,
-    image: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+    function: &FunctionSpec,
+) -> Result<Duration, Box<dyn std::error::Error>> {
     let client = Client::new();
     let url = format!("{}/v1/runtimes", base_url);
 
-    // The runtimeEntrypoint becomes the container CMD via `bash -c runtimeEntrypoint`
-    // Run the server in foreground to keep the container alive (Docker.php line 463)
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "runtimeId": runtime_id,
-        "image": image,
-        "entrypoint": "",
-        "variables": {},
-        "runtimeEntrypoint": "cd /usr/local/server && exec node src/server.js"
+        "image": function.image,
+        "entrypoint": function.entrypoint,
+        "version": "v5",
+        "variables": function.variables,
+        "runtimeEntrypoint": function.runtime_entrypoint
     });
+    if let Some(ref source) = function.source {
+        payload["source"] = serde_json::Value::String(source.clone());
+    }
 
+    let start = Instant::now();
     let response = apply_auth_headers(client.post(&url), secret)
         .header("Content-Type", "application/json")
         .json(&payload)
         .timeout(Duration::from_secs(120))
         .send()
         .await?;
+    let elapsed = start.elapsed();
 
     if !response.status().is_success() {
         let status = response.status();
@@ -393,9 +471,61 @@ pub async fn create_benchmark_runtime(
         return Err(format!("Failed to create runtime: {} - {}", status, body).into());
     }
 
-    // Wait for runtime to be ready
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    Ok(())
+    Ok(elapsed)
+}
+
+/// Poll executions until the function answers with a 2xx status. Returns the
+/// time from the first attempt to the first successful response.
+pub async fn wait_for_first_execution(
+    base_url: &str,
+    secret: &str,
+    runtime_id: &str,
+    max_wait: Duration,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let url = format!("{}/v1/runtimes/{}/executions", base_url, runtime_id);
+    let payload = execution_payload("/");
+
+    let start = Instant::now();
+    let mut last_status: Option<u16> = None;
+    let mut last_body = String::new();
+    while start.elapsed() < max_wait {
+        let resp = apply_auth_headers(client.post(&url), secret)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await;
+        match resp {
+            Ok(resp) => {
+                let http_status = resp.status().as_u16();
+                let body = resp.bytes().await.unwrap_or_default();
+                let function_status = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("statusCode").and_then(|s| s.as_u64()))
+                    .map(|s| s as u16);
+                let effective = if (200..300).contains(&http_status) {
+                    function_status.unwrap_or(http_status)
+                } else {
+                    http_status
+                };
+                if (200..300).contains(&effective) {
+                    return Ok(start.elapsed());
+                }
+                last_status = Some(effective);
+                last_body = String::from_utf8_lossy(&body).chars().take(300).collect();
+            }
+            Err(e) => {
+                last_body = e.to_string();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    Err(format!(
+        "runtime {} never answered a successful execution within {:?} (last status {:?}: {})",
+        runtime_id, max_wait, last_status, last_body
+    )
+    .into())
 }
 
 /// Delete a benchmark runtime
@@ -408,10 +538,171 @@ pub async fn delete_benchmark_runtime(
     let url = format!("{}/v1/runtimes/{}", base_url, runtime_id);
 
     apply_auth_headers(client.delete(&url), secret)
+        .timeout(Duration::from_secs(60))
         .send()
         .await?;
 
     Ok(())
+}
+
+/// Package a function source directory into a gzipped tarball at a path the
+/// executors can read. The archive is produced inside a throwaway container so
+/// the output lands on the Docker host's filesystem, which both executors mount
+/// at /tmp, regardless of where this binary runs.
+///
+/// The archive mirrors a build artefact: the runtime start lifecycle sources a
+/// `.open-runtimes` env file from the extracted tree, so an empty one is added.
+pub fn package_function_source(
+    source_dir: &str,
+    archive_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let archive_dir = std::path::Path::new(archive_path)
+        .parent()
+        .ok_or("archive path has no parent directory")?
+        .to_string_lossy()
+        .into_owned();
+    let archive_name = std::path::Path::new(archive_path)
+        .file_name()
+        .ok_or("archive path has no file name")?
+        .to_string_lossy()
+        .into_owned();
+
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/src:ro", source_dir),
+            "-v",
+            &format!("{}:/out", archive_dir),
+            "alpine:latest",
+            "sh",
+            "-c",
+            &format!(
+                "cp -r /src /work && touch /work/.open-runtimes && tar czf /out/{} -C /work . && chmod 644 /out/{}",
+                archive_name, archive_name
+            ),
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "failed to package function source: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// One `docker stats` sample for a container
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceSample {
+    pub mem_mb: f64,
+    pub cpu_pct: f64,
+}
+
+/// Summary of resource samples taken while a benchmark ran
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceStats {
+    pub container: String,
+    pub samples: usize,
+    pub idle_mem_mb: f64,
+    pub mean_mem_mb: f64,
+    pub peak_mem_mb: f64,
+    pub mean_cpu_pct: f64,
+    pub peak_cpu_pct: f64,
+}
+
+/// Parse a docker size string such as "123.4MiB" or "1.2GB" into megabytes
+fn parse_docker_size_mb(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: f64 = num.trim().parse().ok()?;
+    let factor = match unit.trim() {
+        "B" => 1.0 / (1024.0 * 1024.0),
+        "KiB" | "kB" | "KB" => 1.0 / 1024.0,
+        "MiB" | "MB" => 1.0,
+        "GiB" | "GB" => 1024.0,
+        "TiB" | "TB" => 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some(value * factor)
+}
+
+/// Take one resource sample of a container via `docker stats`
+pub fn sample_container(container: &str) -> Option<ResourceSample> {
+    let output = Command::new("docker")
+        .args([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{.MemUsage}}|{{.CPUPerc}}",
+            container,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next()?;
+    let (mem, cpu) = line.split_once('|')?;
+    let mem_used = mem.split('/').next()?;
+    let mem_mb = parse_docker_size_mb(mem_used)?;
+    let cpu_pct: f64 = cpu.trim().trim_end_matches('%').parse().ok()?;
+    Some(ResourceSample { mem_mb, cpu_pct })
+}
+
+/// Samples a container's resource usage on a background thread until stopped
+pub struct ResourceSampler {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Vec<ResourceSample>>,
+    container: String,
+    idle: Option<ResourceSample>,
+}
+
+impl ResourceSampler {
+    pub fn start(container: &str) -> Self {
+        let idle = sample_container(container);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let name = container.to_string();
+        let handle = std::thread::spawn(move || {
+            let mut samples = Vec::new();
+            while !stop_flag.load(Ordering::Relaxed) {
+                if let Some(sample) = sample_container(&name) {
+                    samples.push(sample);
+                }
+            }
+            samples
+        });
+        Self {
+            stop,
+            handle,
+            container: container.to_string(),
+            idle,
+        }
+    }
+
+    pub fn finish(self) -> Option<ResourceStats> {
+        self.stop.store(true, Ordering::Relaxed);
+        let samples = self.handle.join().unwrap_or_default();
+        if samples.is_empty() {
+            return None;
+        }
+        let n = samples.len() as f64;
+        Some(ResourceStats {
+            container: self.container,
+            samples: samples.len(),
+            idle_mem_mb: self.idle.map(|s| s.mem_mb).unwrap_or(0.0),
+            mean_mem_mb: samples.iter().map(|s| s.mem_mb).sum::<f64>() / n,
+            peak_mem_mb: samples.iter().map(|s| s.mem_mb).fold(0.0, f64::max),
+            mean_cpu_pct: samples.iter().map(|s| s.cpu_pct).sum::<f64>() / n,
+            peak_cpu_pct: samples.iter().map(|s| s.cpu_pct).fold(0.0, f64::max),
+        })
+    }
 }
 
 /// Print benchmark results in a nice format
@@ -442,7 +733,9 @@ pub fn print_results(results: &BenchmarkResults) {
     println!("  Max:              {:.2}ms", results.latency.max_ms);
     println!();
     println!("Status Codes:");
-    for (code, count) in &results.status_codes {
+    let mut codes: Vec<_> = results.status_codes.iter().collect();
+    codes.sort();
+    for (code, count) in codes {
         println!("  {}: {}", code, count);
     }
     if !results.errors.is_empty() {
@@ -455,12 +748,8 @@ pub fn print_results(results: &BenchmarkResults) {
     println!("{:=<60}", "");
 }
 
-/// Cleanup Docker containers from benchmark runs
-/// Removes containers with urt.managed=true label, excluding panini and known services
+/// Remove leftover runtime containers created by URT during benchmark runs
 pub async fn cleanup_benchmark_containers() {
-    use std::process::Command;
-
-    // Get containers with urt.managed=true label
     let output = Command::new("docker")
         .args([
             "ps",
@@ -482,7 +771,6 @@ pub async fn cleanup_benchmark_containers() {
                 continue;
             }
 
-            // Skip panini and known service containers
             if name.contains("panini")
                 || name.contains("redis")
                 || name.contains("minio")
@@ -492,7 +780,6 @@ pub async fn cleanup_benchmark_containers() {
                 continue;
             }
 
-            // Remove the container
             let rm_result = Command::new("docker").args(["rm", "-f", name]).output();
 
             if rm_result.is_ok() {
@@ -504,137 +791,6 @@ pub async fn cleanup_benchmark_containers() {
             println!("  Removed {} leftover container(s)", cleaned);
         } else {
             println!("  No leftover containers to clean");
-        }
-    }
-}
-
-/// Run Apache Bench (ab) and parse results
-/// Returns BenchmarkResults with ab metrics
-/// Set quiet=true to suppress console output
-pub async fn run_ab_benchmark(
-    url: &str,
-    requests: u64,
-    concurrency: usize,
-    quiet: bool,
-    secret: &str,
-) -> Option<BenchmarkResults> {
-    use std::process::Command;
-
-    if !quiet {
-        println!("\n### Apache Bench (ab) Validation ###");
-        println!("Running: ab -n {} -c {} -k {}", requests, concurrency, url);
-    }
-
-    let output = Command::new("ab")
-        .args([
-            "-n",
-            &requests.to_string(),
-            "-c",
-            &concurrency.to_string(),
-            "-k", // Keep-alive
-            "-H",
-            &format!("Authorization: Bearer {}", secret),
-            "-H",
-            &format!("x-open-runtimes-secret: {}", secret),
-            url,
-        ])
-        .output();
-
-    match output {
-        Ok(result) => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            let stderr = String::from_utf8_lossy(&result.stderr);
-
-            if !result.status.success() {
-                eprintln!("ab failed: {}", stderr);
-                return None;
-            }
-
-            // Parse ab output
-            let mut rps = 0.0;
-            let mut total_requests = 0u64;
-            let mut failed_requests = 0u64;
-            let mut mean_ms = 0.0;
-            let mut p50_ms = 0.0;
-            let mut p99_ms = 0.0;
-            let mut min_ms = 0.0;
-            let mut max_ms = 0.0;
-
-            for line in stdout.lines() {
-                let line = line.trim();
-
-                if line.starts_with("Requests per second:") {
-                    if let Some(val) = line.split_whitespace().nth(3) {
-                        rps = val.parse().unwrap_or(0.0);
-                    }
-                } else if line.starts_with("Complete requests:") {
-                    if let Some(val) = line.split_whitespace().nth(2) {
-                        total_requests = val.parse().unwrap_or(0);
-                    }
-                } else if line.starts_with("Failed requests:") {
-                    if let Some(val) = line.split_whitespace().nth(2) {
-                        failed_requests = val.parse().unwrap_or(0);
-                    }
-                } else if line.starts_with("Time per request:")
-                    && line.contains("(mean)")
-                    && !line.contains("across")
-                {
-                    if let Some(val) = line.split_whitespace().nth(3) {
-                        mean_ms = val.parse().unwrap_or(0.0);
-                    }
-                } else if line.starts_with("50%") {
-                    if let Some(val) = line.split_whitespace().nth(1) {
-                        p50_ms = val.parse().unwrap_or(0.0);
-                    }
-                } else if line.starts_with("99%") {
-                    if let Some(val) = line.split_whitespace().nth(1) {
-                        p99_ms = val.parse().unwrap_or(0.0);
-                    }
-                } else if line.contains("min") && line.contains("mean") && line.contains("max") {
-                    // Skip header line
-                } else if line.starts_with("Total:") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 5 {
-                        min_ms = parts[1].parse().unwrap_or(0.0);
-                        max_ms = parts[4].parse().unwrap_or(0.0);
-                    }
-                }
-            }
-
-            if !quiet {
-                println!("\n==================== ab_benchmark ====================");
-                println!("Requests per second:    {:.2}", rps);
-                println!("Complete requests:      {}", total_requests);
-                println!("Failed requests:        {}", failed_requests);
-                println!("Mean latency:           {:.2}ms", mean_ms);
-                println!("p50 latency:            {:.2}ms", p50_ms);
-                println!("p99 latency:            {:.2}ms", p99_ms);
-                println!("========================================================\n");
-            }
-
-            Some(BenchmarkResults {
-                name: "ab_benchmark".to_string(),
-                total_requests,
-                successful_requests: total_requests - failed_requests,
-                failed_requests,
-                rps,
-                duration_secs: total_requests as f64 / rps,
-                latency: LatencyStats {
-                    min_ms,
-                    max_ms,
-                    mean_ms,
-                    p50_ms,
-                    p90_ms: 0.0, // ab doesn't report p90 in standard output
-                    p99_ms,
-                    p999_ms: 0.0, // ab doesn't report p999
-                },
-                status_codes: HashMap::new(),
-                errors: Vec::new(),
-            })
-        }
-        Err(e) => {
-            eprintln!("Failed to run ab: {} (is Apache Bench installed?)", e);
-            None
         }
     }
 }
