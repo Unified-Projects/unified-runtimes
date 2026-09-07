@@ -3559,3 +3559,133 @@ mod cold_start {
         );
     }
 }
+
+mod source_archive_integrity {
+    //! An object store answering a GET with an error document must not produce
+    //! a runtime. These tests drive the local storage backend, so they need
+    //! neither network nor object storage.
+
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use urt_executor::storage::{download_verified_archive, LocalStorage};
+
+    /// The body Hetzner object storage returned for every object during the
+    /// 25 Aug outage: 207 bytes of XML with a 503 status.
+    const S3_ERROR_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>ServiceUnavailable</Code><Message>Service is unable to handle request.</Message></Error>"#;
+
+    fn gzipped_source() -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"module.exports = () => {};").unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn error_document_named_code_tar_gz_fails_the_download() {
+        let store = tempfile::tempdir().unwrap();
+        tokio::fs::write(store.path().join("code.tar.gz"), S3_ERROR_BODY)
+            .await
+            .unwrap();
+        let storage = LocalStorage::with_base_path(store.path().to_str().unwrap());
+
+        let destination = tempfile::tempdir().unwrap();
+        let local_source = destination.path().join("src").join("code.tar.gz");
+
+        let error = download_verified_archive(&storage, "code.tar.gz", &local_source, 2, 1)
+            .await
+            .expect_err("an error document must not be accepted as a build");
+
+        let message = error.to_string();
+        assert!(message.contains("it is an error document"), "{}", message);
+        assert!(
+            !local_source.exists(),
+            "a rejected artefact was left at {}",
+            local_source.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn real_archive_downloads_and_reports_its_size() {
+        let store = tempfile::tempdir().unwrap();
+        let archive = gzipped_source();
+        tokio::fs::write(store.path().join("code.tar.gz"), &archive)
+            .await
+            .unwrap();
+        let storage = LocalStorage::with_base_path(store.path().to_str().unwrap());
+
+        let destination = tempfile::tempdir().unwrap();
+        let local_source = destination.path().join("src").join("code.tar.gz");
+
+        let size = download_verified_archive(&storage, "code.tar.gz", &local_source, 2, 1)
+            .await
+            .expect("a real archive downloads");
+
+        assert_eq!(size, archive.len() as u64);
+        assert_eq!(tokio::fs::read(&local_source).await.unwrap(), archive);
+    }
+
+    /// End-to-end through `POST /v1/runtimes`: the create must fail, no
+    /// registry entry may survive, and the runtime's tmp folder must be gone,
+    /// so the next request for the deployment starts a fresh create.
+    #[tokio::test]
+    async fn create_rejects_error_document_source_and_leaves_no_registry_entry() {
+        require_docker!(state);
+
+        let runtime_id = format!("urt-xml-source-{}", uuid::Uuid::new_v4().simple());
+        let full_name = format!("{}-{}", state.config.hostname, runtime_id);
+
+        // The default storage backend is the local filesystem rooted at the
+        // system temp directory, so the source key is a path relative to it.
+        let source_key = format!("{}/code.tar.gz", runtime_id);
+        let source_path = std::env::temp_dir().join(&source_key);
+        tokio::fs::create_dir_all(source_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&source_path, S3_ERROR_BODY).await.unwrap();
+
+        let payload = json!({
+            "runtimeId": runtime_id,
+            "image": "alpine:latest",
+            "entrypoint": "",
+            "source": source_key,
+            "version": "v5",
+            "variables": {}
+        });
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_client_error() || response.status().is_server_error(),
+            "create should have failed, got {}",
+            response.status()
+        );
+
+        assert!(
+            !state.registry.exists(&full_name).await,
+            "a runtime was registered from a source that is not an archive"
+        );
+
+        let tmp_folder: PathBuf = std::env::temp_dir().join(&full_name);
+        assert!(
+            !tmp_folder.exists(),
+            "the failed create left {} behind",
+            tmp_folder.display()
+        );
+
+        tokio::fs::remove_dir_all(std::env::temp_dir().join(&runtime_id))
+            .await
+            .ok();
+    }
+}

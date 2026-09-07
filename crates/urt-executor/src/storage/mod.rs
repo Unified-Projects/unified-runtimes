@@ -10,6 +10,7 @@
 //!
 //! Also provides a local file cache for speeding up cold starts.
 
+mod archive;
 mod cache;
 mod file_cache;
 mod local;
@@ -17,11 +18,17 @@ mod s3;
 
 use crate::config::{StorageConfig, StorageDevice};
 use crate::error::Result;
+use crate::resilience::retry_with_backoff;
+use archive::validate_archive_file;
 use async_trait::async_trait;
 pub use cache::BuildCache;
 pub use file_cache::StorageFileCache;
 pub use local::LocalStorage;
 pub use s3::S3Storage;
+use std::path::Path;
+
+/// Metric label for source-archive downloads.
+const SOURCE_DOWNLOAD_OPERATION: &str = "runtime_source_download";
 
 /// Trait for storage backends
 #[async_trait]
@@ -85,6 +92,45 @@ impl Storage for std::sync::Arc<dyn Storage> {
     async fn upload(&self, local_path: &str, remote_path: &str) -> Result<()> {
         (**self).upload(local_path, remote_path).await
     }
+}
+
+/// Download an archive from storage and verify it before any caller uses it.
+///
+/// The download is retried through `retry_with_backoff`, so a 5xx from object
+/// storage is attempted again while a 404 fails immediately. The artefact is
+/// then checked against the format its key implies, and anything that fails
+/// that check is removed from disk rather than left where a runtime could mount
+/// it. Returns the verified size in bytes.
+pub async fn download_verified_archive(
+    storage: &dyn Storage,
+    remote_path: &str,
+    local_path: &Path,
+    retry_attempts: u32,
+    retry_delay_ms: u64,
+) -> Result<u64> {
+    let local_display = local_path.display().to_string();
+
+    let result = retry_with_backoff(
+        SOURCE_DOWNLOAD_OPERATION,
+        retry_attempts,
+        retry_delay_ms,
+        |_| {
+            let destination = local_display.clone();
+            async move {
+                storage.download(remote_path, &destination).await?;
+                validate_archive_file(remote_path, local_path).await
+            }
+        },
+    )
+    .await;
+
+    if result.is_err() {
+        // A rejected or half-written artefact must never survive as something a
+        // later step could mount or cache.
+        tokio::fs::remove_file(local_path).await.ok();
+    }
+
+    result
 }
 
 /// Parse a storage DSN and create the appropriate storage backend (legacy)
