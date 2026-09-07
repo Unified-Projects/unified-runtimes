@@ -358,6 +358,21 @@ impl BenchmarkRunner {
             }
         }
 
+        let had_failures = out
+            .execution
+            .as_ref()
+            .map(|r| r.failed_requests > 0)
+            .unwrap_or(false)
+            || out
+                .execution_sweep
+                .iter()
+                .any(|p| p.result.failed_requests > 0)
+            || !out.errors.is_empty();
+        if had_failures {
+            println!("\n### Runtime diagnostics ({}) ###", runtime_id);
+            dump_runtime_diagnostics(&runtime_id);
+        }
+
         println!("\nRemoving runtime {}...", runtime_id);
         let _ = delete_benchmark_runtime(&cfg.base_url, &cfg.secret, &runtime_id).await;
 

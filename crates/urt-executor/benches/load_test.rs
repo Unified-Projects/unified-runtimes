@@ -748,6 +748,61 @@ pub fn print_results(results: &BenchmarkResults) {
     println!("{:=<60}", "");
 }
 
+/// Print state and recent logs of every container whose name contains the
+/// runtime ID, so a runtime that died under load can be diagnosed before the
+/// executor removes it.
+pub fn dump_runtime_diagnostics(runtime_id: &str) {
+    let list = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name={}", runtime_id),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output();
+    let names: Vec<String> = match list {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Err(e) => {
+            println!("  docker ps failed: {}", e);
+            return;
+        }
+    };
+    if names.is_empty() {
+        println!("  no container matching {} exists", runtime_id);
+        return;
+    }
+    for name in names {
+        let state = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}",
+                &name,
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|e| format!("inspect failed: {}", e));
+        println!("  {}: {}", name, state);
+        if let Ok(logs) = Command::new("docker")
+            .args(["logs", "--tail", "60", &name])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&logs.stdout)
+                .lines()
+                .chain(String::from_utf8_lossy(&logs.stderr).lines())
+            {
+                println!("    | {}", line);
+            }
+        }
+    }
+}
+
 /// Remove leftover runtime containers created by URT during benchmark runs
 pub async fn cleanup_benchmark_containers() {
     let output = Command::new("docker")

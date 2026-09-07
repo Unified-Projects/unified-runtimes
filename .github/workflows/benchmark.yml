@@ -181,12 +181,18 @@ jobs:
                   retention-days: 90
                   if-no-files-found: error
 
-            - name: Show executor logs on failure
-              if: failure()
+            - name: Show executor logs
+              if: always()
               run: |
+                  echo "=== Managed containers ==="
+                  docker ps -a --filter "label=urt.managed" --format '{{.Names}} {{.Status}}' || true
+                  docker ps -a --filter "name=opr-bench-executor-" --format '{{.Names}} {{.Status}}' || true
                   echo "=== URT Executor Logs ==="
                   docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
-                      logs --no-color urt-executor | tail -100
+                      logs --no-color urt-executor | grep -v -E ' (DEBUG|TRACE) ' | tail -300
+                  echo "=== OpenRuntimes Executor Logs ==="
+                  docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
+                      logs --no-color openruntimes-executor | tail -100
 
             - name: Clean up resources
               if: always()
