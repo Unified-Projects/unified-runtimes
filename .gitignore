@@ -33,3 +33,8 @@ docker-compose.override.yml
 # Temporary files
 /tmp/
 *.tmp
+
+# Local scratch notes, never committed
+.scratch/
+# Agent worktrees
+.claude/worktrees/

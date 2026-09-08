@@ -22,6 +22,10 @@ on:
                 description: "Function type (node, nextjs)"
                 required: false
                 default: "node"
+            opr_image:
+                description: "OpenRuntimes executor image to compare against"
+                required: false
+                default: "openruntimes/executor:0.29.0"
 
 concurrency:
     group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,6 +37,8 @@ env:
     BENCH_DURATION: ${{ github.event.inputs.duration || '30' }}
     BENCH_RUNTIME_IMAGE: ${{ github.event.inputs.runtime_image || 'openruntimes/node:v5-22' }}
     BENCH_FUNCTION: ${{ github.event.inputs.function || 'node' }}
+    BENCH_OPR_IMAGE: ${{ github.event.inputs.opr_image || 'openruntimes/executor:0.29.0' }}
+    BENCH_FUNCTION_SOURCE: ${{ github.workspace }}/crates/urt-executor/tests/fixtures/node-function
     BENCH_OUTPUT_JSON: benchmark_results.json
     COMPOSE_PROJECT_NAME: urt-bench
 
@@ -81,6 +87,8 @@ jobs:
                   echo "Pulling runtime image: ${{ env.BENCH_RUNTIME_IMAGE }}"
                   docker pull "${{ env.BENCH_RUNTIME_IMAGE }}"
                   docker image inspect "${{ env.BENCH_RUNTIME_IMAGE }}" --format 'Pulled {{.RepoTags}} (id={{.Id}})'
+                  echo "Pulling OpenRuntimes executor image: ${{ env.BENCH_OPR_IMAGE }}"
+                  docker pull "${{ env.BENCH_OPR_IMAGE }}"
 
             - name: Run dockerized benchmarks
               run: |
@@ -117,22 +125,35 @@ jobs:
                       echo ""
 
                       if [ -f "${BENCH_OUTPUT_JSON}" ]; then
-                          echo "| Benchmark | RPS | Success % | p50 (ms) | p90 (ms) | p99 (ms) |"
-                          echo "|-----------|-----|-----------|----------|----------|----------|"
+                          echo "| Executor | Benchmark | RPS | Success % | p50 (ms) | p90 (ms) | p99 (ms) |"
+                          echo "|----------|-----------|-----|-----------|----------|----------|----------|"
                           jq -r '
                             def success: if .total_requests == 0 then 0 else (.successful_requests / .total_requests * 100) end;
                             def fmt: . * 100 | floor / 100;
-                            def row($name):
+                            def row($exec; $name):
                               if . == null then empty
-                              else "| \($name) | \(.rps|fmt) | \(success|fmt)% | \(.latency.p50_ms|fmt) | \(.latency.p90_ms|fmt) | \(.latency.p99_ms|fmt) |"
+                              else "| \($exec) | \($name) | \(.rps|fmt) | \(success|fmt)% | \(.latency.p50_ms|fmt) | \(.latency.p90_ms|fmt) | \(.latency.p99_ms|fmt) |"
                               end;
-                            (.urt // {}) as $u |
-                            [
-                              ($u.ping | row("Ping Endpoint")),
-                              ($u.health | row("Health Endpoint")),
-                              ($u.execution | row("Function Execution")),
-                              ($u.list_runtimes | row("List Runtimes"))
-                            ] | .[]
+                            def target($key; $label):
+                              (.[$key] // {}) as $t |
+                              [
+                                ($t.ping | row($label; "Ping Endpoint")),
+                                ($t.health | row($label; "Health Endpoint")),
+                                ($t.execution | row($label; "Function Execution")),
+                                ($t.list_runtimes | row($label; "List Runtimes"))
+                              ] | .[];
+                            target("urt"; "URT"), target("opr"; "OpenRuntimes")
+                          ' "${BENCH_OUTPUT_JSON}"
+                          echo ""
+                          echo "| Executor | Cold start median (ms) | Memory mean (MB) | Memory peak (MB) | CPU mean (%) |"
+                          echo "|----------|------------------------|------------------|------------------|--------------|"
+                          jq -r '
+                            def fmt: . * 100 | floor / 100;
+                            def median: if length == 0 then null else (sort | .[length / 2 | floor]) end;
+                            def target($key; $label):
+                              (.[$key] // empty) as $t |
+                              "| \($label) | \(([$t.cold_starts[]?.total_ms] | median | if . == null then "-" else fmt end)) | \($t.resources.mean_mem_mb // "-" | if type == "number" then fmt else . end) | \($t.resources.peak_mem_mb // "-" | if type == "number" then fmt else . end) | \($t.resources.mean_cpu_pct // "-" | if type == "number" then fmt else . end) |";
+                            target("urt"; "URT"), target("opr"; "OpenRuntimes")
                           ' "${BENCH_OUTPUT_JSON}"
                           echo ""
                       else
@@ -142,10 +163,8 @@ jobs:
 
                       if [ -f benchmark_output.txt ]; then
                           awk '
-                              /^## URT Concurrency Scaling/ {printing=1}
+                              /^## (Health|Execution) Concurrency Scaling/ {printing=1}
                               printing {print}
-                              /^\\| Concurrency \\|/ {table=1}
-                              table && /^$/ {exit}
                           ' benchmark_output.txt
                           echo ""
                       fi
@@ -162,12 +181,18 @@ jobs:
                   retention-days: 90
                   if-no-files-found: error
 
-            - name: Show executor logs on failure
-              if: failure()
+            - name: Show executor logs
+              if: always()
               run: |
+                  echo "=== Managed containers ==="
+                  docker ps -a --filter "label=urt.managed" --format '{{.Names}} {{.Status}}' || true
+                  docker ps -a --filter "name=opr-bench-executor-" --format '{{.Names}} {{.Status}}' || true
                   echo "=== URT Executor Logs ==="
                   docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
-                      logs --no-color urt-executor | tail -100
+                      logs --no-color urt-executor | grep -v -E ' (DEBUG|TRACE) ' | tail -300
+                  echo "=== OpenRuntimes Executor Logs ==="
+                  docker compose -p "${{ env.COMPOSE_PROJECT_NAME }}" -f crates/urt-executor/docker-compose.test.yml \
+                      logs --no-color openruntimes-executor | tail -100
 
             - name: Clean up resources
               if: always()

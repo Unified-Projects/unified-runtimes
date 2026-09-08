@@ -45,16 +45,20 @@ services:
   # URT Executor (for benchmarks)
   urt-executor:
     profiles: ["bench"]
+    container_name: urt-bench-executor
+    hostname: urt-bench-executor
     build:
       context: ../..
       dockerfile: docker/Dockerfile
+    ports:
+      - "${URT_BENCH_PORT:-9900}:80"
     environment:
       - URT_HOST=0.0.0.0
       - URT_PORT=80
       - URT_SECRET=${URT_SECRET:-${BENCH_SECRET:-benchmark-secret}}
       - URT_NETWORK=e2e-test-network
       - URT_KEEP_ALIVE=true
-      - URT_IMAGE_PULL=enabled
+      - URT_IMAGE_PULL=${URT_IMAGE_PULL:-enabled}
       - RUST_LOG=info
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -68,6 +72,44 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
+    networks:
+      - e2e-test-network
+
+  # OpenRuntimes executor, the reference implementation, driven with the same
+  # runtime image and function so the two can be compared side by side
+  openruntimes-executor:
+    profiles: ["bench"]
+    container_name: opr-bench-executor
+    hostname: opr-bench-executor
+    image: ${BENCH_OPR_IMAGE:-openruntimes/executor:0.29.0}
+    stop_signal: SIGINT
+    ports:
+      - "${OPR_BENCH_PORT:-9901}:80"
+    environment:
+      - OPR_EXECUTOR_ENV=production
+      - OPR_EXECUTOR_SECRET=${OPR_SECRET:-${BENCH_SECRET:-benchmark-secret}}
+      - OPR_EXECUTOR_NETWORK=e2e-test-network
+      - OPR_EXECUTOR_IMAGES=${BENCH_RUNTIME_IMAGE:-openruntimes/node:v5-22}
+      - OPR_EXECUTOR_RUNTIMES=node-22
+      - OPR_EXECUTOR_RUNTIME_VERSIONS=v5
+      - OPR_EXECUTOR_INACTIVE_THRESHOLD=600
+      - OPR_EXECUTOR_MAINTENANCE_INTERVAL=3600
+      - OPR_EXECUTOR_CONNECTION_STORAGE=local://localhost
+      - OPR_EXECUTOR_CONNECTION_BUILD_CACHE_STORAGE=
+      - OPR_EXECUTOR_LOGGING_CONFIG=
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp:/tmp
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -H \"Authorization: Bearer $$OPR_EXECUTOR_SECRET\" http://localhost:80/v1/health",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
       start_period: 10s
     networks:
       - e2e-test-network
@@ -86,17 +128,25 @@ services:
       - RUST_BACKTRACE=1
       # Benchmark configuration - use service names for Docker networking
       - URT_URL=http://urt-executor:80
+      - OPR_URL=${OPR_URL:-http://openruntimes-executor:80}
       - BENCH_SECRET=${BENCH_SECRET:-benchmark-secret}
       - URT_SECRET=${URT_SECRET:-${BENCH_SECRET:-benchmark-secret}}
+      - OPR_SECRET=${OPR_SECRET:-${BENCH_SECRET:-benchmark-secret}}
       - BENCH_DURATION=${BENCH_DURATION:-30}
+      - BENCH_SWEEP_DURATION=${BENCH_SWEEP_DURATION:-10}
       - BENCH_WARMUP=${BENCH_WARMUP:-3}
       - BENCH_TIMEOUT=${BENCH_TIMEOUT:-30}
+      - BENCH_COLD_STARTS=${BENCH_COLD_STARTS:-3}
       - BENCH_RUNTIME_IMAGE=${BENCH_RUNTIME_IMAGE:-openruntimes/node:v5-22}
       - BENCH_FUNCTION=${BENCH_FUNCTION:-node}
+      # Host path: the archive is built by a helper container via the Docker socket
+      - BENCH_FUNCTION_SOURCE=${BENCH_FUNCTION_SOURCE:-}
       - BENCH_OUTPUT_JSON=${BENCH_OUTPUT_JSON:-benchmark_results.json}
     command: ["cargo", "bench", "--package", "urt-executor", "--bench", "benchmark"]
     depends_on:
       urt-executor:
+        condition: service_healthy
+      openruntimes-executor:
         condition: service_healthy
     networks:
       - e2e-test-network
