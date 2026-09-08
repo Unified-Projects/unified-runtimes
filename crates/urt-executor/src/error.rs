@@ -11,7 +11,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 /// Main error type for the executor
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum ExecutorError {
     #[error("Internal server error")]
     Unknown,

@@ -7,6 +7,8 @@ use crate::docker::container::ContainerConfig;
 use crate::error::{ExecutorError, Result};
 use crate::platform;
 use crate::resilience::{is_transient_error, retry_with_backoff};
+use crate::runtime::create_tracker::spawn_or_join;
+use crate::runtime::readiness::ReadinessGuard;
 use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime};
 use crate::storage;
 use crate::tasks;
@@ -417,6 +419,28 @@ fn is_live_container_state(state: &str, status: &str) -> bool {
         || normalized_status.starts_with("up ")
 }
 
+/// Tear down everything a failed build owns: the container if one reached
+/// Docker, the working directory, the readiness notifier and the pending
+/// registry entry.
+///
+/// Consuming the `ReadinessGuard` makes it impossible for a failure path to
+/// forget it: waiters are always woken before the registry entry disappears, so
+/// they see the absence and return a deterministic 404.
+async fn abandon_pending_create(
+    state: &AppState,
+    full_name: &str,
+    tmp_folder: &std::path::Path,
+    readiness_guard: ReadinessGuard,
+    remove_container: bool,
+) {
+    if remove_container {
+        state.docker.remove_container(full_name, true).await.ok();
+    }
+    tokio::fs::remove_dir_all(tmp_folder).await.ok();
+    drop(readiness_guard);
+    state.registry.remove(full_name).await;
+}
+
 async fn cleanup_runtime_artifacts(state: &AppState, full_name: &str) {
     state.readiness_notify_and_remove(full_name);
     state.registry.remove(full_name).await;
@@ -424,26 +448,42 @@ async fn cleanup_runtime_artifacts(state: &AppState, full_name: &str) {
     tokio::fs::remove_dir_all(&tmp_folder).await.ok();
 }
 
+/// Settle an existing entry for this runtime ID before a build starts.
+///
+/// The caller must hold the create slot for `full_name`, which is what makes it
+/// safe to treat a pending entry as an orphan rather than a live build.
 async fn reconcile_existing_runtime_id(
     state: &AppState,
     runtime_id: &str,
     full_name: &str,
 ) -> Result<()> {
     if let Some(runtime) = state.registry.sync_status(full_name, &state.docker).await {
-        if is_live_container_state(&runtime.status, &runtime.status) || runtime.is_pending() {
+        if runtime.is_pending() {
+            // The caller holds the create slot for this name, so no build is
+            // running behind this entry: it was left by a create that ended
+            // without cleaning up. Reclaim it rather than refusing every retry
+            // until maintenance reaps it.
+            warn!(
+                "Reclaiming orphaned pending entry for runtime {} ({}s old, no create in flight)",
+                runtime_id,
+                runtime.age_seconds()
+            );
+            let _ = state.docker.remove_container(full_name, true).await;
+            cleanup_runtime_artifacts(state, full_name).await;
+        } else if is_live_container_state(&runtime.status, &runtime.status) {
             info!(
                 "Runtime {} already exists with live status {}",
                 runtime_id, runtime.status
             );
             return Err(ExecutorError::RuntimeConflict);
+        } else {
+            warn!(
+                "Cleaning up stale registry entry for runtime {} with status {}",
+                runtime_id, runtime.status
+            );
+            let _ = state.docker.remove_container(full_name, true).await;
+            cleanup_runtime_artifacts(state, full_name).await;
         }
-
-        warn!(
-            "Cleaning up stale registry entry for runtime {} with status {}",
-            runtime_id, runtime.status
-        );
-        let _ = state.docker.remove_container(full_name, true).await;
-        cleanup_runtime_artifacts(state, full_name).await;
     } else if state.registry.exists(full_name).await {
         return Err(ExecutorError::RuntimeConflict);
     }
@@ -490,7 +530,7 @@ async fn reconcile_existing_runtime_id(
 
 /// Response for creating a runtime
 /// Field names must match executor-main exactly for Appwrite compatibility
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateRuntimeResponse {
     pub output: Vec<LogEntry>,
@@ -519,6 +559,22 @@ fn source_download_error(source: &str, error: ExecutorError) -> ExecutorError {
     }
 }
 
+/// Everything a build needs once the request has been validated.
+///
+/// Collected into one owned value so the build can be handed to a detached task
+/// without borrowing anything from the HTTP handler.
+struct RuntimeBuild {
+    state: AppState,
+    req: CreateRuntimeRequest,
+    resolved_image: String,
+    full_name: String,
+    start_time: std::time::Instant,
+    start_timestamp: f64,
+    /// Held for the life of the build, so the create concurrency limit bounds
+    /// builds actually running rather than clients still connected.
+    create_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// POST /v1/runtimes - Create a new runtime
 /// Note: Accepts JSON regardless of Content-Type header for backwards compatibility
 pub async fn create_runtime(
@@ -530,7 +586,7 @@ pub async fn create_runtime(
     let start_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
 
     let queue_wait_started = std::time::Instant::now();
-    let _runtime_create_permit = match &state.runtime_create_limiter {
+    let runtime_create_permit = match &state.runtime_create_limiter {
         Some(limiter) => {
             let queue_wait_timeout =
                 Duration::from_millis(state.config.runtime_create_queue_wait_ms);
@@ -581,17 +637,58 @@ pub async fn create_runtime(
     validate_runtime_id(&req.runtime_id)?;
     validate_image_name(&resolved_image)?;
 
-    let full_name = format!("{}-{}", state.config.hostname, req.runtime_id);
-    if state.registry.exists(&full_name).await {
-        reconcile_existing_runtime_id(&state, &req.runtime_id, &full_name).await?;
-    }
-
     // Check if image is allowed
     if !state.config.is_runtime_allowed(&resolved_image) {
         return Err(ExecutorError::BadRequest(format!(
             "Image {} is not in allowed runtimes list",
             resolved_image
         )));
+    }
+
+    let full_name = format!("{}-{}", state.config.hostname, req.runtime_id);
+
+    // The build runs on a detached task from here on. A client that hangs up
+    // mid-download no longer cancels it, so the pending registry entry this
+    // create is about to insert is always resolved by the work behind it, and a
+    // create that arrives while the build is running joins it instead of being
+    // refused by the existing-runtime guard.
+    let build = run_create(RuntimeBuild {
+        state: state.clone(),
+        req,
+        resolved_image,
+        full_name: full_name.clone(),
+        start_time,
+        start_timestamp,
+        create_permit: runtime_create_permit,
+    });
+
+    let response = spawn_or_join(&state.create_tracker, &full_name, build).await?;
+
+    operation_timer.mark_success();
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Build a runtime: reconcile any existing entry, register it as pending,
+/// download the source, create and start the container, then publish it as
+/// running.
+///
+/// Runs to completion regardless of what the requesting client does. Every exit
+/// after the pending entry is inserted either promotes that entry out of pending
+/// or tears it down along with the container and working directory it owns.
+async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
+    let RuntimeBuild {
+        state,
+        req,
+        resolved_image,
+        full_name,
+        start_time,
+        start_timestamp,
+        create_permit: _create_permit,
+    } = build;
+
+    if state.registry.exists(&full_name).await {
+        reconcile_existing_runtime_id(&state, &req.runtime_id, &full_name).await?;
     }
 
     // Apply minimum resource overrides
@@ -632,10 +729,8 @@ pub async fn create_runtime(
     // success-path notify automatically fires notify_waiters() and removes the
     // entry, preventing the DashMap leak (Fix D).
     state.readiness_notifier(&full_name);
-    let mut readiness_guard = crate::runtime::readiness::ReadinessGuard::new(
-        full_name.clone(),
-        std::sync::Arc::clone(&state.readiness),
-    );
+    let mut readiness_guard =
+        ReadinessGuard::new(full_name.clone(), std::sync::Arc::clone(&state.readiness));
 
     // Register keep-alive ownership (if applicable)
     // This also revokes protection from any previous owner with the same ID
@@ -724,14 +819,21 @@ pub async fn create_runtime(
     // Canonicalize tmp_base first (L1) so all derived paths are consistent and
     // the cleanup target matches what was created.
     let tmp_base_raw = platform::temp_dir();
-    let canonical_tmp_base = tokio::fs::canonicalize(&tmp_base_raw).await.map_err(|e| {
-        ExecutorError::RuntimeFailed(format!("Failed to canonicalize temp base path: {}", e))
-    })?;
+    let canonical_tmp_base = match tokio::fs::canonicalize(&tmp_base_raw).await {
+        Ok(base) => base,
+        Err(e) => {
+            error!("Failed to canonicalize temp base path: {}", e);
+            abandon_pending_create(&state, &full_name, &tmp_base_raw, readiness_guard, false).await;
+            return Err(ExecutorError::RuntimeFailed(format!(
+                "Failed to canonicalize temp base path: {}",
+                e
+            )));
+        }
+    };
     let tmp_folder = canonical_tmp_base.join(&full_name);
 
     // Verify containment to prevent path-traversal via crafted runtime IDs.
     if !tmp_folder.starts_with(&canonical_tmp_base) {
-        // readiness_guard Drop will fire notify_waiters; explicit registry remove follows.
         drop(readiness_guard);
         state.registry.remove(&full_name).await;
         return Err(ExecutorError::BadRequest(
@@ -748,9 +850,7 @@ pub async fn create_runtime(
             src_dir.display(),
             e
         );
-        // readiness_guard Drop fires notify_waiters automatically.
-        drop(readiness_guard);
-        state.registry.remove(&full_name).await;
+        abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, false).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create source directory: {}",
             e
@@ -763,8 +863,7 @@ pub async fn create_runtime(
             src_dir.display(),
             e
         );
-        drop(readiness_guard);
-        state.registry.remove(&full_name).await;
+        abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, false).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set source directory permissions: {}",
             e
@@ -776,8 +875,7 @@ pub async fn create_runtime(
             builds_dir.display(),
             e
         );
-        drop(readiness_guard);
-        state.registry.remove(&full_name).await;
+        abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, false).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to create builds directory: {}",
             e
@@ -786,8 +884,7 @@ pub async fn create_runtime(
     // Set directory permissions to 0777 to allow tar extraction with preserved permissions
     if let Err(e) = platform::set_permissions_open(&builds_dir).await {
         error!("Failed to set builds directory permissions: {}", e);
-        drop(readiness_guard);
-        state.registry.remove(&full_name).await;
+        abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, false).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Failed to set builds directory permissions: {}",
             e
@@ -818,13 +915,12 @@ pub async fn create_runtime(
             Ok(size) => info!("Source downloaded successfully: {} bytes", size),
             Err(e) => {
                 error!("Failed to download source {}: {}", req.source, e);
-                // Leave nothing behind: the pending entry, the readiness
-                // notifier and the tmp folder all go, so the next request for
-                // this deployment starts a fresh create rather than adopting a
-                // runtime built from a body that is not an archive.
-                drop(readiness_guard);
-                state.registry.remove(&full_name).await;
-                tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+                // Leave nothing behind: the pending entry, the readiness notifier,
+                // the create-tracker slot and the tmp folder all go, so the next
+                // request for this deployment starts a fresh create rather than
+                // adopting a runtime built from a body that is not an archive.
+                abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, false)
+                    .await;
                 return Err(source_download_error(&req.source, e));
             }
         }
@@ -908,8 +1004,7 @@ pub async fn create_runtime(
         }
         Err(e) => {
             error!("Failed to create container: {}", e);
-            drop(readiness_guard);
-            state.registry.remove(&full_name).await;
+            abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, true).await;
             return Err(ExecutorError::RuntimeFailed(format!(
                 "Failed to create container: {}",
                 e
@@ -948,9 +1043,8 @@ pub async fn create_runtime(
                 if matches!(status.as_str(), "exited" | "dead" | "removing" | "failed") {
                     // Terminal failure states — no point retrying.
                     error!("Container reached terminal state: {}", info.state);
-                    state.docker.remove_container(&full_name, true).await.ok();
-                    drop(readiness_guard);
-                    state.registry.remove(&full_name).await;
+                    abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, true)
+                        .await;
                     return Err(ExecutorError::RuntimeFailed(format!(
                         "Container exited with status: {}",
                         info.state
@@ -979,9 +1073,7 @@ pub async fn create_runtime(
             .unwrap_or(last_status);
 
         error!("Container startup timed out, last status: {}", last_status);
-        state.docker.remove_container(&full_name, true).await.ok();
-        drop(readiness_guard);
-        state.registry.remove(&full_name).await;
+        abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, true).await;
         return Err(ExecutorError::RuntimeFailed(format!(
             "Container startup timed out (last status: {})",
             last_status
@@ -1049,10 +1141,8 @@ pub async fn create_runtime(
                         result.exit_code, result.stderr
                     );
                     // On failure, cleanup and return error
-                    state.docker.remove_container(&full_name, true).await.ok();
-                    tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-                    drop(readiness_guard);
-                    state.registry.remove(&full_name).await;
+                    abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, true)
+                        .await;
 
                     let error_msg = if output_logs.is_empty() {
                         result.stderr.clone()
@@ -1068,10 +1158,8 @@ pub async fn create_runtime(
             }
             Err(e) => {
                 error!("Failed to execute build command: {}", e);
-                state.docker.remove_container(&full_name, true).await.ok();
-                tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-                drop(readiness_guard);
-                state.registry.remove(&full_name).await;
+                abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, true)
+                    .await;
                 return Err(ExecutorError::RuntimeFailed(format!(
                     "Failed to execute command: {}",
                     e
@@ -1168,10 +1256,8 @@ pub async fn create_runtime(
                     "Runtime {} failed port readiness: {}",
                     req.runtime_id, error
                 );
-                state.docker.remove_container(&full_name, true).await.ok();
-                tokio::fs::remove_dir_all(&tmp_folder).await.ok();
-                drop(readiness_guard);
-                state.registry.remove(&full_name).await;
+                abandon_pending_create(&state, &full_name, &tmp_folder, readiness_guard, true)
+                    .await;
                 return Err(ExecutorError::RuntimeFailed(
                     "Runtime port readiness check timed out".to_string(),
                 ));
@@ -1212,18 +1298,14 @@ pub async fn create_runtime(
     let duration = start_time.elapsed().as_secs_f64();
 
     info!("Runtime {} created in {:.2}s", req.runtime_id, duration);
-    operation_timer.mark_success();
 
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateRuntimeResponse {
-            output: output_logs,
-            path: result_path,
-            size: result_size,
-            start_time: start_timestamp,
-            duration,
-        }),
-    ))
+    Ok(CreateRuntimeResponse {
+        output: output_logs,
+        path: result_path,
+        size: result_size,
+        start_time: start_timestamp,
+        duration,
+    })
 }
 
 /// GET /v1/runtimes - List all runtimes

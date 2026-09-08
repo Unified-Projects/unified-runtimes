@@ -348,6 +348,11 @@ pub struct ExecutorConfig {
     /// runtime to become ready.  Applies as a cap on top of (not instead of)
     /// the per-request deadline.  Defaults to 60 seconds.
     pub pending_wait_max_secs: u64,
+
+    /// Age in seconds after which maintenance reaps a pending registry entry
+    /// that has no build behind it.  Entries whose create is still in flight are
+    /// never reaped, whatever their age.  Defaults to 300 seconds.
+    pub pending_max_age_secs: u64,
 }
 
 impl ExecutorConfig {
@@ -475,6 +480,12 @@ impl ExecutorConfig {
             pending_wait_max_secs: env_urt_or_opr("PENDING_WAIT_MAX_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60)
+                .max(1),
+
+            // Age at which an orphaned pending entry is reaped by maintenance
+            pending_max_age_secs: env_urt_or_opr("PENDING_MAX_AGE_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300)
                 .max(1),
         }
     }

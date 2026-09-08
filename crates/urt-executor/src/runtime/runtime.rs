@@ -128,6 +128,12 @@ impl Runtime {
         &self.runtime_id
     }
 
+    /// Get seconds since the entry was created
+    pub fn age_seconds(&self) -> u64 {
+        let now = Self::unix_timestamp();
+        (now - self.created).max(0.0) as u64
+    }
+
     /// Get seconds since last activity
     pub fn idle_seconds(&self) -> u64 {
         let now = Self::unix_timestamp();

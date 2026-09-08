@@ -52,6 +52,7 @@ fn test_config() -> ExecutorConfig {
         retry_delay_ms: 500,
         warmup_required: false,
         pending_wait_max_secs: 60,
+        pending_max_age_secs: 300,
     }
 }
 
@@ -80,6 +81,7 @@ async fn create_test_state() -> Option<AppState> {
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
+        create_tracker: urt_executor::runtime::CreateTracker::new(),
     })
 }
 
@@ -2473,6 +2475,7 @@ mod audit_fixes {
             retry_attempts: 5,
             retry_delay_ms: 500,
             pending_wait_max_secs: 60,
+            pending_max_age_secs: 300,
         };
 
         assert!(
@@ -2892,6 +2895,7 @@ mod regression_pending_wait {
             warmup_required: false,
             // KEY: cap the pending-wait at 1 second, regardless of req.timeout.
             pending_wait_max_secs: 1,
+            pending_max_age_secs: 300,
         };
 
         let docker = match DockerManager::new(config.clone()).await {
@@ -2920,6 +2924,7 @@ mod regression_pending_wait {
             execution_limiter_capacity: None,
             runtime_create_limiter_capacity: None,
             readiness: Arc::new(dashmap::DashMap::new()),
+            create_tracker: urt_executor::runtime::CreateTracker::new(),
         };
 
         let hostname = state.config.hostname.clone();
@@ -3687,5 +3692,99 @@ mod source_archive_integrity {
         tokio::fs::remove_dir_all(std::env::temp_dir().join(&runtime_id))
             .await
             .ok();
+    }
+}
+
+/// Regression tests for the cold-start wedge: a create whose caller disconnected
+/// mid-download used to leave a `pending` registry entry that nothing removed,
+/// after which every create for that runtime ID returned `RuntimeConflict` until
+/// someone deleted the entry by hand.
+///
+/// The create path itself is covered by the unit tests in
+/// `runtime::create_tracker`, which drive the detached-build machinery without
+/// needing Docker. These cover the maintenance safety net and the config knob
+/// that bounds it.
+mod cold_start_wedge {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use urt_executor::runtime::{CreateTracker, Runtime, RuntimeRegistry};
+
+    fn aged_pending(runtime_id: &str, age_secs: f64) -> Runtime {
+        let mut runtime = Runtime::new(runtime_id, "test-executor", "img", "v5", None);
+        runtime.created -= age_secs;
+        runtime.updated -= age_secs;
+        runtime
+    }
+
+    #[tokio::test]
+    async fn maintenance_reaps_an_orphaned_pending_entry_and_wakes_its_waiters() {
+        let registry = RuntimeRegistry::new();
+        let readiness: dashmap::DashMap<String, Arc<tokio::sync::Notify>> = dashmap::DashMap::new();
+        let create_tracker = CreateTracker::new();
+
+        registry
+            .insert(aged_pending("wedged", 900.0))
+            .await
+            .expect("insert pending");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        readiness.insert("test-executor-wedged".to_string(), notify.clone());
+        let waiter = tokio::spawn(async move { notify.notified().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let reaped =
+            urt_executor::tasks::cleanup_stale_pending(&registry, &readiness, &create_tracker, 300)
+                .await;
+
+        assert_eq!(reaped, 1, "the orphaned pending entry must be reaped");
+        assert!(
+            registry.get("test-executor-wedged").await.is_none(),
+            "the wedged entry must be gone so the next create is not refused with 409"
+        );
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiters must be woken rather than parked to their deadline")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_leaves_a_recent_pending_entry_alone() {
+        let registry = RuntimeRegistry::new();
+        let readiness: dashmap::DashMap<String, Arc<tokio::sync::Notify>> = dashmap::DashMap::new();
+        let create_tracker = CreateTracker::new();
+
+        registry
+            .insert(aged_pending("building", 5.0))
+            .await
+            .expect("insert pending");
+
+        let reaped =
+            urt_executor::tasks::cleanup_stale_pending(&registry, &readiness, &create_tracker, 300)
+                .await;
+
+        assert_eq!(reaped, 0);
+        assert!(registry.get("test-executor-building").await.is_some());
+    }
+
+    #[test]
+    fn pending_max_age_config_knob_is_parsed() {
+        use urt_executor::config::ExecutorConfig;
+
+        assert_eq!(
+            test_config().pending_max_age_secs,
+            300,
+            "the test harness must carry the documented default"
+        );
+
+        // SAFETY: single-threaded test; no concurrent env mutation.
+        unsafe {
+            std::env::set_var("URT_PENDING_MAX_AGE_SECS", "45");
+        }
+        let from_env = ExecutorConfig::from_env();
+        unsafe {
+            std::env::remove_var("URT_PENDING_MAX_AGE_SECS");
+        }
+
+        assert_eq!(from_env.pending_max_age_secs, 45);
     }
 }

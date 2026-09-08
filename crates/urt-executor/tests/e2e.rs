@@ -131,6 +131,7 @@ fn test_config(network: String) -> ExecutorConfig {
         retry_delay_ms: 500,
         warmup_required: false,
         pending_wait_max_secs: 60,
+        pending_max_age_secs: 300,
     }
 }
 
@@ -346,6 +347,7 @@ async fn create_test_server_with(
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
+        create_tracker: urt_executor::runtime::CreateTracker::new(),
     };
 
     // Bind to random available port
@@ -367,17 +369,19 @@ async fn create_test_server_with(
     });
 
     if start_maintenance {
-        let maintenance_docker = state.docker.clone();
-        let maintenance_registry = state.registry.clone();
-        let maintenance_keep_alive_registry = state.keep_alive_registry.clone();
+        let maintenance_handles = urt_executor::tasks::MaintenanceHandles {
+            docker: state.docker.clone(),
+            registry: state.registry.clone(),
+            keep_alive_registry: state.keep_alive_registry.clone(),
+            readiness: state.readiness.clone(),
+            create_tracker: state.create_tracker.clone(),
+        };
         let maintenance_config = config.clone();
         let maintenance_storage = storage.clone();
         let maintenance_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             urt_executor::tasks::run_maintenance(
-                maintenance_docker,
-                maintenance_registry,
-                maintenance_keep_alive_registry,
+                maintenance_handles,
                 maintenance_config,
                 maintenance_storage,
                 maintenance_shutdown,
@@ -1476,6 +1480,7 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
+        create_tracker: urt_executor::runtime::CreateTracker::new(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")
