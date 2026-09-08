@@ -7,6 +7,7 @@
 //! This allows existing OpenRuntimes deployments to work as drop-in replacements
 //! while new deployments can use the URT prefix.
 
+use crate::runtime::{DEFAULT_INACTIVE_THRESHOLD_SECS, DEFAULT_STARTUP_TIMEOUT_SECS};
 use std::collections::HashSet;
 use std::env;
 
@@ -316,7 +317,15 @@ pub struct ExecutorConfig {
 
     // Lifecycle configuration
     pub keep_alive: bool,
-    pub inactive_threshold: u64,   // seconds
+    /// Default seconds of inactivity before a runtime is reclaimed. A runtime
+    /// created with `inactiveThreshold` overrides this for itself.
+    pub inactive_threshold: u64, // seconds
+    /// Default seconds a runtime has to start listening before it is marked
+    /// failed. A runtime created with `startupTimeout` overrides this.
+    pub startup_timeout_secs: u64,
+    /// Default cap on executions in flight against a single runtime. `None` is
+    /// unlimited. A runtime created with `maxConcurrency` overrides this.
+    pub runtime_max_concurrency: Option<usize>,
     pub maintenance_interval: u64, // seconds
     pub autoscale: bool,
     pub eager_runtime_readiness: bool,
@@ -436,7 +445,14 @@ impl ExecutorConfig {
                 .unwrap_or(false),
             inactive_threshold: env_urt_or_opr("INACTIVE_THRESHOLD")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
+                .unwrap_or(DEFAULT_INACTIVE_THRESHOLD_SECS),
+            startup_timeout_secs: env_urt_or_opr("STARTUP_TIMEOUT_SECS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS)
+                .max(1),
+            runtime_max_concurrency: env_urt_or_opr("RUNTIME_MAX_CONCURRENCY")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0),
             maintenance_interval: env_urt_or_opr("MAINTENANCE_INTERVAL")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
@@ -504,6 +520,15 @@ impl ExecutorConfig {
             adoption_negative_cache_ms: env_urt_or_opr("ADOPTION_NEGATIVE_CACHE_MS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2000),
+        }
+    }
+
+    /// The lifecycle knobs a runtime gets when the request sets none of its own.
+    pub fn runtime_lifecycle_defaults(&self) -> crate::runtime::RuntimeLifecycle {
+        crate::runtime::RuntimeLifecycle {
+            startup_timeout: self.startup_timeout_secs,
+            inactive_threshold: self.inactive_threshold,
+            max_concurrency: self.runtime_max_concurrency,
         }
     }
 

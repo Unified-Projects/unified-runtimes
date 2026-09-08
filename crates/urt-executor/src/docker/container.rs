@@ -7,12 +7,14 @@ use std::collections::HashMap;
 pub struct ContainerConfig {
     pub name: String,
     pub image: String,
-    pub hostname: String,
     pub entrypoint: Option<Vec<String>>,
     pub cmd: Option<Vec<String>>,
     pub env: HashMap<String, String>,
     pub cpus: f64,
     pub memory: u64, // bytes
+    /// Network the container is created on. Set as Docker's network mode so the
+    /// container never joins the default bridge; further networks are attached
+    /// after the container starts.
     pub network: Option<String>,
     pub restart_policy: String,
     pub labels: HashMap<String, String>,
@@ -32,7 +34,6 @@ impl ContainerConfig {
         Self {
             name: name.to_string(),
             image: image.to_string(),
-            hostname: String::new(),
             entrypoint: None,
             cmd: None,
             env: HashMap::new(),
@@ -43,11 +44,6 @@ impl ContainerConfig {
             labels: HashMap::new(),
             mounts: Vec::new(),
         }
-    }
-
-    pub fn with_hostname(mut self, hostname: &str) -> Self {
-        self.hostname = hostname.to_string();
-        self
     }
 
     #[allow(dead_code)]
@@ -94,6 +90,11 @@ impl ContainerConfig {
 
     pub fn with_label(mut self, key: &str, value: &str) -> Self {
         self.labels.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    pub fn with_labels(mut self, labels: HashMap<String, String>) -> Self {
+        self.labels.extend(labels);
         self
     }
 

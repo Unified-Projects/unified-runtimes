@@ -117,6 +117,8 @@ fn test_config(network: String) -> ExecutorConfig {
         min_memory: 0,
         keep_alive: true,
         inactive_threshold: 300,
+        startup_timeout_secs: 60,
+        runtime_max_concurrency: None,
         maintenance_interval: 3600,
         autoscale: false,
         eager_runtime_readiness: false,
@@ -332,6 +334,7 @@ async fn create_test_server_with(
             &registry,
             &keep_alive_registry,
             &config.hostname,
+            config.runtime_lifecycle_defaults(),
         )
         .await;
     }
@@ -350,6 +353,7 @@ async fn create_test_server_with(
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
+        runtime_concurrency: urt_executor::runtime::RuntimeConcurrency::new(),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
         adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
             std::time::Duration::from_millis(2000),
@@ -1487,6 +1491,7 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
+        runtime_concurrency: urt_executor::runtime::RuntimeConcurrency::new(),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
         adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
             std::time::Duration::from_millis(2000),
@@ -2857,8 +2862,9 @@ mod docker_dns_resolution {
     /// Test that the `listening` field correctly reflects runtime port availability.
     ///
     /// This test verifies:
-    /// 1. Initially `listening` is 0 (runtime not yet listening on port 3000)
-    /// 2. After first successful execution, `listening` becomes 1
+    /// 1. `initialised` never runs ahead of `listening`: the executor only
+    ///    claims a runtime is initialised once it has answered on port 3000
+    /// 2. After a successful execution, `listening` is 1
     /// 3. When `listening` is 1, subsequent executions work correctly
     ///
     /// The `listening` flag is used to skip the TCP port check on subsequent requests,
@@ -2895,7 +2901,9 @@ mod docker_dns_resolution {
             // Wait for runtime to start
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            // Check initial listening state - should be 0 before first execution
+            // Check the initial state. The background probe may already have
+            // observed the runtime listening, so the invariant rather than a
+            // fixed value is what matters here.
             let response = server
                 .client
                 .get(format!("{}/v1/runtimes/{}", server.base_url, runtime_id))
@@ -2907,12 +2915,12 @@ mod docker_dns_resolution {
             assert_eq!(response.status(), StatusCode::OK);
             let runtime: Value = response.json().await.expect("Failed to parse JSON");
             let initial_listening = runtime["listening"].as_u64().unwrap_or(99);
+            let initial_initialised = runtime["initialised"].as_u64().unwrap_or(99);
 
-            // Initial state should be 0 (not yet verified as listening)
             assert_eq!(
-                initial_listening, 0,
-                "Runtime should initially have listening=0, got {}",
-                initial_listening
+                initial_initialised, initial_listening,
+                "initialised must only be set once the runtime is observed listening, got initialised={} listening={}",
+                initial_initialised, initial_listening
             );
 
             // Execute function (this triggers the TCP port check and sets listening=1)
@@ -2957,6 +2965,13 @@ mod docker_dns_resolution {
             assert_eq!(response.status(), StatusCode::OK);
             let runtime: Value = response.json().await.expect("Failed to parse JSON");
             let after_exec_listening = runtime["listening"].as_u64().unwrap_or(99);
+            let after_exec_initialised = runtime["initialised"].as_u64().unwrap_or(99);
+
+            assert_eq!(
+                after_exec_initialised, 1,
+                "Runtime should have initialised=1 after execution, got {}",
+                after_exec_initialised
+            );
 
             // After successful execution, listening should be 1
             assert_eq!(
@@ -3155,9 +3170,16 @@ mod docker_dns_resolution {
                 "Name and hostname should be different for keep-alive runtime"
             );
 
-            // Verify keep-alive is present (may or may not be exposed in API)
+            // The background probe may already have observed the runtime
+            // listening, so assert the invariant rather than a fixed value:
+            // initialised is never claimed ahead of listening.
             let initial_listening = runtime["listening"].as_u64().unwrap_or(99);
-            assert_eq!(initial_listening, 0, "Should start with listening=0");
+            let initial_initialised = runtime["initialised"].as_u64().unwrap_or(99);
+            assert_eq!(
+                initial_initialised, initial_listening,
+                "initialised={} must match listening={}",
+                initial_initialised, initial_listening
+            );
 
             // Execute multiple times to test keep-alive behavior
             let exec_payload = json!({

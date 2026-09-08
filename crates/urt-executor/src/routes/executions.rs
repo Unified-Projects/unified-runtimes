@@ -9,7 +9,9 @@ use super::AppState;
 use crate::error::{ExecutorError, Result};
 use crate::execution_counter::ExecutionGuard;
 use crate::resilience::retry_with_backoff;
-use crate::runtime::{get_protocol, wait_for_runtime_port, ExecuteRequest, ExecuteResponse};
+use crate::runtime::{
+    get_protocol, wait_for_runtime_port, ExecuteRequest, ExecuteResponse, RUNTIME_PORT,
+};
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
     body::Body,
@@ -22,7 +24,7 @@ use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Request body for execution
 #[derive(Debug, Deserialize)]
@@ -61,6 +63,17 @@ pub struct ExecutionRequest {
     pub logging: bool,
     #[serde(default = "default_restart_policy")]
     pub restart_policy: String,
+    /// Seconds the runtime has to start listening, for an on-the-fly create.
+    #[serde(default)]
+    pub startup_timeout: Option<u64>,
+    /// Seconds of inactivity before the runtime is reclaimed, for an on-the-fly
+    /// create.
+    #[serde(default)]
+    pub inactive_threshold: Option<u64>,
+    /// Cap on executions in flight against this runtime, for an on-the-fly
+    /// create. Applies to every execution once the runtime exists.
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
 }
 
 fn default_path() -> String {
@@ -352,6 +365,9 @@ fn parse_multipart_execution_request(body: &str, content_type: &str) -> Result<E
             .get("restartPolicy")
             .cloned()
             .unwrap_or_else(default_restart_policy),
+        startup_timeout: fields.get("startupTimeout").and_then(|s| s.parse().ok()),
+        inactive_threshold: fields.get("inactiveThreshold").and_then(|s| s.parse().ok()),
+        max_concurrency: fields.get("maxConcurrency").and_then(|s| s.parse().ok()),
     })
 }
 
@@ -429,6 +445,32 @@ pub async fn create_execution(
 
     let runtime = resolve_runtime(&state, &runtime_id, &full_name, &req).await?;
 
+    // Per-runtime admission control. A runtime created with `maxConcurrency`
+    // admits that many executions at once; the rest queue for the executor's
+    // execution queue wait and are then refused, rather than piling onto a
+    // runtime that cannot keep up with them.
+    let _runtime_slot = match runtime.max_concurrency {
+        Some(limit) => {
+            let queue_wait = Duration::from_millis(state.config.execution_queue_wait_ms);
+            match state
+                .runtime_concurrency
+                .acquire(&full_name, limit, queue_wait)
+                .await
+            {
+                Some(permit) => Some(permit),
+                None => {
+                    metrics().inc_error_class("create_execution", "runtime_at_capacity");
+                    operation_timer.mark_overload();
+                    return Err(ExecutorError::RuntimeAtCapacity(format!(
+                        "Runtime {} is already running its limit of {} concurrent executions",
+                        runtime_id, limit
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
+
     // Coalesce activity updates to reduce write contention on the runtime registry.
     state.registry.touch_if_stale(&full_name, 1.0).await.ok();
 
@@ -436,17 +478,18 @@ pub async fn create_execution(
     // On first execution, wait for the runtime to start listening on port 3000
     if !runtime.is_listening() {
         debug!(
-            "Checking if runtime {} is listening on port 3000",
-            runtime.name
+            "Checking if runtime {} is listening on port {}",
+            runtime.name, RUNTIME_PORT
         );
         let port_timeout = Duration::from_secs(req.timeout as u64);
-        wait_for_runtime_port(&runtime.name, 3000, port_timeout).await?;
+        wait_for_runtime_port(&runtime.name, RUNTIME_PORT, port_timeout).await?;
 
-        // Mark runtime as listening so we skip this check on subsequent executions
+        // Observing the port is what marks the runtime initialised, and it also
+        // skips this check on subsequent executions.
         if let Err(e) = state.registry.set_listening(&full_name).await {
             debug!("Failed to mark runtime as listening: {}", e);
         }
-        debug!("Runtime {} is now listening", runtime.hostname);
+        debug!("Runtime {} is now listening", runtime.name);
     }
 
     // Build execution request
@@ -567,6 +610,15 @@ async fn resolve_runtime(
     )
     .await
     {
+        // A runtime the watchdog has given up on is about to be removed. Treat
+        // it as absent so a caller that supplied an image recreates it now
+        // instead of executing against something that has never answered.
+        Ok(rt) if rt.is_failed() => {
+            warn!(
+                "Runtime {} is marked failed after never listening; not serving executions from it",
+                rt.name
+            );
+        }
         Ok(rt) => return Ok(rt),
         Err(ExecutorError::RuntimeNotFound) => {}
         Err(e) => return Err(e),
@@ -595,7 +647,10 @@ async fn resolve_runtime(
         "memory": req.memory,
         "version": req.version,
         "restartPolicy": req.restart_policy,
-        "dockerCmd": []
+        "dockerCmd": [],
+        "startupTimeout": req.startup_timeout,
+        "inactiveThreshold": req.inactive_threshold,
+        "maxConcurrency": req.max_concurrency
     });
 
     let _ = super::runtimes::create_runtime(
@@ -671,6 +726,9 @@ fn parse_multipart_execution_request_bytes(
         runtime_entrypoint: String::new(),
         logging: default_logging(),
         restart_policy: default_restart_policy(),
+        startup_timeout: None,
+        inactive_threshold: None,
+        max_concurrency: None,
     };
 
     let mut i = 0;
@@ -734,6 +792,11 @@ fn parse_multipart_execution_request_bytes(
                 "runtimeEntrypoint" => request.runtime_entrypoint = parse_string(value),
                 "logging" => request.logging = value == b"true" || value == b"1",
                 "restartPolicy" => request.restart_policy = parse_string(value),
+                "startupTimeout" => request.startup_timeout = parse_u64(value),
+                "inactiveThreshold" => request.inactive_threshold = parse_u64(value),
+                "maxConcurrency" => {
+                    request.max_concurrency = parse_u64(value).map(|limit| limit as usize)
+                }
                 _ => {}
             }
             i += next_boundary;

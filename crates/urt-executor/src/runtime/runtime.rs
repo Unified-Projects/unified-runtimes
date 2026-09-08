@@ -5,6 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Lifecycle state of a registry entry, tracked separately from the Docker
@@ -18,6 +19,105 @@ pub enum RuntimeState {
     /// The entry is published: its status reflects the container.
     #[default]
     Published,
+}
+
+/// Port every managed runtime is expected to serve on.
+pub const RUNTIME_PORT: u16 = 3000;
+
+/// Status of a runtime the executor has given up on: the container is up but it
+/// never started listening inside its startup window. Docker never reports this
+/// state itself, so it cannot be confused with a container state.
+pub const STATUS_FAILED: &str = "failed";
+
+/// Seconds a runtime may be running without listening on its port before it is
+/// marked failed. Default for `URT_STARTUP_TIMEOUT_SECS` and for the per-runtime
+/// `startupTimeout` request field.
+pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 60;
+
+/// Seconds a runtime may sit idle before maintenance reclaims it. Default for
+/// `URT_INACTIVE_THRESHOLD` and for the per-runtime `inactiveThreshold` field.
+pub const DEFAULT_INACTIVE_THRESHOLD_SECS: u64 = 60;
+
+/// The lifecycle knobs a caller may set per runtime, resolved against the
+/// executor-wide defaults at creation time and carried on the runtime itself so
+/// every consumer reads one value rather than re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeLifecycle {
+    /// Seconds the runtime has to start listening before it is marked failed.
+    pub startup_timeout: u64,
+    /// Seconds of inactivity before idle cleanup may reclaim the runtime.
+    pub inactive_threshold: u64,
+    /// Cap on executions in flight against this runtime. `None` is unlimited.
+    pub max_concurrency: Option<usize>,
+}
+
+impl Default for RuntimeLifecycle {
+    fn default() -> Self {
+        Self {
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT_SECS,
+            inactive_threshold: DEFAULT_INACTIVE_THRESHOLD_SECS,
+            max_concurrency: None,
+        }
+    }
+}
+
+/// Container label carrying the startup window.
+pub const LABEL_STARTUP_TIMEOUT: &str = "urt.startup_timeout";
+/// Container label carrying the idle threshold.
+pub const LABEL_INACTIVE_THRESHOLD: &str = "urt.inactive_threshold";
+/// Container label carrying the in-flight execution cap, where `0` is unlimited.
+pub const LABEL_MAX_CONCURRENCY: &str = "urt.max_concurrency";
+
+impl RuntimeLifecycle {
+    /// The knobs as container labels, so a runtime adopted after an executor
+    /// restart keeps the values its creator asked for rather than silently
+    /// reverting to the executor defaults.
+    pub fn to_labels(self) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                LABEL_STARTUP_TIMEOUT.to_string(),
+                self.startup_timeout.to_string(),
+            ),
+            (
+                LABEL_INACTIVE_THRESHOLD.to_string(),
+                self.inactive_threshold.to_string(),
+            ),
+            (
+                LABEL_MAX_CONCURRENCY.to_string(),
+                self.max_concurrency.unwrap_or(0).to_string(),
+            ),
+        ])
+    }
+
+    /// Read the knobs back off a container's labels, falling back to `defaults`
+    /// for anything missing or unparseable (a container created before these
+    /// labels existed, or one labelled by hand).
+    pub fn from_labels(labels: &HashMap<String, String>, defaults: Self) -> Self {
+        let parsed = |key: &str| -> Option<u64> { labels.get(key)?.trim().parse::<u64>().ok() };
+
+        Self {
+            startup_timeout: parsed(LABEL_STARTUP_TIMEOUT)
+                .filter(|value| *value > 0)
+                .unwrap_or(defaults.startup_timeout),
+            inactive_threshold: parsed(LABEL_INACTIVE_THRESHOLD)
+                .unwrap_or(defaults.inactive_threshold),
+            max_concurrency: match parsed(LABEL_MAX_CONCURRENCY) {
+                // The label is always written, with 0 standing for unlimited, so
+                // a present-and-zero value is a deliberate "no cap".
+                Some(0) => None,
+                Some(limit) => Some(limit as usize),
+                None => defaults.max_concurrency,
+            },
+        }
+    }
+}
+
+fn default_startup_timeout() -> u64 {
+    DEFAULT_STARTUP_TIMEOUT_SECS
+}
+
+fn default_inactive_threshold() -> u64 {
+    DEFAULT_INACTIVE_THRESHOLD_SECS
 }
 
 /// Runtime state representing a containerized function instance
@@ -37,7 +137,8 @@ pub struct Runtime {
     pub updated: f64,
     /// Container name: {hostname}-{runtimeId}
     pub name: String,
-    /// Internal hostname (32-char hex)
+    /// 32-char hex identity reported on the runtime object. The container's own
+    /// hostname is left to Docker; adoption fills this in from the container.
     pub hostname: String,
     /// Container status: "pending" or Docker status string
     pub status: String,
@@ -52,8 +153,19 @@ pub struct Runtime {
     pub listening: u8,
     /// Docker image name
     pub image: String,
-    /// Initialization counter
+    /// Set to 1 once the runtime has been observed listening on its port, and
+    /// never before: a runtime that reports `initialised: 1, listening: 0` was
+    /// what hid two production outages.
     pub initialised: u8,
+    /// Seconds this runtime has to start listening before it is marked failed.
+    #[serde(default = "default_startup_timeout")]
+    pub startup_timeout: u64,
+    /// Seconds of inactivity before idle cleanup may reclaim this runtime.
+    #[serde(default = "default_inactive_threshold")]
+    pub inactive_threshold: u64,
+    /// Cap on executions in flight against this runtime; `null` is unlimited.
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
     /// Optional keep-alive ID for cleanup protection.
     /// When set, this runtime is protected from cleanup as long as it
     /// owns this ID (i.e., is the newest runtime with this ID).
@@ -98,6 +210,9 @@ impl Runtime {
             listening: 0,
             image: image.to_string(),
             initialised: 0,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT_SECS,
+            inactive_threshold: DEFAULT_INACTIVE_THRESHOLD_SECS,
+            max_concurrency: None,
             keep_alive_id,
             authorization_header: String::new(),
         };
@@ -111,11 +226,58 @@ impl Runtime {
         self.state = RuntimeState::Published;
     }
 
-    /// Mark runtime as running with the container status
+    /// Apply the resolved lifecycle knobs to this runtime.
+    pub fn with_lifecycle(mut self, lifecycle: RuntimeLifecycle) -> Self {
+        self.apply_lifecycle(lifecycle);
+        self
+    }
+
+    /// Apply the resolved lifecycle knobs in place.
+    pub fn apply_lifecycle(&mut self, lifecycle: RuntimeLifecycle) {
+        self.startup_timeout = lifecycle.startup_timeout.max(1);
+        self.inactive_threshold = lifecycle.inactive_threshold;
+        self.max_concurrency = lifecycle.max_concurrency.filter(|limit| *limit > 0);
+    }
+
+    /// The lifecycle knobs currently in force for this runtime.
+    pub fn lifecycle(&self) -> RuntimeLifecycle {
+        RuntimeLifecycle {
+            startup_timeout: self.startup_timeout,
+            inactive_threshold: self.inactive_threshold,
+            max_concurrency: self.max_concurrency,
+        }
+    }
+
+    /// Mark runtime as running with the container status.
+    ///
+    /// Deliberately leaves `initialised` alone: a container that is up has not
+    /// yet proved it can serve, and only `set_listening` makes that claim.
     pub fn mark_running(&mut self, status: &str) {
         self.publish_status(status);
-        self.initialised = 1;
         self.touch();
+    }
+
+    /// Give up on a runtime that started but never listened. The entry stays in
+    /// the registry so `GET /v1/runtimes` shows the verdict until the watchdog
+    /// reaps it on its next cycle.
+    pub fn mark_failed(&mut self) {
+        self.status = STATUS_FAILED.to_string();
+        self.initialised = 0;
+    }
+
+    /// Whether the executor has given up on this runtime.
+    pub fn is_failed(&self) -> bool {
+        self.status.eq_ignore_ascii_case(STATUS_FAILED)
+    }
+
+    /// Seconds of inactivity this runtime tolerates, falling back to the
+    /// executor-wide default for entries that carry no value of their own.
+    pub fn effective_inactive_threshold(&self, default_threshold: u64) -> u64 {
+        if self.inactive_threshold > 0 {
+            self.inactive_threshold
+        } else {
+            default_threshold
+        }
     }
 
     /// Update the last activity timestamp
@@ -170,10 +332,22 @@ impl Runtime {
         self.listening > 0
     }
 
-    /// Mark the runtime as listening on port 3000
+    /// Record that the runtime has been observed listening on port 3000.
+    ///
+    /// This is the only transition that sets `initialised`, and it clears a
+    /// previous failed verdict for a runtime that came up late.
     pub fn set_listening(&mut self) {
         self.listening = 1;
+        self.initialised = 1;
+        if self.is_failed() {
+            self.status = "running".to_string();
+        }
         self.touch();
+    }
+
+    /// Whether the runtime is up but has not listened within its startup window.
+    pub fn missed_startup_window(&self) -> bool {
+        self.is_running() && !self.is_listening() && self.age_seconds() >= self.startup_timeout
     }
 
     pub fn refresh_cached_auth(&mut self) {
@@ -192,6 +366,18 @@ impl Runtime {
             .unwrap()
             .as_secs_f64()
     }
+}
+
+/// Single-shot check that something is accepting connections on the runtime's
+/// port. Unlike `wait_for_runtime_port` this never retries, so a caller
+/// sweeping many runtimes spends at most `timeout` on each.
+pub async fn is_runtime_listening(name: &str, timeout: Duration) -> bool {
+    let addr = format!("{}:{}", name, RUNTIME_PORT);
+
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 pub async fn wait_for_runtime_port(hostname: &str, port: u16, timeout: Duration) -> Result<()> {
@@ -251,14 +437,130 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_running() {
+    fn test_mark_running_does_not_claim_initialised() {
         let mut rt = Runtime::new("test", "exec", "img", "v5", None);
         // Docker inspect returns "running" as the status
         rt.mark_running("running");
 
         assert!(!rt.is_pending());
         assert!(rt.is_running());
+        assert_eq!(rt.initialised, 0);
+        assert_eq!(rt.listening, 0);
+    }
+
+    #[test]
+    fn test_set_listening_is_what_initialises_a_runtime() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        rt.set_listening();
+
+        assert_eq!(rt.listening, 1);
         assert_eq!(rt.initialised, 1);
+        assert!(rt.is_listening());
+    }
+
+    #[test]
+    fn test_mark_failed_clears_initialised_and_is_visible_as_status() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        rt.set_listening();
+        rt.mark_failed();
+
+        assert!(rt.is_failed());
+        assert_eq!(rt.status, "failed");
+        assert_eq!(rt.initialised, 0);
+        assert!(!rt.is_running());
+        assert!(!rt.is_pending());
+    }
+
+    #[test]
+    fn test_late_listener_clears_the_failed_verdict() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        rt.mark_failed();
+        rt.set_listening();
+
+        assert!(!rt.is_failed());
+        assert!(rt.is_running());
+        assert_eq!(rt.initialised, 1);
+    }
+
+    #[test]
+    fn test_missed_startup_window_only_after_the_window() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.apply_lifecycle(RuntimeLifecycle {
+            startup_timeout: 30,
+            ..RuntimeLifecycle::default()
+        });
+        rt.mark_running("running");
+
+        assert!(!rt.missed_startup_window());
+
+        rt.created -= 31.0;
+        assert!(rt.missed_startup_window());
+
+        rt.set_listening();
+        assert!(!rt.missed_startup_window());
+    }
+
+    #[test]
+    fn test_pending_runtime_never_misses_the_startup_window() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.created -= 3_600.0;
+
+        assert!(rt.is_pending());
+        assert!(!rt.missed_startup_window());
+    }
+
+    #[test]
+    fn test_lifecycle_round_trips_and_normalises() {
+        let rt = Runtime::new("test", "exec", "img", "v5", None).with_lifecycle(RuntimeLifecycle {
+            startup_timeout: 0,
+            inactive_threshold: 900,
+            max_concurrency: Some(0),
+        });
+
+        // A zero startup timeout would condemn every runtime immediately, and a
+        // zero concurrency cap would reject every execution.
+        assert_eq!(rt.startup_timeout, 1);
+        assert_eq!(rt.inactive_threshold, 900);
+        assert_eq!(rt.max_concurrency, None);
+        assert_eq!(rt.lifecycle().inactive_threshold, 900);
+    }
+
+    #[test]
+    fn test_effective_inactive_threshold_falls_back_to_default() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        assert_eq!(rt.effective_inactive_threshold(120), 60);
+
+        rt.inactive_threshold = 0;
+        assert_eq!(rt.effective_inactive_threshold(120), 120);
+
+        rt.inactive_threshold = 5;
+        assert_eq!(rt.effective_inactive_threshold(120), 5);
+    }
+
+    #[test]
+    fn test_runtime_deserialises_without_lifecycle_fields() {
+        let json = r#"{
+            "runtime_id": "fn-1",
+            "executor_hostname": "exec",
+            "version": "v5",
+            "created": 1.0,
+            "updated": 1.0,
+            "name": "exec-fn-1",
+            "hostname": "abc",
+            "status": "running",
+            "key": "k",
+            "listening": 0,
+            "image": "img",
+            "initialised": 0
+        }"#;
+
+        let rt: Runtime = serde_json::from_str(json).unwrap();
+        assert_eq!(rt.startup_timeout, DEFAULT_STARTUP_TIMEOUT_SECS);
+        assert_eq!(rt.inactive_threshold, DEFAULT_INACTIVE_THRESHOLD_SECS);
+        assert_eq!(rt.max_concurrency, None);
     }
 
     #[test]

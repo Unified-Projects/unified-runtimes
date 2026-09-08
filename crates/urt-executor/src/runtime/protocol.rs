@@ -528,6 +528,9 @@ mod tests {
             listening: 1,
             image: "openruntimes/node:v5-22".to_string(),
             initialised: 1,
+            startup_timeout: 60,
+            inactive_threshold: 60,
+            max_concurrency: None,
             keep_alive_id: None,
             authorization_header: "Basic dummy".to_string(),
         };
@@ -553,6 +556,9 @@ mod tests {
             listening: 1,
             image: "openruntimes/node:v5-22".to_string(),
             initialised: 1,
+            startup_timeout: 60,
+            inactive_threshold: 60,
+            max_concurrency: None,
             keep_alive_id: None,
             authorization_header: "Basic dummy".to_string(),
         };

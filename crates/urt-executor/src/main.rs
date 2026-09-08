@@ -29,7 +29,9 @@ use docker::DockerManager;
 use execution_counter::active_executions;
 use platform::temp_dir;
 use routes::{create_router, AppState};
-use runtime::{AdoptionNegativeCache, CreateTracker, KeepAliveRegistry, RuntimeRegistry};
+use runtime::{
+    AdoptionNegativeCache, CreateTracker, KeepAliveRegistry, RuntimeConcurrency, RuntimeRegistry,
+};
 use storage::{Storage, StorageFileCache};
 
 /// Main entry point with optimized Tokio runtime configuration
@@ -137,8 +139,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let keep_alive_registry = KeepAliveRegistry::new();
 
     // Adopt any existing managed containers from previous runs
-    tasks::adopt_existing_containers(&docker, &registry, &keep_alive_registry, &config.hostname)
-        .await;
+    tasks::adopt_existing_containers(
+        &docker,
+        &registry,
+        &keep_alive_registry,
+        &config.hostname,
+        config.runtime_lifecycle_defaults(),
+    )
+    .await;
 
     let mut default_headers = reqwest::header::HeaderMap::new();
     // Force no compression, matches curl / Docker.php behavior
@@ -286,6 +294,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // that still has a build behind it from one that was orphaned.
     let readiness: Arc<DashMap<String, Arc<tokio::sync::Notify>>> = Arc::new(DashMap::new());
     let create_tracker = CreateTracker::new();
+    let runtime_concurrency = RuntimeConcurrency::new();
 
     let maintenance_handles = tasks::MaintenanceHandles {
         docker: docker.clone(),
@@ -314,10 +323,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         tasks::run_stats_collector(stats_docker, stats_registry, stats_shutdown).await;
     });
 
-    let listening_watch_registry = registry.clone();
+    let listening_watch_handles = tasks::ListeningWatchHandles {
+        docker: docker.clone(),
+        registry: registry.clone(),
+        keep_alive_registry: keep_alive_registry.clone(),
+        runtime_concurrency: runtime_concurrency.clone(),
+    };
     let listening_watch_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
-        tasks::run_listening_watch(listening_watch_registry, listening_watch_shutdown).await;
+        tasks::run_listening_watch(listening_watch_handles, listening_watch_shutdown).await;
     });
 
     // Create application state
@@ -334,6 +348,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         execution_limiter_capacity,
         runtime_create_limiter_capacity,
         readiness,
+        runtime_concurrency,
         create_tracker,
         adoption_negative_cache: AdoptionNegativeCache::new(Duration::from_millis(
             config.adoption_negative_cache_ms,

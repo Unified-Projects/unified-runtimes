@@ -52,6 +52,9 @@ pub enum ExecutorError {
     #[error("Executor is overloaded creating runtimes, retry later")]
     RuntimeOverloaded,
 
+    #[error("{0}, retry later")]
+    RuntimeAtCapacity(String),
+
     #[error("Timed out waiting for logs")]
     LogsTimeout,
 
@@ -91,6 +94,7 @@ impl ExecutorError {
             Self::RuntimeFailed(_) => "runtime_failed",
             Self::RuntimeTimeout => "runtime_timeout",
             Self::RuntimeOverloaded => "runtime_timeout",
+            Self::RuntimeAtCapacity(_) => "runtime_at_capacity",
             Self::LogsTimeout => "logs_timeout",
             Self::CommandTimeout => "command_timeout",
             Self::CommandFailed(_) => "command_failed",
@@ -117,6 +121,7 @@ impl ExecutorError {
             Self::RuntimeFailed(_) => StatusCode::BAD_REQUEST,
             Self::RuntimeTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RuntimeOverloaded => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RuntimeAtCapacity(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::LogsTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::CommandTimeout => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CommandFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -245,6 +250,10 @@ mod tests {
             ExecutorError::RuntimeOverloaded.error_type(),
             "runtime_timeout"
         );
+        assert_eq!(
+            ExecutorError::RuntimeAtCapacity("test".to_string()).error_type(),
+            "runtime_at_capacity"
+        );
         assert_eq!(ExecutorError::LogsTimeout.error_type(), "logs_timeout");
         assert_eq!(
             ExecutorError::CommandTimeout.error_type(),
@@ -321,6 +330,10 @@ mod tests {
         );
         assert_eq!(
             ExecutorError::RuntimeOverloaded.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            ExecutorError::RuntimeAtCapacity("test".to_string()).status_code(),
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(

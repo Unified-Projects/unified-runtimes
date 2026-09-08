@@ -66,6 +66,89 @@ fn container_info(summary: bollard::models::ContainerSummary) -> ContainerInfo {
     }
 }
 
+fn restart_policy_for(policy: &str) -> Option<RestartPolicy> {
+    let name = match policy {
+        "always" => RestartPolicyNameEnum::ALWAYS,
+        "on-failure" => {
+            return Some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::ON_FAILURE),
+                maximum_retry_count: Some(3),
+            })
+        }
+        "unless-stopped" => RestartPolicyNameEnum::UNLESS_STOPPED,
+        _ => RestartPolicyNameEnum::NO,
+    };
+
+    Some(RestartPolicy {
+        name: Some(name),
+        maximum_retry_count: None,
+    })
+}
+
+/// Host configuration for a runtime container: resource limits, mounts, the
+/// security hardening URT adds over executor-main, and the network the
+/// container is created on.
+///
+/// The network is set as the container's network mode rather than attached
+/// afterwards. Creating on the default bridge and connecting later leaves the
+/// container on both networks, so a server that binds to its container address
+/// binds to the bridge address the executor cannot reach, and every runtime
+/// gets L2 reach to everything else on the bridge. executor-main runs its
+/// runtimes with `--network` and never touches the bridge; this matches it.
+fn build_host_config(container_config: &ContainerConfig) -> HostConfig {
+    HostConfig {
+        memory: Some(container_config.memory as i64),
+        nano_cpus: Some((container_config.cpus * 1_000_000_000.0) as i64),
+        restart_policy: restart_policy_for(&container_config.restart_policy),
+        network_mode: container_config.network.clone(),
+        binds: Some(
+            container_config
+                .mounts
+                .iter()
+                .map(|m| {
+                    if m.read_only {
+                        format!("{}:{}:ro", m.source, m.target)
+                    } else {
+                        format!("{}:{}", m.source, m.target)
+                    }
+                })
+                .collect(),
+        ),
+        // Security hardening: drop all capabilities first
+        cap_drop: Some(vec!["ALL".to_string()]),
+        // Add back only essential capabilities for runtime operation
+        cap_add: Some(vec![
+            "CHOWN".to_string(),  // Change file ownership
+            "SETGID".to_string(), // Set group ID
+            "SETUID".to_string(), // Set user ID
+        ]),
+        // Prevent privilege escalation
+        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+        // Limit PIDs to prevent fork bombs
+        // 6144 is enough for complex builds (Next.js, webpack) while still providing protection
+        // executor-main doesn't set a limit, but we add one for safety
+        pids_limit: Some(6144),
+        ..Default::default()
+    }
+}
+
+/// Create body for a runtime container.
+///
+/// The container hostname is left unset so Docker seeds it with the container
+/// ID, as executor-main does. Nothing in the executor reaches a runtime by its
+/// hostname: every caller uses the container name over the runtimes network.
+fn build_create_body(container_config: &ContainerConfig) -> ContainerCreateBody {
+    ContainerCreateBody {
+        image: Some(container_config.image.clone()),
+        env: Some(container_config.env_vec()),
+        entrypoint: container_config.entrypoint.clone(),
+        cmd: container_config.cmd.clone(),
+        host_config: Some(build_host_config(container_config)),
+        labels: Some(container_config.labels.clone()),
+        ..Default::default()
+    }
+}
+
 /// Parse Docker environment format (`KEY=VALUE`) into a map.
 fn parse_env_vars(env: Option<Vec<String>>) -> HashMap<String, String> {
     let mut vars = HashMap::new();
@@ -285,76 +368,7 @@ impl DockerManager {
     pub async fn create_container(&self, container_config: ContainerConfig) -> Result<String> {
         debug!("Creating container: {}", container_config.name);
 
-        // Convert restart policy
-        let restart_policy = match container_config.restart_policy.as_str() {
-            "always" => Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::ALWAYS),
-                maximum_retry_count: None,
-            }),
-            "on-failure" => Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::ON_FAILURE),
-                maximum_retry_count: Some(3),
-            }),
-            "unless-stopped" => Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                maximum_retry_count: None,
-            }),
-            _ => Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::NO),
-                maximum_retry_count: None,
-            }),
-        };
-
-        // Build host config with security hardening
-        let host_config = HostConfig {
-            memory: Some(container_config.memory as i64),
-            nano_cpus: Some((container_config.cpus * 1_000_000_000.0) as i64),
-            restart_policy,
-            binds: Some(
-                container_config
-                    .mounts
-                    .iter()
-                    .map(|m| {
-                        if m.read_only {
-                            format!("{}:{}:ro", m.source, m.target)
-                        } else {
-                            format!("{}:{}", m.source, m.target)
-                        }
-                    })
-                    .collect(),
-            ),
-            // Security hardening: drop all capabilities first
-            cap_drop: Some(vec!["ALL".to_string()]),
-            // Add back only essential capabilities for runtime operation
-            cap_add: Some(vec![
-                "CHOWN".to_string(),  // Change file ownership
-                "SETGID".to_string(), // Set group ID
-                "SETUID".to_string(), // Set user ID
-            ]),
-            // Prevent privilege escalation
-            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            // Limit PIDs to prevent fork bombs
-            // 6144 is enough for complex builds (Next.js, webpack) while still providing protection
-            // executor-main doesn't set a limit, but we add one for safety
-            pids_limit: Some(6144),
-            ..Default::default()
-        };
-
-        // Build container config
-        let config = ContainerCreateBody {
-            image: Some(container_config.image.clone()),
-            hostname: if container_config.hostname.is_empty() {
-                None
-            } else {
-                Some(container_config.hostname.clone())
-            },
-            env: Some(container_config.env_vec()),
-            entrypoint: container_config.entrypoint.clone(),
-            cmd: container_config.cmd.clone(),
-            host_config: Some(host_config),
-            labels: Some(container_config.labels.clone()),
-            ..Default::default()
-        };
+        let config = build_create_body(&container_config);
 
         let options = CreateContainerOptions {
             name: Some(container_config.name.clone()),
@@ -390,16 +404,9 @@ impl DockerManager {
             container_config.name, response.id
         );
 
-        // Connect to network if specified
-        if let Some(ref network) = container_config.network {
-            if let Err(error) =
-                connect_container(&self.docker, network, &container_config.name).await
-            {
-                self.discard_unstarted_container(&container_config.name, "network attach failed")
-                    .await;
-                return Err(error);
-            }
-        }
+        // The primary network was applied as the container's network mode at
+        // create, so there is nothing to attach here. Secondary networks are
+        // connected by the caller once the container is running.
 
         // Start container
         if let Err(error) = self
@@ -648,8 +655,67 @@ impl std::fmt::Debug for DockerManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_missing_image_error, map_create_container_error};
+    use super::{
+        build_create_body, build_host_config, is_missing_image_error, map_create_container_error,
+    };
+    use crate::docker::container::ContainerConfig;
     use crate::error::ExecutorError;
+
+    #[test]
+    fn test_host_config_creates_the_container_on_the_configured_network() {
+        let config = ContainerConfig::new("exc1-fn-1", "openruntimes/node:v5-25")
+            .with_network("openruntimes-runtimes");
+
+        let host_config = build_host_config(&config);
+
+        assert_eq!(
+            host_config.network_mode.as_deref(),
+            Some("openruntimes-runtimes")
+        );
+    }
+
+    #[test]
+    fn test_host_config_without_a_network_leaves_the_mode_unset() {
+        let config = ContainerConfig::new("exc1-fn-1", "openruntimes/node:v5-25");
+
+        assert!(build_host_config(&config).network_mode.is_none());
+    }
+
+    #[test]
+    fn test_create_body_leaves_the_hostname_to_docker() {
+        let config =
+            ContainerConfig::new("exc1-fn-1", "openruntimes/node:v5-25").with_network("runtimes");
+
+        assert!(build_create_body(&config).hostname.is_none());
+    }
+
+    #[test]
+    fn test_create_body_keeps_security_hardening_and_resource_limits() {
+        let config = ContainerConfig::new("exc1-fn-1", "openruntimes/node:v5-25")
+            .with_network("runtimes")
+            .with_cpus(2.0)
+            .with_memory_mb(1024)
+            .with_mount("/tmp/src", "/tmp", false)
+            .with_mount("/tmp/builds", "/mnt/code", true);
+
+        let host_config = build_create_body(&config).host_config.unwrap();
+
+        assert_eq!(host_config.memory, Some(1024 * 1024 * 1024));
+        assert_eq!(host_config.nano_cpus, Some(2_000_000_000));
+        assert_eq!(host_config.cap_drop, Some(vec!["ALL".to_string()]));
+        assert_eq!(
+            host_config.security_opt,
+            Some(vec!["no-new-privileges:true".to_string()])
+        );
+        assert_eq!(host_config.pids_limit, Some(6144));
+        assert_eq!(
+            host_config.binds,
+            Some(vec![
+                "/tmp/src:/tmp".to_string(),
+                "/tmp/builds:/mnt/code:ro".to_string(),
+            ])
+        );
+    }
 
     #[test]
     fn test_is_missing_image_error_detects_docker_not_found() {

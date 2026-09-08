@@ -85,7 +85,9 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_METRICS` | `false` | Enable Prometheus metrics endpoint at `/metrics` |
 | `URT_NETWORK` | `openruntimes-runtimes` | Docker network for containers |
 | `URT_KEEP_ALIVE` | `false` | Disable idle timeout (containers only removed via DELETE) |
-| `URT_INACTIVE_THRESHOLD` | `60` | Seconds before marking runtime inactive |
+| `URT_INACTIVE_THRESHOLD` | `60` | Default seconds before an idle runtime is reclaimed (per-runtime `inactiveThreshold` overrides it) |
+| `URT_STARTUP_TIMEOUT_SECS` | `60` | Default seconds a runtime has to start listening on port 3000 before it is marked failed (per-runtime `startupTimeout` overrides it) |
+| `URT_RUNTIME_MAX_CONCURRENCY` | `` | Default cap on executions in flight against a single runtime; unlimited when unset (per-runtime `maxConcurrency` overrides it) |
 | `URT_MAINTENANCE_INTERVAL` | `3600` | Seconds between cleanup tasks |
 | `URT_ADOPTION_NEGATIVE_CACHE_MS` | `2000` | How long a failed container adoption is remembered, so repeated requests for an unknown runtime ID do not each cost a Docker inspect (`0` disables) |
 | `URT_AUTOSCALE` | `false` | Enable autoscale mode with adaptive concurrency limiting |
@@ -120,6 +122,30 @@ See `.env.example` for the complete list with descriptions.
 - `GET /v1/runtimes` - List all runtimes
 - `GET /v1/runtimes/{id}` - Get runtime details
 - `DELETE /v1/runtimes/{id}` - Delete a runtime
+
+#### Per-runtime lifecycle fields
+
+`POST /v1/runtimes` and the on-the-fly create inside `POST /v1/runtimes/{id}/executions`
+accept three optional fields. Each falls back to the environment default above, and
+each is echoed back on the runtime in `GET /v1/runtimes`. Unknown fields are ignored,
+so OpenRuntimes clients that know nothing about them are unaffected.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `startupTimeout` | seconds | How long the runtime has to start listening on port 3000. A runtime still silent at the end of its window is marked `failed` and removed, so the next request builds a fresh one. |
+| `inactiveThreshold` | seconds | How long the runtime may sit idle before maintenance reclaims it. |
+| `maxConcurrency` | integer | Executions admitted at once. Requests beyond the cap wait up to `URT_EXECUTION_QUEUE_WAIT_MS` and are then refused with `503 runtime_at_capacity`. |
+
+The values are stored as container labels, so a runtime adopted after an executor
+restart keeps the settings it was created with.
+
+#### Runtime state
+
+`status` is `pending` while a runtime is being built, then the Docker container
+state, or `failed` once the executor has given up on a runtime that never listened.
+`listening` is 1 once the runtime has answered on port 3000, and `initialised` is
+set at the same moment and never before: a runtime reporting `initialised: 1` has
+proved it can serve.
 
 ### Executions
 - `POST /v1/runtimes/{id}/executions` - Execute a function

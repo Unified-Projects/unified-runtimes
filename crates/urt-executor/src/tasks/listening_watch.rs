@@ -1,222 +1,319 @@
 //! Watchdog for runtimes that start but never listen
 //!
-//! A container can report `running` with `initialised = 1` and still be
-//! unreachable, most commonly when its server binds to a per-container address
-//! rather than the wildcard address. The registry records that as
-//! `listening = 0` forever and nothing else surfaces it, so this task turns the
-//! condition into a warning in the executor log.
+//! A container can report `running` and still be unreachable, most commonly
+//! when its server binds to a per-container address rather than the wildcard
+//! address, or when the code it was given is not a build at all. The executor
+//! only sets `initialised` once a runtime has been observed listening, and this
+//! task is what observes it: it probes every running runtime that has not
+//! listened yet, records the ones that answer, and gives up on the ones still
+//! silent at the end of their startup window.
+//!
+//! A runtime it gives up on is marked `failed`, which is visible in
+//! `GET /v1/runtimes`, and removed on the following cycle so the next request
+//! for that runtime ID creates a fresh one. The cycle is deliberately short:
+//! the hourly maintenance sweep is far too coarse to sit in front of a
+//! function that is returning errors.
 
-use crate::runtime::{Runtime, RuntimeRegistry};
+use crate::docker::DockerManager;
+use crate::runtime::{
+    is_runtime_listening, KeepAliveRegistry, Runtime, RuntimeConcurrency, RuntimeRegistry,
+    RUNTIME_PORT,
+};
+use futures_util::stream::{self, StreamExt};
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-/// How often the registry is scanned for stuck runtimes.
-const SCAN_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the registry is swept. Short enough that a runtime which never
+/// comes up is out of the way well inside a user's patience.
+const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long a runtime may be running and initialised without ever having been
-/// observed listening before it is reported.
-const LISTENING_GRACE: Duration = Duration::from_secs(120);
+/// How long a single probe waits for the runtime to accept a connection. A
+/// listening runtime accepts immediately even when it is busy, because the
+/// kernel completes the handshake from the accept backlog.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Port every managed runtime is expected to serve on.
-const RUNTIME_PORT: u16 = 3000;
+/// Probes issued at once, so a host with many silent runtimes still finishes a
+/// sweep well inside the scan interval.
+const PROBE_CONCURRENCY: usize = 8;
 
-/// Remembers which runtimes have already been reported so the warning is logged
-/// once per runtime instead of on every scan.
-#[derive(Debug, Default)]
-struct NonListeningWatch {
-    reported: HashSet<String>,
+/// What the watchdog needs to see and act on runtime state.
+#[derive(Clone)]
+pub struct ListeningWatchHandles {
+    pub docker: Arc<DockerManager>,
+    pub registry: RuntimeRegistry,
+    pub keep_alive_registry: KeepAliveRegistry,
+    pub runtime_concurrency: RuntimeConcurrency,
 }
 
-impl NonListeningWatch {
-    /// Return the runtimes that have just crossed the grace period without ever
-    /// being observed listening. Names that have left the registry are forgotten,
-    /// so a recreated runtime under the same name can be reported again.
-    fn newly_stuck<'a>(
-        &mut self,
-        runtimes: &'a [Runtime],
-        grace: Duration,
-        now: f64,
-    ) -> Vec<&'a Runtime> {
-        let live: HashSet<&str> = runtimes.iter().map(|r| r.name.as_str()).collect();
-        self.reported.retain(|name| live.contains(name.as_str()));
+/// Worth probing: up, not pending, not failed, and not yet known to listen.
+fn is_probe_candidate(runtime: &Runtime) -> bool {
+    runtime.is_running() && !runtime.is_listening()
+}
 
-        let grace_secs = grace.as_secs_f64();
-        runtimes
-            .iter()
-            .filter(|runtime| is_stuck_non_listening(runtime, grace_secs, now))
-            .filter(|runtime| self.reported.insert(runtime.name.clone()))
-            .collect()
+/// Probe every runtime that has not listened yet, record the ones that answer,
+/// and mark the ones that have run out of startup window as failed.
+///
+/// Returns the names newly marked failed. Needs nothing but the registry, so a
+/// caller can drive one sweep directly.
+pub async fn sweep_listening_state(registry: &RuntimeRegistry) -> Vec<String> {
+    let candidates: Vec<Runtime> = registry
+        .list()
+        .await
+        .into_iter()
+        .filter(is_probe_candidate)
+        .collect();
+
+    if candidates.is_empty() {
+        return Vec::new();
     }
+
+    let probed: Vec<(Runtime, bool)> = stream::iter(candidates)
+        .map(|runtime| async move {
+            let listening = is_runtime_listening(&runtime.name, PROBE_TIMEOUT).await;
+            (runtime, listening)
+        })
+        .buffer_unordered(PROBE_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut failed = Vec::new();
+
+    for (runtime, listening) in probed {
+        if listening {
+            if registry.set_listening(&runtime.name).await.is_ok() {
+                debug!(
+                    "Runtime {} is listening on port {}",
+                    runtime.name, RUNTIME_PORT
+                );
+            }
+            continue;
+        }
+
+        if !runtime.missed_startup_window() {
+            continue;
+        }
+
+        // The runtime may have been removed or have started listening between
+        // the sweep's snapshot and here; `mark_failed` leaves both alone.
+        match registry.mark_failed(&runtime.name).await {
+            Ok(marked) if marked.is_failed() => {
+                warn!(
+                    runtime = %runtime.name,
+                    runtime_id = %runtime.runtime_id,
+                    image = %runtime.image,
+                    elapsed_seconds = runtime.age_seconds(),
+                    startup_timeout_seconds = runtime.startup_timeout,
+                    "Runtime {} on image {} has been running for {}s without listening on port \
+                     {} and is past its {}s startup window; marking it failed. It is most likely \
+                     bound to its container address instead of 0.0.0.0, or was created from a \
+                     source archive that is not a build.",
+                    runtime.name,
+                    runtime.image,
+                    runtime.age_seconds(),
+                    RUNTIME_PORT,
+                    runtime.startup_timeout,
+                );
+                failed.push(runtime.name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    failed
 }
 
-/// A runtime that Docker reports as up, that the executor has marked
-/// initialised, that has never answered on its port, and that has had long
-/// enough to do so.
-fn is_stuck_non_listening(runtime: &Runtime, grace_secs: f64, now: f64) -> bool {
-    runtime.is_running()
-        && runtime.initialised > 0
-        && !runtime.is_listening()
-        && now - runtime.created >= grace_secs
-}
+/// Remove the runtimes the previous sweep gave up on, along with their
+/// containers, so the next request for that runtime ID builds a fresh one.
+///
+/// Returns the number removed.
+pub async fn reap_failed_runtimes(
+    docker: &DockerManager,
+    registry: &RuntimeRegistry,
+    keep_alive_registry: &KeepAliveRegistry,
+) -> usize {
+    let failed: Vec<Runtime> = registry
+        .list()
+        .await
+        .into_iter()
+        .filter(|runtime| runtime.is_failed())
+        .collect();
 
-fn unix_now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
+    let mut reaped = 0;
 
-fn report(runtimes: &[Runtime], watch: &mut NonListeningWatch, grace: Duration, now: f64) {
-    for runtime in watch.newly_stuck(runtimes, grace, now) {
-        let age_secs = (now - runtime.created).max(0.0) as u64;
-        warn!(
-            runtime = %runtime.name,
-            runtime_id = %runtime.runtime_id,
-            image = %runtime.image,
-            age_seconds = age_secs,
-            "Runtime {} has been running and initialised for {}s but has never been observed \
-             listening on port {}; it is most likely bound to its container address instead of \
-             {}. Set {}={} for it, or check its server logs for the address it reported.",
-            runtime.name,
-            age_secs,
-            RUNTIME_PORT,
-            crate::routes::DEFAULT_RUNTIME_BIND_HOSTNAME,
-            crate::routes::RUNTIME_BIND_HOSTNAME_VAR,
-            crate::routes::DEFAULT_RUNTIME_BIND_HOSTNAME,
+    for runtime in failed {
+        info!(
+            "Removing failed runtime {} (never listened on port {})",
+            runtime.name, RUNTIME_PORT
         );
+
+        match docker.remove_container(&runtime.name, true).await {
+            Ok(_) | Err(crate::error::ExecutorError::RuntimeNotFound) => {}
+            Err(e) => {
+                warn!(
+                    "Failed to remove container for failed runtime {}: {}",
+                    runtime.name, e
+                );
+                // Leave the entry in place; the next cycle tries again rather
+                // than losing track of a container that is still there.
+                continue;
+            }
+        }
+
+        if let Some(ref ka_id) = runtime.keep_alive_id {
+            keep_alive_registry.unregister(ka_id, &runtime.name);
+        }
+
+        registry.remove(&runtime.name).await;
+
+        let tmp_folder = crate::platform::temp_dir().join(&runtime.name);
+        if let Err(e) = tokio::fs::remove_dir_all(&tmp_folder).await {
+            debug!(
+                "No temp directory removed for failed runtime {}: {}",
+                runtime.name, e
+            );
+        }
+
+        reaped += 1;
     }
+
+    reaped
 }
 
-/// Run the non-listening watchdog until shutdown.
-pub async fn run_listening_watch(registry: RuntimeRegistry, mut shutdown: watch::Receiver<bool>) {
-    debug!(
-        "Starting non-listening watchdog (scan: {}s, grace: {}s)",
-        SCAN_INTERVAL.as_secs(),
-        LISTENING_GRACE.as_secs()
-    );
+/// Run the listening watchdog until shutdown.
+pub async fn run_listening_watch(
+    handles: ListeningWatchHandles,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let ListeningWatchHandles {
+        docker,
+        registry,
+        keep_alive_registry,
+        runtime_concurrency,
+    } = handles;
 
-    let mut watch = NonListeningWatch::default();
+    debug!(
+        "Starting listening watchdog (scan interval: {}s)",
+        SCAN_INTERVAL.as_secs()
+    );
 
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    debug!("Non-listening watchdog shutting down");
+                    debug!("Listening watchdog shutting down");
                     break;
                 }
             }
             _ = tokio::time::sleep(SCAN_INTERVAL) => {
-                let runtimes = registry.list().await;
-                report(&runtimes, &mut watch, LISTENING_GRACE, unix_now());
+                // Reap before sweeping, so a runtime marked failed on the last
+                // cycle is visible as failed for one full cycle before it goes.
+                reap_failed_runtimes(&docker, &registry, &keep_alive_registry).await;
+                sweep_listening_state(&registry).await;
+
+                let live: HashSet<String> = registry
+                    .list()
+                    .await
+                    .into_iter()
+                    .map(|runtime| runtime.name)
+                    .collect();
+                runtime_concurrency.retain_known(&live);
             }
         }
     }
 
-    debug!("Non-listening watchdog stopped");
+    debug!("Listening watchdog stopped");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn runtime_at(name: &str, created: f64) -> Runtime {
+    fn running(name: &str, age_secs: f64, startup_timeout: u64) -> Runtime {
         let mut runtime = Runtime::new(name, "executor-a", "node:v5", "v5", None);
-        runtime.created = created;
-        runtime.updated = created;
-        runtime
-    }
-
-    fn stuck_runtime(name: &str, created: f64) -> Runtime {
-        let mut runtime = runtime_at(name, created);
+        runtime.startup_timeout = startup_timeout;
         runtime.mark_running("running");
-        runtime.created = created;
+        runtime.created -= age_secs;
         runtime
     }
 
     #[test]
-    fn reports_a_runtime_that_never_listened_once_past_the_grace_period() {
-        let now = 10_000.0;
-        let runtimes = vec![stuck_runtime("rt-stuck", now - 300.0)];
-        let mut watch = NonListeningWatch::default();
-
-        let stuck = watch.newly_stuck(&runtimes, Duration::from_secs(120), now);
-
-        assert_eq!(stuck.len(), 1);
-        assert_eq!(stuck[0].name, "executor-a-rt-stuck");
+    fn probes_running_runtimes_that_have_not_listened() {
+        assert!(is_probe_candidate(&running("rt-silent", 5.0, 60)));
     }
 
     #[test]
-    fn reports_each_runtime_only_once() {
-        let now = 10_000.0;
-        let runtimes = vec![stuck_runtime("rt-stuck", now - 300.0)];
-        let mut watch = NonListeningWatch::default();
-
-        assert_eq!(
-            watch
-                .newly_stuck(&runtimes, Duration::from_secs(120), now)
-                .len(),
-            1
-        );
-        assert!(watch
-            .newly_stuck(&runtimes, Duration::from_secs(120), now + 30.0)
-            .is_empty());
-    }
-
-    #[test]
-    fn ignores_runtimes_inside_the_grace_period() {
-        let now = 10_000.0;
-        let runtimes = vec![stuck_runtime("rt-young", now - 30.0)];
-        let mut watch = NonListeningWatch::default();
-
-        assert!(watch
-            .newly_stuck(&runtimes, Duration::from_secs(120), now)
-            .is_empty());
-    }
-
-    #[test]
-    fn ignores_listening_pending_and_stopped_runtimes() {
-        let now = 10_000.0;
-
-        let mut listening = stuck_runtime("rt-listening", now - 300.0);
+    fn does_not_probe_listening_pending_or_stopped_runtimes() {
+        let mut listening = running("rt-listening", 300.0, 60);
         listening.set_listening();
-        listening.created = now - 300.0;
 
-        let pending = runtime_at("rt-pending", now - 300.0);
+        let pending = Runtime::new("rt-pending", "executor-a", "node:v5", "v5", None);
 
-        let mut exited = stuck_runtime("rt-exited", now - 300.0);
+        let mut exited = running("rt-exited", 300.0, 60);
         exited.status = "exited".to_string();
 
-        let runtimes = vec![listening, pending, exited];
-        let mut watch = NonListeningWatch::default();
+        let mut failed = running("rt-failed", 300.0, 60);
+        failed.mark_failed();
 
-        assert!(watch
-            .newly_stuck(&runtimes, Duration::from_secs(120), now)
-            .is_empty());
+        for runtime in [listening, pending, exited, failed] {
+            assert!(!is_probe_candidate(&runtime), "{}", runtime.name);
+        }
     }
 
-    #[test]
-    fn forgets_runtimes_that_leave_the_registry() {
-        let now = 10_000.0;
-        let runtimes = vec![stuck_runtime("rt-stuck", now - 300.0)];
-        let mut watch = NonListeningWatch::default();
+    #[tokio::test(start_paused = true)]
+    async fn marks_a_runtime_that_never_listened_as_failed() {
+        let registry = RuntimeRegistry::new();
+        let runtime = running("rt-silent", 300.0, 60);
+        let name = runtime.name.clone();
+        registry.insert(runtime).await.unwrap();
 
-        assert_eq!(
-            watch
-                .newly_stuck(&runtimes, Duration::from_secs(120), now)
-                .len(),
-            1
-        );
-        assert!(watch
-            .newly_stuck(&[], Duration::from_secs(120), now + 10.0)
-            .is_empty());
-        // Same name recreated later: reported again rather than suppressed forever.
-        assert_eq!(
-            watch
-                .newly_stuck(&runtimes, Duration::from_secs(120), now + 20.0)
-                .len(),
-            1
-        );
+        let failed = sweep_listening_state(&registry).await;
+
+        assert_eq!(failed, vec![name.clone()]);
+
+        let after = registry.get(&name).await.unwrap();
+        assert!(after.is_failed());
+        assert_eq!(after.initialised, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaves_a_runtime_inside_its_startup_window_alone() {
+        let registry = RuntimeRegistry::new();
+        let runtime = running("rt-young", 5.0, 60);
+        let name = runtime.name.clone();
+        registry.insert(runtime).await.unwrap();
+
+        assert!(sweep_listening_state(&registry).await.is_empty());
+
+        let after = registry.get(&name).await.unwrap();
+        assert!(after.is_running());
+        assert_eq!(after.initialised, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn honours_a_longer_per_runtime_startup_window() {
+        let registry = RuntimeRegistry::new();
+        // Well past the default window, still inside its own.
+        let runtime = running("rt-slow-builder", 120.0, 600);
+        let name = runtime.name.clone();
+        registry.insert(runtime).await.unwrap();
+
+        assert!(sweep_listening_state(&registry).await.is_empty());
+        assert!(!registry.get(&name).await.unwrap().is_failed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_is_only_reported_once() {
+        let registry = RuntimeRegistry::new();
+        registry
+            .insert(running("rt-silent", 300.0, 60))
+            .await
+            .unwrap();
+
+        assert_eq!(sweep_listening_state(&registry).await.len(), 1);
+        // Now failed, so no longer a probe candidate.
+        assert!(sweep_listening_state(&registry).await.is_empty());
     }
 }
