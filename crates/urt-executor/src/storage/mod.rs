@@ -26,6 +26,7 @@ pub use file_cache::StorageFileCache;
 pub use local::LocalStorage;
 pub use s3::S3Storage;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Metric label for source-archive downloads.
 const SOURCE_DOWNLOAD_OPERATION: &str = "runtime_source_download";
@@ -136,19 +137,37 @@ pub async fn download_verified_archive(
 /// Parse a storage DSN and create the appropriate storage backend (legacy)
 #[allow(dead_code)]
 pub fn from_dsn(dsn: &str) -> Result<Box<dyn Storage>> {
+    from_dsn_with_cache(dsn, None)
+}
+
+/// Parse a storage DSN and create the appropriate storage backend, backed by a
+/// local file cache when the backend is remote.
+pub fn from_dsn_with_cache(
+    dsn: &str,
+    file_cache: Option<Arc<StorageFileCache>>,
+) -> Result<Box<dyn Storage>> {
     if dsn.starts_with("s3://") {
-        Ok(Box::new(S3Storage::from_dsn(dsn)?))
-    } else if dsn.starts_with("local://") {
-        Ok(Box::new(LocalStorage::new()))
+        Ok(Box::new(S3Storage::from_dsn_with_cache(dsn, file_cache)?))
     } else {
-        // Default to local
+        // Local storage reads from the same host filesystem the cache lives on,
+        // so caching it would only duplicate every artefact.
         Ok(Box::new(LocalStorage::new()))
     }
 }
 
 /// Create storage backend from StorageConfig (executor-main compatible)
 /// Uses STORAGE_DEVICE and individual provider env vars
+#[allow(dead_code)]
 pub fn from_config(config: &StorageConfig) -> Result<Box<dyn Storage>> {
+    from_config_with_cache(config, None)
+}
+
+/// Create storage backend from StorageConfig, backed by a local file cache when
+/// the backend is remote.
+pub fn from_config_with_cache(
+    config: &StorageConfig,
+    file_cache: Option<Arc<StorageFileCache>>,
+) -> Result<Box<dyn Storage>> {
     match config.device {
         StorageDevice::Local => Ok(Box::new(LocalStorage::new())),
         StorageDevice::S3 => {
@@ -158,7 +177,7 @@ pub fn from_config(config: &StorageConfig) -> Result<Box<dyn Storage>> {
                 .ok_or_else(|| crate::error::ExecutorError::Storage(
                     "S3 storage selected but STORAGE_S3_ACCESS_KEY and STORAGE_S3_SECRET not configured".to_string()
                 ))?;
-            Ok(Box::new(S3Storage::new_s3(cfg)?))
+            Ok(Box::new(S3Storage::new_s3_with_cache(cfg, file_cache)?))
         }
         StorageDevice::DoSpaces => {
             let cfg = config
@@ -167,7 +186,7 @@ pub fn from_config(config: &StorageConfig) -> Result<Box<dyn Storage>> {
                 .ok_or_else(|| crate::error::ExecutorError::Storage(
                     "DO Spaces storage selected but STORAGE_DO_SPACES_ACCESS_KEY and STORAGE_DO_SPACES_SECRET not configured".to_string()
                 ))?;
-            Ok(Box::new(S3Storage::new_do_spaces(cfg)?))
+            Ok(Box::new(S3Storage::new_do_spaces(cfg, file_cache)?))
         }
         StorageDevice::Backblaze => {
             let cfg = config
@@ -176,7 +195,7 @@ pub fn from_config(config: &StorageConfig) -> Result<Box<dyn Storage>> {
                 .ok_or_else(|| crate::error::ExecutorError::Storage(
                     "Backblaze storage selected but STORAGE_BACKBLAZE_ACCESS_KEY and STORAGE_BACKBLAZE_SECRET not configured".to_string()
                 ))?;
-            Ok(Box::new(S3Storage::new_backblaze(cfg)?))
+            Ok(Box::new(S3Storage::new_backblaze(cfg, file_cache)?))
         }
         StorageDevice::Linode => {
             let cfg = config
@@ -185,7 +204,7 @@ pub fn from_config(config: &StorageConfig) -> Result<Box<dyn Storage>> {
                 .ok_or_else(|| crate::error::ExecutorError::Storage(
                     "Linode storage selected but STORAGE_LINODE_ACCESS_KEY and STORAGE_LINODE_SECRET not configured".to_string()
                 ))?;
-            Ok(Box::new(S3Storage::new_linode(cfg)?))
+            Ok(Box::new(S3Storage::new_linode(cfg, file_cache)?))
         }
         StorageDevice::Wasabi => {
             let cfg = config
@@ -194,7 +213,7 @@ pub fn from_config(config: &StorageConfig) -> Result<Box<dyn Storage>> {
                 .ok_or_else(|| crate::error::ExecutorError::Storage(
                     "Wasabi storage selected but STORAGE_WASABI_ACCESS_KEY and STORAGE_WASABI_SECRET not configured".to_string()
                 ))?;
-            Ok(Box::new(S3Storage::new_wasabi(cfg)?))
+            Ok(Box::new(S3Storage::new_wasabi(cfg, file_cache)?))
         }
     }
 }

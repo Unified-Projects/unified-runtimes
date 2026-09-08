@@ -3,7 +3,7 @@
 use super::executions::VariablesInput;
 use super::logs::{parse_build_logs, LogEntry};
 use super::AppState;
-use crate::docker::container::ContainerConfig;
+use crate::docker::container::{belongs_to_executor, ContainerConfig};
 use crate::error::{ExecutorError, Result};
 use crate::platform;
 use crate::resilience::{is_transient_error, retry_with_backoff};
@@ -820,7 +820,9 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
     // the cleanup target matches what was created.
     let tmp_base_raw = platform::temp_dir();
     let canonical_tmp_base = match tokio::fs::canonicalize(&tmp_base_raw).await {
-        Ok(base) => base,
+        // On Windows the canonical form carries the verbatim `\\?\` prefix,
+        // which the Docker daemon will not accept as a bind-mount source.
+        Ok(base) => platform::strip_verbatim_prefix(base),
         Err(e) => {
             error!("Failed to canonicalize temp base path: {}", e);
             abandon_pending_create(&state, &full_name, &tmp_base_raw, readiness_guard, false).await;
@@ -1380,7 +1382,17 @@ pub async fn delete_runtime(
 
     if let Ok(containers) = state.docker.list_containers(Some(&label)).await {
         for container in containers {
-            // Uses your existing remove_container implementation
+            // The runtime ID is unique per executor, not per daemon: two
+            // executors sharing a daemon both answer to the same ID and would
+            // otherwise delete each other's runtime.
+            if !belongs_to_executor(&container, &state.config.hostname) {
+                debug!(
+                    "Skipping container {} during delete of {}: it belongs to another executor",
+                    container.name, full_name
+                );
+                continue;
+            }
+
             let _ = state.docker.remove_container(&container.name, true).await;
         }
     }

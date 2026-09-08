@@ -353,6 +353,11 @@ pub struct ExecutorConfig {
     /// that has no build behind it.  Entries whose create is still in flight are
     /// never reaped, whatever their age.  Defaults to 300 seconds.
     pub pending_max_age_secs: u64,
+
+    /// How long, in milliseconds, a failed adoption attempt is remembered so
+    /// that repeated requests for an unknown runtime ID do not each cost a
+    /// Docker inspect.  Zero disables the cache.  Defaults to 2000 ms.
+    pub adoption_negative_cache_ms: u64,
 }
 
 impl ExecutorConfig {
@@ -487,6 +492,11 @@ impl ExecutorConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300)
                 .max(1),
+
+            // How long a failed adoption attempt suppresses the next inspect
+            adoption_negative_cache_ms: env_urt_or_opr("ADOPTION_NEGATIVE_CACHE_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000),
         }
     }
 

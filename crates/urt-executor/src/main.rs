@@ -29,7 +29,7 @@ use docker::DockerManager;
 use execution_counter::active_executions;
 use platform::temp_dir;
 use routes::{create_router, AppState};
-use runtime::{CreateTracker, KeepAliveRegistry, RuntimeRegistry};
+use runtime::{AdoptionNegativeCache, CreateTracker, KeepAliveRegistry, RuntimeRegistry};
 use storage::{Storage, StorageFileCache};
 
 /// Main entry point with optimized Tokio runtime configuration
@@ -119,16 +119,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect executor container to configured runtime networks (best-effort)
     // This mirrors executor-main behavior and ensures DNS/port checks work.
-    if let Some(executor_container) = docker
-        .resolve_container_name_by_hostname(&config.hostname)
-        .await
-    {
+    if let Some(executor_container) = docker.resolve_own_container().await {
         docker
-            .connect_container_to_networks(&executor_container)
+            .connect_container_to_networks(&executor_container.name)
             .await;
     } else {
         debug!(
-            "Could not resolve executor container by hostname '{}'; skipping startup network attach",
+            "Could not resolve the executor's own container (hostname '{}'); skipping startup network attach",
             config.hostname
         );
     }
@@ -166,6 +163,28 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .expect("Failed to create HTTP client");
 
+    // Initialize file cache for faster cold starts (30 day TTL, 1GB max size).
+    // Only a download that passed the status and archive-format checks is ever
+    // cached, so a failed fetch cannot be served from here later.
+    let file_cache = Arc::new(StorageFileCache::new(None, None, None));
+    let storage_cache = match file_cache.initialize().await {
+        Ok(()) => {
+            info!(
+                "Storage file cache initialized at {}",
+                file_cache.cache_dir.display()
+            );
+            Some(file_cache.clone())
+        }
+        Err(e) => {
+            warn!(
+                "Failed to initialize file cache at {}, cold starts will always hit storage: {}",
+                file_cache.cache_dir.display(),
+                e
+            );
+            None
+        }
+    };
+
     // Create storage backend. For drop-in compatibility, support legacy
     // OPR_EXECUTOR_CONNECTION_STORAGE DSN when STORAGE_DEVICE is not explicitly set.
     let storage: Arc<dyn Storage> = {
@@ -185,29 +204,24 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 let scheme = dsn.split("://").next().unwrap_or("unknown");
                 info!("Storage backend initialized from DSN: {}", scheme);
                 Arc::from(
-                    storage::from_dsn(&dsn).expect("Failed to create storage from connection DSN"),
+                    storage::from_dsn_with_cache(&dsn, storage_cache)
+                        .expect("Failed to create storage from connection DSN"),
                 )
             } else {
                 info!("Storage backend initialized: {:?}", config.storage.device);
-                Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"))
+                Arc::from(
+                    storage::from_config_with_cache(&config.storage, storage_cache)
+                        .expect("Failed to create storage"),
+                )
             }
         } else {
             info!("Storage backend initialized: {:?}", config.storage.device);
-            Arc::from(storage::from_config(&config.storage).expect("Failed to create storage"))
+            Arc::from(
+                storage::from_config_with_cache(&config.storage, storage_cache)
+                    .expect("Failed to create storage"),
+            )
         }
     };
-
-    // Initialize file cache for faster cold starts (30 day TTL, 1GB max size)
-    let file_cache = Arc::new(StorageFileCache::new(None, None, None));
-    file_cache
-        .initialize()
-        .await
-        .inspect_err(|e| warn!("Failed to initialize file cache: {}", e))
-        .ok();
-    info!(
-        "Storage file cache initialized at {}",
-        file_cache.cache_dir.display()
-    );
 
     // Autoscale mode applies adaptive concurrency limits to smooth queueing under burst traffic.
     let (execution_limiter, execution_limiter_capacity): (Option<Arc<Semaphore>>, Option<usize>) =
@@ -308,6 +322,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_create_limiter_capacity,
         readiness,
         create_tracker,
+        adoption_negative_cache: AdoptionNegativeCache::new(Duration::from_millis(
+            config.adoption_negative_cache_ms,
+        )),
     };
 
     // Create router

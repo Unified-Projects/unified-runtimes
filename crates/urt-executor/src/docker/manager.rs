@@ -3,9 +3,10 @@
 #![allow(deprecated)]
 
 use super::build::{build_image, BuildRequest, BuildResult};
-use super::container::{ContainerConfig, ContainerInfo};
+use super::container::{belongs_to_executor, ContainerConfig, ContainerInfo};
 use super::exec::{exec_bash, exec_shell, ExecResult};
 use super::network::{connect_container, ensure_network};
+use super::self_container;
 use super::stats::{get_container_stats, get_host_stats, ContainerStats, HostStats, StatsCache};
 use crate::config::ExecutorConfig;
 use crate::error::{ExecutorError, Result};
@@ -17,14 +18,12 @@ use bollard::query_parameters::{
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::Docker;
-use bollard::API_DEFAULT_VERSION;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tracing::warn;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 fn is_missing_image_error(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
@@ -42,6 +41,29 @@ fn map_create_container_error(message: String) -> ExecutorError {
     }
 
     ExecutorError::Docker(message)
+}
+
+/// Project a Docker list entry onto the executor's container view.
+///
+/// The list endpoint carries no environment or hostname; both stay empty until
+/// something inspects the container.
+fn container_info(summary: bollard::models::ContainerSummary) -> ContainerInfo {
+    ContainerInfo {
+        id: summary.id.unwrap_or_default(),
+        name: summary
+            .names
+            .and_then(|names| names.first().cloned())
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .to_string(),
+        image: summary.image.unwrap_or_default(),
+        state: summary.state.map(|s| s.to_string()).unwrap_or_default(),
+        status: summary.status.unwrap_or_default(),
+        created: summary.created.unwrap_or(0),
+        labels: summary.labels.unwrap_or_default(),
+        env: HashMap::new(),
+        hostname: String::new(),
+    }
 }
 
 /// Parse Docker environment format (`KEY=VALUE`) into a map.
@@ -77,12 +99,14 @@ impl DockerManager {
         self.docker.create_container(Some(options), config).await
     }
 
-    /// Stop and remove all containers managed by URT
+    /// Stop and remove the runtime containers this executor owns.
+    ///
+    /// Scoped to `urt.executor_hostname`: several executors can share a Docker
+    /// daemon, and a shutdown that removed every `urt.managed` container would
+    /// take the others' runtimes down with it.
     #[allow(dead_code)]
     pub async fn cleanup_managed_containers(&self) -> Vec<String> {
-        use tracing::{info, warn};
-
-        let containers = match self.list_containers(Some("urt.managed=true")).await {
+        let mut containers = match self.list_containers(Some("urt.managed=true")).await {
             Ok(c) => c,
             Err(e) => {
                 warn!("Failed to list managed containers during shutdown: {}", e);
@@ -90,22 +114,26 @@ impl DockerManager {
             }
         };
 
-        let mut containers = containers;
         containers.sort_by_key(|c| c.created);
+
+        // Resolved once, outside the loop, so the sweep cannot remove the
+        // executor itself if its container also carries the managed label.
+        let own_container = self.resolve_own_container().await;
         let mut cleaned_names = Vec::with_capacity(containers.len());
 
-        // Get executor container ID ONCE
-        let self_id = self
-            .docker
-            .info()
-            .await
-            .ok()
-            .and_then(|i| i.id)
-            .unwrap_or_default();
-
         for container in containers {
-            // Skip executor container by ID
-            if container.id == self_id {
+            if !belongs_to_executor(&container, &self.config.hostname) {
+                debug!(
+                    "Skipping managed container {} during shutdown: it belongs to another executor",
+                    container.name
+                );
+                continue;
+            }
+
+            if own_container
+                .as_ref()
+                .is_some_and(|own| own.id == container.id || own.name == container.name)
+            {
                 info!("Skipping executor container {}", container.name);
                 continue;
             }
@@ -152,8 +180,23 @@ impl DockerManager {
         Ok(())
     }
 
-    /// Resolve a container name by hostname (best-effort)
-    pub async fn resolve_container_name_by_hostname(&self, hostname: &str) -> Option<String> {
+    /// Resolve the container the executor is itself running in (best-effort).
+    ///
+    /// Prefers the container ID published by the kernel, which is exact. The
+    /// hostname name filter is only a fallback because it matches substrings:
+    /// an executor called `exc1` matches every `exc1-<runtime id>` it created.
+    pub async fn resolve_own_container(&self) -> Option<ContainerInfo> {
+        if let Some(id) = self_container::own_container_id().await {
+            match self.inspect_container(&id).await {
+                Ok(info) => return Some(info),
+                Err(e) => debug!(
+                    "Own container ID {} came from /proc but Docker does not know it: {}",
+                    id, e
+                ),
+            }
+        }
+
+        let hostname = &self.config.hostname;
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![hostname.to_string()]);
 
@@ -164,18 +207,9 @@ impl DockerManager {
         };
 
         let containers = self.docker.list_containers(Some(options)).await.ok()?;
-        let name = containers
-            .into_iter()
-            .find_map(|c| c.names.and_then(|n| n.first().cloned()))
-            .unwrap_or_default()
-            .trim_start_matches('/')
-            .to_string();
+        let candidates: Vec<ContainerInfo> = containers.into_iter().map(container_info).collect();
 
-        if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        }
+        self_container::select_own_container(&candidates, hostname).cloned()
     }
 
     /// Connect a container to all configured networks (best-effort)
@@ -486,25 +520,7 @@ impl DockerManager {
             .await
             .map_err(|e| ExecutorError::Docker(e.to_string()))?;
 
-        Ok(containers
-            .into_iter()
-            .map(|c| ContainerInfo {
-                id: c.id.unwrap_or_default(),
-                name: c
-                    .names
-                    .and_then(|n| n.first().cloned())
-                    .unwrap_or_default()
-                    .trim_start_matches('/')
-                    .to_string(),
-                image: c.image.unwrap_or_default(),
-                state: c.state.map(|s| s.to_string()).unwrap_or_default(),
-                status: c.status.unwrap_or_default(),
-                created: c.created.unwrap_or(0),
-                labels: c.labels.unwrap_or_default(),
-                env: HashMap::new(),
-                hostname: String::new(),
-            })
-            .collect())
+        Ok(containers.into_iter().map(container_info).collect())
     }
 
     /// Execute a shell command in a container (using sh -c)
@@ -561,6 +577,8 @@ impl DockerManager {
 }
 
 fn connect_to_docker() -> Result<Docker> {
+    // Only unix has a second candidate socket to push.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut attempts: Vec<(
         &'static str,
         std::result::Result<Docker, bollard::errors::Error>,
@@ -568,6 +586,8 @@ fn connect_to_docker() -> Result<Docker> {
 
     #[cfg(unix)]
     {
+        use bollard::API_DEFAULT_VERSION;
+
         if let Some(home) = std::env::var_os("HOME") {
             let user_socket = Path::new(&home).join(".docker/run/docker.sock");
             if user_socket.exists() {

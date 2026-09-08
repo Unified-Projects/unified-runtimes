@@ -32,6 +32,19 @@ impl LocalStorage {
         }
     }
 
+    /// Render a path relative to the base directory as a storage key.
+    ///
+    /// Keys are separator-independent: callers, the build cache included, match
+    /// on `/` regardless of what the host filesystem uses, so a Windows host
+    /// must not emit `builds\runtime\manifest.json`.
+    fn storage_key(relative: &Path) -> String {
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     fn full_path(&self, path: &str) -> String {
         if Path::new(path).is_absolute() {
             path.to_string()
@@ -141,7 +154,7 @@ impl Storage for LocalStorage {
                 }
 
                 let relative = path.strip_prefix(&base_path).unwrap_or(&path);
-                entries.push(relative.to_string_lossy().to_string());
+                entries.push(Self::storage_key(relative));
             }
         }
 
@@ -313,6 +326,21 @@ mod tests {
         assert!(files.contains(&"file1.txt".to_string()));
         assert!(files.contains(&"file2.txt".to_string()));
         assert!(files.contains(&"subdir/file3.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_keys_never_use_the_host_separator() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::with_base_path(dir.path().to_str().unwrap());
+
+        storage
+            .write("builds/runtime/hash/manifest.json", b"{}")
+            .await
+            .unwrap();
+
+        let files = storage.list("builds").await.unwrap();
+        assert_eq!(files, vec!["builds/runtime/hash/manifest.json".to_string()]);
+        assert!(files.iter().all(|key| !key.contains('\\')));
     }
 
     #[tokio::test]

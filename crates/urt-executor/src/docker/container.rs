@@ -134,3 +134,68 @@ pub struct ContainerInfo {
     /// Container hostname (internal)
     pub hostname: String,
 }
+
+/// Whether a container belongs to the executor running under `hostname`.
+///
+/// Several executors can share one Docker daemon, so `urt.managed=true` and
+/// `urt.runtime_id` are not on their own enough to decide that a container is
+/// ours to stop or remove. The `urt.executor_hostname` label is authoritative;
+/// the name prefix is the fallback for containers created before that label
+/// existed.
+pub fn belongs_to_executor(container: &ContainerInfo, hostname: &str) -> bool {
+    if let Some(executor_hostname) = container
+        .labels
+        .get("urt.executor_hostname")
+        .filter(|value| !value.is_empty())
+    {
+        return executor_hostname == hostname;
+    }
+
+    container
+        .name
+        .strip_prefix(&format!("{}-", hostname))
+        .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn container(name: &str, labels: &[(&str, &str)]) -> ContainerInfo {
+        ContainerInfo {
+            id: "abc".to_string(),
+            name: name.to_string(),
+            image: "openruntimes/node:v5-22".to_string(),
+            state: "running".to_string(),
+            status: "Up 3 seconds".to_string(),
+            created: 0,
+            labels: labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            env: HashMap::new(),
+            hostname: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_executor_hostname_label_decides_ownership() {
+        let owned = container("exc2-fn-1", &[("urt.executor_hostname", "exc1")]);
+        assert!(belongs_to_executor(&owned, "exc1"));
+        assert!(!belongs_to_executor(&owned, "exc2"));
+    }
+
+    #[test]
+    fn an_unlabelled_container_falls_back_to_its_name_prefix() {
+        let legacy = container("exc1-fn-1", &[]);
+        assert!(belongs_to_executor(&legacy, "exc1"));
+        assert!(!belongs_to_executor(&legacy, "exc2"));
+    }
+
+    #[test]
+    fn a_blank_label_does_not_claim_another_executors_runtime() {
+        let blank = container("exc1-fn-1", &[("urt.executor_hostname", "")]);
+        assert!(belongs_to_executor(&blank, "exc1"));
+        assert!(!belongs_to_executor(&blank, "exc2"));
+    }
+}

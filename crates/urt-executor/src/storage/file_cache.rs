@@ -206,15 +206,7 @@ impl StorageFileCache {
     /// Store data in the cache
     pub async fn put(&self, remote_path: &str, data: &[u8]) -> Result<()> {
         let (cache_file, meta_file) = self.get_cache_path(remote_path);
-
-        // Ensure parent directory exists
-        if let Some(parent) = cache_file.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).await.map_err(|e| {
-                    ExecutorError::Storage(format!("Failed to create cache directory: {}", e))
-                })?;
-            }
-        }
+        self.ensure_entry_dir(&cache_file).await?;
 
         // Write data file
         let mut file = File::create(&cache_file)
@@ -230,19 +222,54 @@ impl StorageFileCache {
             .await
             .map_err(|e| ExecutorError::Storage(format!("Failed to sync cache file: {}", e)))?;
 
-        // Write metadata
+        self.finalize_entry(remote_path, &meta_file, data.len() as u64)
+            .await
+    }
+
+    /// Store a file that is already on disk in the cache.
+    ///
+    /// Lets a streamed download be cached without the artefact being read back
+    /// into memory first.
+    pub async fn put_file(&self, remote_path: &str, source: &Path) -> Result<()> {
+        let (cache_file, meta_file) = self.get_cache_path(remote_path);
+        self.ensure_entry_dir(&cache_file).await?;
+
+        let size = fs::copy(source, &cache_file).await.map_err(|e| {
+            ExecutorError::Storage(format!(
+                "Failed to copy {} into the cache: {}",
+                source.display(),
+                e
+            ))
+        })?;
+
+        self.finalize_entry(remote_path, &meta_file, size).await
+    }
+
+    /// Create the shard directory holding a cache entry.
+    async fn ensure_entry_dir(&self, cache_file: &Path) -> Result<()> {
+        if let Some(parent) = cache_file.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    ExecutorError::Storage(format!("Failed to create cache directory: {}", e))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write the metadata that makes an entry readable, then enforce the size
+    /// bound. Without metadata `exists` treats the entry as expired.
+    async fn finalize_entry(&self, remote_path: &str, meta_file: &Path, size: u64) -> Result<()> {
         let meta = CacheMetadata {
             remote_path: remote_path.to_string(),
             created: SystemTime::now(),
-            size: data.len() as u64,
+            size,
         };
 
-        self.write_metadata(&meta_file, &meta).await?;
+        self.write_metadata(meta_file, &meta).await?;
 
-        // Check cache size and cleanup if necessary
-        self.maybe_cleanup().await?;
-
-        Ok(())
+        self.maybe_cleanup().await
     }
 
     /// Remove a file from the cache

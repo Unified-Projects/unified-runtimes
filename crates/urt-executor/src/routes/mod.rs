@@ -16,7 +16,7 @@ use crate::error::ExecutorError;
 use crate::middleware::{
     auth::auth_middleware, request_context_middleware, security_headers_middleware,
 };
-use crate::runtime::{CreateTracker, KeepAliveRegistry, RuntimeRegistry};
+use crate::runtime::{AdoptionNegativeCache, CreateTracker, KeepAliveRegistry, RuntimeRegistry};
 use crate::storage::Storage;
 use axum::{
     extract::DefaultBodyLimit,
@@ -48,6 +48,9 @@ pub struct AppState {
     /// whole duration of its build, so concurrent creates can join it and
     /// maintenance can tell an orphaned pending entry from a live one.
     pub create_tracker: CreateTracker,
+    /// Container names a recent adoption attempt did not find. Keeps a scan over
+    /// unknown runtime IDs from costing one Docker inspect per request.
+    pub adoption_negative_cache: AdoptionNegativeCache,
 }
 
 impl AppState {
