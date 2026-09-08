@@ -90,6 +90,33 @@ fn uses_modern_runtime_layout(version: &str) -> bool {
     !is_legacy_v2(version)
 }
 
+/// Mount name the source archive is stored under inside the runtime's `/tmp` mount.
+///
+/// Mirrors executor-main 0.29: a source with a known archive extension keeps that
+/// extension so the runtime's lifecycle helper can pick the right decompressor,
+/// and anything else falls back to the gzipped-tar default.
+fn source_mount_file_name(source: &str) -> &'static str {
+    let lowered = source.to_ascii_lowercase();
+    if lowered.ends_with(".tar.gz") {
+        "code.tar.gz"
+    } else if lowered.ends_with(".tgz") {
+        "code.tgz"
+    } else if lowered.ends_with(".tar") {
+        "code.tar"
+    } else if lowered.ends_with(".sqfs") {
+        "code.sqfs"
+    } else if lowered.ends_with(".gz") {
+        "code.gz"
+    } else {
+        "code.tar.gz"
+    }
+}
+
+/// Absolute path the source archive is visible at from inside the container.
+fn source_code_path(source: &str) -> String {
+    format!("/tmp/{}", source_mount_file_name(source))
+}
+
 struct RuntimeEnvVars<'a> {
     version: &'a str,
     entrypoint: &'a str,
@@ -97,6 +124,7 @@ struct RuntimeEnvVars<'a> {
     cpus: f64,
     memory: u64,
     output_directory: &'a str,
+    source: &'a str,
 }
 
 fn apply_runtime_env_vars(
@@ -142,6 +170,14 @@ fn apply_runtime_env_vars(
             "OPEN_RUNTIMES_OUTPUT_DIRECTORY".to_string(),
             config.output_directory.to_string(),
         );
+    }
+
+    // Runtime images from September 2026 onwards read OPEN_RUNTIMES_CODE_PATH to locate
+    // the code archive; without it the lifecycle helper only searches /mnt/code and serve
+    // mode fails with "Code archive not found". A caller-supplied value always wins.
+    if !config.source.is_empty() {
+        env.entry("OPEN_RUNTIMES_CODE_PATH".to_string())
+            .or_insert_with(|| source_code_path(config.source));
     }
 }
 
@@ -602,6 +638,7 @@ pub async fn create_runtime(
             cpus,
             memory,
             output_directory: &req.output_directory,
+            source: &req.source,
         },
     );
 
@@ -717,13 +754,9 @@ pub async fn create_runtime(
     // Copy source file from storage to local tmp (Docker.php lines 439-443)
     // This is required because Docker can only mount local paths
     if !req.source.is_empty() {
-        // Determine source filename based on extension
-        let source_file = if req.source.ends_with(".tar") {
-            "code.tar"
-        } else {
-            "code.tar.gz"
-        };
-        let local_source = src_dir.join(source_file);
+        // Same derivation the OPEN_RUNTIMES_CODE_PATH env var uses, so the mounted
+        // file name and the path handed to the runtime cannot drift.
+        let local_source = src_dir.join(source_mount_file_name(&req.source));
         let local_source_str = local_source.display().to_string();
 
         info!("Downloading source {} to {}", req.source, local_source_str);
@@ -1343,7 +1376,8 @@ async fn cleanup_previous_keep_alive_runtime(
 mod tests {
     use super::{
         apply_runtime_env_vars, is_legacy_v2, is_live_container_state, sanitize_tar_flags,
-        uses_modern_runtime_layout, KeepAliveRegistrationGuard, RuntimeEnvVars,
+        source_mount_file_name, uses_modern_runtime_layout, KeepAliveRegistrationGuard,
+        RuntimeEnvVars,
     };
     use crate::runtime::{KeepAliveRegistry, Runtime};
     use std::collections::HashMap;
@@ -1501,6 +1535,7 @@ mod tests {
                 cpus: 1.0,
                 memory: 512,
                 output_directory: "dist",
+                source: "",
             },
         );
 
@@ -1538,6 +1573,7 @@ mod tests {
                 cpus: 1.0,
                 memory: 512,
                 output_directory: "",
+                source: "",
             },
         );
 
@@ -1549,5 +1585,88 @@ mod tests {
             env.get("INERNAL_EXECUTOR_HOSTNAME"),
             Some(&"executor-a".to_string())
         );
+    }
+
+    fn env_for_source(version: &str, source: &str, env: &mut HashMap<String, String>) {
+        let runtime = Runtime::new("rt-code-path", "executor-a", "img", version, None);
+        apply_runtime_env_vars(
+            env,
+            &runtime,
+            RuntimeEnvVars {
+                version,
+                entrypoint: "index.js",
+                executor_hostname: "executor-a",
+                cpus: 1.0,
+                memory: 512,
+                output_directory: "",
+                source,
+            },
+        );
+    }
+
+    #[test]
+    fn test_code_path_points_at_gzipped_tar_mount_for_modern_runtimes() {
+        let mut env = HashMap::new();
+        env_for_source("v5", "5f2a/code.tar.gz", &mut env);
+
+        assert_eq!(
+            env.get("OPEN_RUNTIMES_CODE_PATH"),
+            Some(&"/tmp/code.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_code_path_keeps_plain_tar_extension() {
+        let mut env = HashMap::new();
+        env_for_source("v5", "5f2a/code.tar", &mut env);
+
+        assert_eq!(
+            env.get("OPEN_RUNTIMES_CODE_PATH"),
+            Some(&"/tmp/code.tar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_code_path_absent_without_source() {
+        let mut env = HashMap::new();
+        env_for_source("v5", "", &mut env);
+
+        assert_eq!(env.get("OPEN_RUNTIMES_CODE_PATH"), None);
+    }
+
+    #[test]
+    fn test_code_path_absent_for_legacy_v2() {
+        let mut env = HashMap::new();
+        env_for_source("v2", "5f2a/code.tar.gz", &mut env);
+
+        assert_eq!(env.get("OPEN_RUNTIMES_CODE_PATH"), None);
+    }
+
+    #[test]
+    fn test_code_path_preserves_caller_supplied_value() {
+        let mut env = HashMap::new();
+        env.insert(
+            "OPEN_RUNTIMES_CODE_PATH".to_string(),
+            "/mnt/code/.extracted".to_string(),
+        );
+        env_for_source("v5", "5f2a/code.tar.gz", &mut env);
+
+        assert_eq!(
+            env.get("OPEN_RUNTIMES_CODE_PATH"),
+            Some(&"/mnt/code/.extracted".to_string())
+        );
+    }
+
+    #[test]
+    fn test_source_mount_file_name_covers_known_archive_extensions() {
+        assert_eq!(source_mount_file_name("a/code.tar.gz"), "code.tar.gz");
+        assert_eq!(source_mount_file_name("a/code.tar"), "code.tar");
+        assert_eq!(source_mount_file_name("a/code.tgz"), "code.tgz");
+        assert_eq!(source_mount_file_name("a/code.sqfs"), "code.sqfs");
+        assert_eq!(source_mount_file_name("a/code.gz"), "code.gz");
+        assert_eq!(source_mount_file_name("a/CODE.TAR"), "code.tar");
+        // Unknown or missing extensions fall back to the gzipped-tar default.
+        assert_eq!(source_mount_file_name("a/code"), "code.tar.gz");
+        assert_eq!(source_mount_file_name("a/code.zip"), "code.tar.gz");
     }
 }
