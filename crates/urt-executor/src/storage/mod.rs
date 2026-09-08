@@ -10,7 +10,7 @@
 //!
 //! Also provides a local file cache for speeding up cold starts.
 
-mod archive;
+pub mod archive;
 mod cache;
 mod file_cache;
 mod local;

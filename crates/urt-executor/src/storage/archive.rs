@@ -47,6 +47,33 @@ impl ArchiveFormat {
         }
     }
 
+    /// Identify the format from the leading bytes of a payload.
+    ///
+    /// Runtime images name every build artefact `code.tar.gz` whatever
+    /// compression produced it, so the name cannot be trusted to say what is
+    /// inside one. Returns [`ArchiveFormat::Unknown`] when nothing matches.
+    pub fn detect(head: &[u8]) -> Self {
+        if head.starts_with(&GZIP_MAGIC) {
+            Self::Gzip
+        } else if head.starts_with(&ZSTD_MAGIC) {
+            Self::Zstd
+        } else if tar_header_is_plausible(head) {
+            Self::Tar
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// The extension an artefact of this format should be stored under.
+    pub fn extension(&self) -> Option<&'static str> {
+        match self {
+            Self::Gzip => Some("tar.gz"),
+            Self::Zstd => Some("tar.zst"),
+            Self::Tar => Some("tar"),
+            Self::Unknown => None,
+        }
+    }
+
     fn describe(&self) -> &'static str {
         match self {
             Self::Gzip => "gzip",
@@ -108,6 +135,28 @@ pub async fn validate_archive_file(source_hint: &str, path: &Path) -> Result<u64
 
     validate_archive_head(source_hint, &head, size)?;
     Ok(size)
+}
+
+/// Identify the format of an artefact on disk from its leading bytes.
+///
+/// Returns [`ArchiveFormat::Unknown`] when the file cannot be read or nothing
+/// matches, so a caller can fall back to what the file name implies.
+pub async fn detect_archive_file(path: &Path) -> ArchiveFormat {
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return ArchiveFormat::Unknown;
+    };
+
+    let mut head = Vec::with_capacity(TAR_BLOCK_SIZE);
+    if file
+        .take(TAR_BLOCK_SIZE as u64)
+        .read_to_end(&mut head)
+        .await
+        .is_err()
+    {
+        return ArchiveFormat::Unknown;
+    }
+
+    ArchiveFormat::detect(&head)
 }
 
 /// Core check, shared by the in-memory and on-disk entry points.

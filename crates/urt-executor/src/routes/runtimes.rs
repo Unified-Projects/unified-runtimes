@@ -682,6 +682,29 @@ fn keep_alive_owner_id(req: &CreateRuntimeRequest) -> Option<String> {
         })
 }
 
+/// Names a runtime image may write its build artefact under, most likely first.
+const BUILD_ARTEFACT_NAMES: [&str; 2] = ["code.tar.gz", "code.tar"];
+
+/// The extension a build artefact should be stored under.
+///
+/// The bytes decide, because the file name does not: images write `code.tar.gz`
+/// for an uncompressed tar as readily as for a gzipped one. Only when the
+/// content is unrecognisable does the local name get a say.
+fn build_artefact_extension(
+    detected: crate::storage::archive::ArchiveFormat,
+    local_name: &str,
+) -> &'static str {
+    if let Some(extension) = detected.extension() {
+        return extension;
+    }
+
+    if local_name.to_ascii_lowercase().ends_with(".tar") {
+        "tar"
+    } else {
+        "tar.gz"
+    }
+}
+
 /// Watch a freshly created runtime until it starts listening, then record it.
 ///
 /// `initialised` is only ever set by an observed listener, so without this a
@@ -928,10 +951,6 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
 
     // Build environment variables (convert any JSON values to strings)
     let mut env = req.variables.to_map();
-    let build_compression_none = env
-        .get("OPEN_RUNTIMES_BUILD_COMPRESSION")
-        .map(|v| v.eq_ignore_ascii_case("none"))
-        .unwrap_or(false);
 
     apply_runtime_env_vars(
         &mut env,
@@ -1347,13 +1366,18 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
     let mut result_size: Option<u64> = None;
 
     if !req.destination.is_empty() {
-        // Determine build file path (matches executor-main OPEN_RUNTIMES_BUILD_COMPRESSION)
-        let build_file = if build_compression_none {
-            "code.tar"
-        } else {
-            "code.tar.gz"
+        // Runtime images and executor-main write the build to `code.tar.gz`
+        // whatever `OPEN_RUNTIMES_BUILD_COMPRESSION` is set to, and read it back
+        // by sniffing its magic bytes rather than trusting the name. Prefer that
+        // name and keep `code.tar` as a fallback for images that write it.
+        let local_build = match BUILD_ARTEFACT_NAMES
+            .iter()
+            .map(|name| builds_dir.join(name))
+            .find(|candidate| candidate.is_file())
+        {
+            Some(path) => path,
+            None => builds_dir.join(BUILD_ARTEFACT_NAMES[0]),
         };
-        let local_build = builds_dir.join(build_file);
         let local_build_str = local_build.display().to_string();
 
         // Check if build artifact exists
@@ -1363,21 +1387,21 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
                 result_size = Some(metadata.len());
             }
 
+            // The stored object is named for what the file actually is, so a
+            // caller downloading it later infers the right format from the key.
+            let extension = build_artefact_extension(
+                crate::storage::archive::detect_archive_file(&local_build).await,
+                &local_build_str,
+            );
+
             // Generate unique destination path
             let unique_id = uuid::Uuid::new_v4().to_string();
-            let dest_path = if build_file.ends_with(".tar") {
-                format!(
-                    "{}/{}.tar",
-                    req.destination.trim_end_matches('/'),
-                    unique_id
-                )
-            } else {
-                format!(
-                    "{}/{}.tar.gz",
-                    req.destination.trim_end_matches('/'),
-                    unique_id
-                )
-            };
+            let dest_path = format!(
+                "{}/{}.{}",
+                req.destination.trim_end_matches('/'),
+                unique_id,
+                extension
+            );
 
             // Upload to storage
             info!("Uploading build artifact to {}", dest_path);
@@ -1733,11 +1757,11 @@ async fn cleanup_previous_keep_alive_runtime(
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_create_permit, apply_runtime_env_vars, is_legacy_v2, is_live_container_state,
-        keep_alive_owner_id, release_permit_after_start, sanitize_tar_flags,
-        source_mount_file_name, uses_modern_runtime_layout, CreateKind, CreateRuntimeRequest,
-        KeepAliveRegistrationGuard, RuntimeEnvVars, DEFAULT_RUNTIME_BIND_HOSTNAME,
-        RUNTIME_BIND_HOSTNAME_VAR,
+        acquire_create_permit, apply_runtime_env_vars, build_artefact_extension, is_legacy_v2,
+        is_live_container_state, keep_alive_owner_id, release_permit_after_start,
+        sanitize_tar_flags, source_mount_file_name, uses_modern_runtime_layout, CreateKind,
+        CreateRuntimeRequest, KeepAliveRegistrationGuard, RuntimeEnvVars, BUILD_ARTEFACT_NAMES,
+        DEFAULT_RUNTIME_BIND_HOSTNAME, RUNTIME_BIND_HOSTNAME_VAR,
     };
     use crate::error::ExecutorError;
     use crate::runtime::{KeepAliveRegistry, Runtime, RuntimeLifecycle};
@@ -2234,6 +2258,100 @@ mod tests {
         )
         .unwrap();
         assert_eq!(explicit.restart_policy, "always");
+    }
+
+    #[test]
+    fn a_build_artefact_is_named_for_what_its_bytes_are() {
+        use crate::storage::archive::ArchiveFormat;
+
+        // The upstream images write `code.tar.gz` whatever the compression, so
+        // the content decides the stored extension, not the local name.
+        assert_eq!(
+            build_artefact_extension(ArchiveFormat::Tar, "/tmp/build/code.tar.gz"),
+            "tar"
+        );
+        assert_eq!(
+            build_artefact_extension(ArchiveFormat::Gzip, "/tmp/build/code.tar.gz"),
+            "tar.gz"
+        );
+        assert_eq!(
+            build_artefact_extension(ArchiveFormat::Zstd, "/tmp/build/code.tar.gz"),
+            "tar.zst"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_build_artefact_falls_back_to_its_local_name() {
+        use crate::storage::archive::ArchiveFormat;
+
+        assert_eq!(
+            build_artefact_extension(ArchiveFormat::Unknown, "/tmp/build/code.tar"),
+            "tar"
+        );
+        assert_eq!(
+            build_artefact_extension(ArchiveFormat::Unknown, "/tmp/build/code.tar.gz"),
+            "tar.gz"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gzip_artefact_name_is_preferred_and_tar_is_the_fallback() {
+        use crate::storage::archive::{detect_archive_file, ArchiveFormat};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // Only `code.tar` present: the fallback name is the one that exists.
+        let plain = dir.path().join("code.tar");
+        tokio::fs::write(&plain, tar_block_of("code.txt"))
+            .await
+            .expect("write tar");
+        let found = BUILD_ARTEFACT_NAMES
+            .iter()
+            .map(|name| dir.path().join(name))
+            .find(|candidate| candidate.is_file())
+            .expect("an artefact must be found");
+        assert_eq!(found, plain);
+        assert_eq!(detect_archive_file(&found).await, ArchiveFormat::Tar);
+
+        // With both present, `code.tar.gz` wins even though it holds a plain
+        // tar, and the extension still follows the bytes.
+        let gz = dir.path().join("code.tar.gz");
+        tokio::fs::write(&gz, tar_block_of("code.txt"))
+            .await
+            .expect("write gz-named tar");
+        let found = BUILD_ARTEFACT_NAMES
+            .iter()
+            .map(|name| dir.path().join(name))
+            .find(|candidate| candidate.is_file())
+            .expect("an artefact must be found");
+        assert_eq!(found, gz);
+        assert_eq!(
+            build_artefact_extension(
+                detect_archive_file(&found).await,
+                &found.display().to_string()
+            ),
+            "tar"
+        );
+    }
+
+    /// A single valid tar header block naming `entry`, checksum included.
+    fn tar_block_of(entry: &str) -> Vec<u8> {
+        let mut block = vec![0u8; 512];
+        block[..entry.len()].copy_from_slice(entry.as_bytes());
+        block[100..107].copy_from_slice(b"0000644");
+        block[108..115].copy_from_slice(b"0000000");
+        block[116..123].copy_from_slice(b"0000000");
+        block[124..135].copy_from_slice(b"00000000000");
+        block[136..147].copy_from_slice(b"00000000000");
+        block[156] = b'0';
+        block[257..262].copy_from_slice(b"ustar");
+        block[263..265].copy_from_slice(b"00");
+
+        block[148..156].copy_from_slice(b"        ");
+        let checksum: u32 = block.iter().map(|byte| u32::from(*byte)).sum();
+        let rendered = format!("{:06o}  ", checksum);
+        block[148..156].copy_from_slice(rendered.as_bytes());
+        block
     }
 
     #[test]
