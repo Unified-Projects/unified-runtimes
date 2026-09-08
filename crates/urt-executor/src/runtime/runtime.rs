@@ -44,7 +44,19 @@ pub struct Runtime {
     /// Precomputed Authorization header for runtime requests.
     #[serde(skip)]
     pub authorization_header: String,
+    /// Unix timestamp at which a crash-loop quarantine lifts, when quarantined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_until: Option<f64>,
+    /// Exit code from the most recent container death observed for this runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i64>,
+    /// Number of restarts Docker has performed for the container, as last synced.
+    #[serde(default)]
+    pub restart_count: i64,
 }
+
+/// Registry status used while a runtime is quarantined after a crash loop.
+pub const STATUS_QUARANTINED: &str = "quarantined";
 
 impl Runtime {
     /// Create a new runtime in pending state
@@ -81,9 +93,39 @@ impl Runtime {
             initialised: 0,
             keep_alive_id,
             authorization_header: String::new(),
+            quarantined_until: None,
+            last_exit_code: None,
+            restart_count: 0,
         };
         runtime.refresh_cached_auth();
         runtime
+    }
+
+    /// Record that the container behind this runtime has stopped.
+    ///
+    /// The port probe runs again before the next execution, so a container that
+    /// Docker restarts is re-checked rather than assumed to be listening.
+    pub fn mark_dead(&mut self, status: &str, exit_code: Option<i64>) {
+        self.status = status.to_string();
+        self.listening = 0;
+        if exit_code.is_some() {
+            self.last_exit_code = exit_code;
+        }
+    }
+
+    /// Put the runtime into quarantine until `until` (Unix seconds).
+    pub fn mark_quarantined(&mut self, until: f64, exit_code: Option<i64>) {
+        self.status = STATUS_QUARANTINED.to_string();
+        self.listening = 0;
+        self.quarantined_until = Some(until);
+        if exit_code.is_some() {
+            self.last_exit_code = exit_code;
+        }
+    }
+
+    /// Whether the runtime is currently held in crash-loop quarantine.
+    pub fn is_quarantined(&self) -> bool {
+        self.status == STATUS_QUARANTINED
     }
 
     /// Mark runtime as running with the container status
@@ -148,6 +190,11 @@ impl Runtime {
     /// Mark the runtime as listening on port 3000
     pub fn set_listening(&mut self) {
         self.listening = 1;
+        // A runtime that answered on its port is running, whatever the last
+        // synced Docker state said (a restart leaves "restarting" behind).
+        if !self.is_pending() && !self.is_quarantined() {
+            self.status = "running".to_string();
+        }
         self.touch();
     }
 
@@ -240,5 +287,41 @@ mod tests {
     fn test_runtime_id() {
         let rt = Runtime::new("my-func-123", "executor", "img", "v5", None);
         assert_eq!(rt.runtime_id(), "my-func-123");
+    }
+
+    #[test]
+    fn test_mark_dead_clears_listening_and_keeps_exit_code() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        rt.set_listening();
+
+        rt.mark_dead("exited", Some(134));
+
+        assert!(!rt.is_running());
+        assert!(!rt.is_listening());
+        assert_eq!(rt.last_exit_code, Some(134));
+
+        // A death without a known exit code keeps the last one seen.
+        rt.mark_dead("exited", None);
+        assert_eq!(rt.last_exit_code, Some(134));
+    }
+
+    #[test]
+    fn test_quarantine_status_round_trips_through_json() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_quarantined(1_800_000_000.0, Some(137));
+        assert!(rt.is_quarantined());
+        assert!(!rt.is_running());
+        assert!(!rt.is_pending());
+
+        let json = serde_json::to_value(&rt).unwrap();
+        assert_eq!(json["status"], "quarantined");
+        assert_eq!(json["quarantined_until"].as_f64(), Some(1_800_000_000.0));
+        assert_eq!(json["last_exit_code"], 137);
+
+        let plain = Runtime::new("plain", "exec", "img", "v5", None);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("quarantined_until").is_none());
+        assert!(json.get("last_exit_code").is_none());
     }
 }

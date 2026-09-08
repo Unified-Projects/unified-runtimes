@@ -72,6 +72,52 @@ pub enum ExecutorError {
 
     #[error("Build timed out")]
     BuildTimeout,
+
+    /// The runtime could not be connected to: the dial failed before any byte of
+    /// the execution request left the executor.
+    #[error("Runtime {runtime} is unreachable: {cause}")]
+    RuntimeUnreachable { runtime: String, cause: String },
+
+    /// The connection to the runtime was established but the exchange broke
+    /// afterwards. The runtime may have received the request.
+    #[error("Connection to runtime {runtime} failed: {cause}")]
+    RuntimeConnectionFailed { runtime: String, cause: String },
+
+    /// The runtime crashed repeatedly and executions are refused until the
+    /// quarantine expires.
+    #[error("{0}")]
+    RuntimeQuarantined(QuarantineDetail),
+
+    /// A create was refused because the runtime ID is quarantined.
+    #[error("{0}")]
+    RuntimeCreateQuarantined(QuarantineDetail),
+}
+
+/// Why a runtime is quarantined and when the quarantine lifts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineDetail {
+    pub runtime_id: String,
+    pub deaths: u32,
+    pub last_exit_code: Option<i64>,
+    /// Quarantine expiry as an RFC 3339 timestamp.
+    pub expires_at: String,
+    pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for QuarantineDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Runtime {} is quarantined after {} crashes (last exit code {}); quarantine expires at {} ({}s)",
+            self.runtime_id,
+            self.deaths,
+            self.last_exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.expires_at,
+            self.retry_after_secs
+        )
+    }
 }
 
 impl ExecutorError {
@@ -98,6 +144,10 @@ impl ExecutorError {
             Self::Storage(_) => "general_unknown",
             Self::Network(_) => "general_unknown",
             Self::BuildTimeout => "build_timeout",
+            Self::RuntimeUnreachable { .. } => "runtime_unreachable",
+            Self::RuntimeConnectionFailed { .. } => "runtime_connection_failed",
+            Self::RuntimeQuarantined(_) => "runtime_quarantined",
+            Self::RuntimeCreateQuarantined(_) => "runtime_quarantined",
         }
     }
 
@@ -110,7 +160,7 @@ impl ExecutorError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::ExecutionBadRequest(_) => StatusCode::BAD_REQUEST,
             Self::ExecutionBadJson(_) => StatusCode::BAD_REQUEST,
-            Self::ExecutionTimeout => StatusCode::BAD_REQUEST,
+            Self::ExecutionTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::ExecutionOverloaded => StatusCode::TOO_MANY_REQUESTS,
             Self::RuntimeNotFound => StatusCode::NOT_FOUND,
             Self::RuntimeConflict => StatusCode::CONFLICT,
@@ -124,6 +174,10 @@ impl ExecutorError {
             Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Network(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BuildTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::RuntimeUnreachable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RuntimeConnectionFailed { .. } => StatusCode::BAD_GATEWAY,
+            Self::RuntimeQuarantined(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RuntimeCreateQuarantined(_) => StatusCode::CONFLICT,
         }
     }
 }
@@ -140,12 +194,26 @@ impl IntoResponse for ExecutorError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         crate::telemetry::metrics().inc_error_class("global", self.error_type());
+        let retry_after = match &self {
+            Self::RuntimeQuarantined(detail) | Self::RuntimeCreateQuarantined(detail) => {
+                Some(detail.retry_after_secs)
+            }
+            _ => None,
+        };
         let body = ErrorResponse {
             message: self.to_string(),
             r#type: self.error_type().to_string(),
             code: status.as_u16(),
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -297,7 +365,7 @@ mod tests {
         );
         assert_eq!(
             ExecutorError::ExecutionTimeout.status_code(),
-            StatusCode::BAD_REQUEST
+            StatusCode::GATEWAY_TIMEOUT
         );
         assert_eq!(
             ExecutorError::ExecutionOverloaded.status_code(),

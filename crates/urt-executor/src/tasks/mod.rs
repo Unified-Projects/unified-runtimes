@@ -1,10 +1,12 @@
 //! Background tasks module
 
+pub mod docker_events;
 mod listening_watch;
 mod maintenance;
 mod stats;
 mod warmup;
 
+pub use docker_events::run_docker_events;
 pub use listening_watch::run_listening_watch;
 #[allow(unused_imports)]
 pub use maintenance::{

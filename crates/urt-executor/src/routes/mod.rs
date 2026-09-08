@@ -16,7 +16,7 @@ use crate::error::ExecutorError;
 use crate::middleware::{
     auth::auth_middleware, request_context_middleware, security_headers_middleware,
 };
-use crate::runtime::{CreateTracker, KeepAliveRegistry, RuntimeRegistry};
+use crate::runtime::{CreateTracker, KeepAliveRegistry, RuntimeHealth, RuntimeRegistry};
 use crate::storage::Storage;
 use axum::{
     extract::DefaultBodyLimit,
@@ -48,6 +48,9 @@ pub struct AppState {
     /// whole duration of its build, so concurrent creates can join it and
     /// maintenance can tell an orphaned pending entry from a live one.
     pub create_tracker: CreateTracker,
+    /// Death history, restart backoff, quarantine and unreachable markers per
+    /// runtime, shared with the Docker events task and maintenance.
+    pub health: RuntimeHealth,
 }
 
 impl AppState {

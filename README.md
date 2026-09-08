@@ -97,6 +97,11 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_MAX_BODY_SIZE` | `20MB` | Maximum request body size |
 | `URT_RUNTIMES` | `` | Comma-separated allowlist of runtime images (falls back to `OPR_EXECUTOR_IMAGES`) |
 | `URT_AUTO_RUNTIME` | `true` | Auto-resolve official OpenRuntimes shorthands and command mismatches to the newest verified runtime family, bypassing runtime allowlist pinning for official images |
+| `URT_DOCKER_EVENTS` | `true` | Subscribe to Docker container events so runtime deaths are handled as they happen |
+| `URT_RESTART_BACKOFF_MAX_SECS` | `30` | Cap on the 1s, 2s, 4s ... backoff between executor-initiated recreates of a runtime that keeps dying |
+| `URT_CRASH_LOOP_THRESHOLD` | `3` | Deaths inside the crash-loop window that quarantine a runtime |
+| `URT_CRASH_LOOP_WINDOW_SECS` | `60` | Window over which runtime deaths are counted |
+| `URT_QUARANTINE_SECS` | `300` | How long a crash-looping runtime answers 503 on execute and 409 on create |
 | `URT_CONNECTION_STORAGE` | `local://localhost` | Storage DSN for builds |
 | `URT_CACHE_CLEANUP_ON_SHUTDOWN` | `false` | If true, purge local download cache during shutdown |
 

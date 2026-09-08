@@ -133,4 +133,64 @@ pub struct ContainerInfo {
     pub env: HashMap<String, String>,
     /// Container hostname (internal)
     pub hostname: String,
+    /// Exit code of the last run (None while running or when not reported)
+    pub exit_code: Option<i64>,
+    /// Whether the kernel OOM killer stopped the container
+    pub oom_killed: bool,
+    /// Docker restart policy name (empty on list endpoints)
+    pub restart_policy: String,
+    /// Maximum retries for an `on-failure` policy; 0 means unlimited
+    pub restart_max_retries: i64,
+    /// Number of times Docker has restarted the container
+    pub restart_count: i64,
+}
+
+impl ContainerInfo {
+    /// Whether Docker's own restart policy will bring this container back
+    /// after the exit it currently reports.
+    pub fn docker_will_restart(&self) -> bool {
+        if self.state.eq_ignore_ascii_case("restarting") {
+            return true;
+        }
+        match self.restart_policy.as_str() {
+            "always" | "unless-stopped" => true,
+            "on-failure" => {
+                self.exit_code.unwrap_or(0) != 0
+                    && (self.restart_max_retries <= 0
+                        || self.restart_count < self.restart_max_retries)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parsed form of a `restartPolicy` request value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartPolicySpec {
+    No,
+    Always,
+    UnlessStopped,
+    /// `on-failure` with an optional retry cap; `None` retries without limit.
+    OnFailure(Option<u32>),
+}
+
+impl RestartPolicySpec {
+    /// Parse the Docker CLI spelling: `no`, `always`, `unless-stopped`,
+    /// `on-failure`, `on-failure:<n>`. Anything else is treated as `no`.
+    pub fn parse(value: &str) -> Self {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "always" => Self::Always,
+            "unless-stopped" => Self::UnlessStopped,
+            "on-failure" => Self::OnFailure(None),
+            other => match other.strip_prefix("on-failure:") {
+                Some(count) => match count.trim().parse::<u32>() {
+                    Ok(0) => Self::OnFailure(None),
+                    Ok(n) => Self::OnFailure(Some(n)),
+                    Err(_) => Self::No,
+                },
+                None => Self::No,
+            },
+        }
+    }
 }

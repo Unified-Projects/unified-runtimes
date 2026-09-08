@@ -132,6 +132,11 @@ fn test_config(network: String) -> ExecutorConfig {
         warmup_required: false,
         pending_wait_max_secs: 60,
         pending_max_age_secs: 300,
+        docker_events: false,
+        restart_backoff_max_secs: 30,
+        crash_loop_threshold: 3,
+        crash_loop_window_secs: 60,
+        quarantine_secs: 300,
     }
 }
 
@@ -348,6 +353,7 @@ async fn create_test_server_with(
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
+        health: urt_executor::runtime::RuntimeHealth::default(),
     };
 
     // Bind to random available port
@@ -375,6 +381,7 @@ async fn create_test_server_with(
             keep_alive_registry: state.keep_alive_registry.clone(),
             readiness: state.readiness.clone(),
             create_tracker: state.create_tracker.clone(),
+            health: state.health.clone(),
         };
         let maintenance_config = config.clone();
         let maintenance_storage = storage.clone();
@@ -1481,6 +1488,7 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
+        health: urt_executor::runtime::RuntimeHealth::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")
