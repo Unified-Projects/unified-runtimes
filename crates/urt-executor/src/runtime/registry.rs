@@ -5,6 +5,22 @@ use crate::error::{ExecutorError, Result};
 use dashmap::DashMap;
 use std::sync::Arc;
 
+/// Record an observed container status on a registry entry.
+///
+/// A pending entry belongs to the create that inserted it: the container exists
+/// long before the build behind it is finished, so adopting its status here
+/// would advertise a runtime that is still extracting code or running a build
+/// command. Only the create publishes its own entry. Returns whether the status
+/// was applied.
+fn apply_observed_status(runtime: &mut Runtime, observed_status: String) -> bool {
+    if runtime.is_pending() {
+        return false;
+    }
+
+    runtime.status = observed_status;
+    true
+}
+
 /// Thread-safe registry for managing active runtimes
 /// Uses DashMap for lock-free concurrent reads and fine-grained write locks
 #[derive(Debug, Clone)]
@@ -145,7 +161,7 @@ impl RuntimeRegistry {
             Ok(info) => {
                 // Re-acquire write access only for the mutation; the async work is done.
                 if let Some(mut runtime) = self.runtimes.get_mut(name) {
-                    runtime.status = info.state;
+                    apply_observed_status(&mut runtime, info.state);
                     return Some(runtime.clone());
                 }
                 None
@@ -285,6 +301,30 @@ mod tests {
 
         let updated = registry.get(&name).await.unwrap();
         assert_eq!(updated.updated, original_updated);
+    }
+
+    #[test]
+    fn test_observed_status_leaves_a_pending_entry_alone() {
+        let mut runtime = Runtime::new("test", "exec", "img", "v5", None);
+
+        let applied = apply_observed_status(&mut runtime, "running".to_string());
+
+        assert!(!applied, "a pending entry must not take a container status");
+        assert!(runtime.is_pending());
+        assert_eq!(runtime.status, "pending");
+        assert!(!runtime.is_running());
+    }
+
+    #[test]
+    fn test_observed_status_updates_a_published_entry() {
+        let mut runtime = Runtime::new("test", "exec", "img", "v5", None);
+        runtime.mark_running("running");
+
+        let applied = apply_observed_status(&mut runtime, "exited".to_string());
+
+        assert!(applied);
+        assert_eq!(runtime.status, "exited");
+        assert!(!runtime.is_running());
     }
 
     #[tokio::test]

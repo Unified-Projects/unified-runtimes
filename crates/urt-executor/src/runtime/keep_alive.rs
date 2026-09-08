@@ -85,6 +85,11 @@ impl KeepAliveRegistry {
     }
 
     /// Acquire a per keep-alive ID lock for serialized replacement flow.
+    ///
+    /// Lock entries are never removed. Dropping one while a task holds its guard
+    /// would hand the next caller a fresh mutex, and two tasks would then run
+    /// the replacement flow for the same ID at once. The map is bounded by the
+    /// number of distinct keep-alive IDs the executor has ever seen.
     pub async fn lock(&self, keep_alive_id: &str) -> OwnedMutexGuard<()> {
         let lock = self
             .locks
@@ -104,7 +109,6 @@ impl KeepAliveRegistry {
 
         if removed && !self.owners.contains_key(keep_alive_id) {
             self.generations.remove(keep_alive_id);
-            self.locks.remove(keep_alive_id);
         }
     }
 
@@ -222,6 +226,31 @@ mod tests {
         assert_eq!(gen_1, 1);
         assert_eq!(gen_2, 2);
         assert_eq!(registry.current_generation("svc"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_unregister_keeps_the_lock_a_task_is_holding() {
+        let registry = KeepAliveRegistry::new();
+        registry.register("svc", "runtime-a");
+
+        let held = registry.lock("svc").await;
+        registry.unregister("svc", "runtime-a");
+
+        // Same mutex, so the second caller stays out until the first is done.
+        let contended =
+            tokio::time::timeout(std::time::Duration::from_millis(100), registry.lock("svc")).await;
+        assert!(
+            contended.is_err(),
+            "unregister must not replace a lock another task holds"
+        );
+
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), registry.lock("svc"))
+                .await
+                .is_ok(),
+            "the lock must be available once the holder releases it"
+        );
     }
 
     #[test]

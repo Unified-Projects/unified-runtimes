@@ -38,7 +38,11 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub storage: Arc<dyn Storage>,
     pub execution_limiter: Option<Arc<Semaphore>>,
+    /// Permits for serve-style creates: a container to start and hand traffic to.
     pub runtime_create_limiter: Option<Arc<Semaphore>>,
+    /// Permits for build-style creates, which run a user command inside the
+    /// container and can occupy their permit for minutes.
+    pub runtime_build_limiter: Option<Arc<Semaphore>>,
     pub execution_limiter_capacity: Option<usize>,
     pub runtime_create_limiter_capacity: Option<usize>,
     /// Per-runtime readiness notifiers. Inserted when a runtime enters pending state,

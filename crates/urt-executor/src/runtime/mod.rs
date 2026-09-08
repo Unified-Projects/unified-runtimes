@@ -18,4 +18,5 @@ pub use protocol::{
     V2Protocol, V5Protocol,
 };
 pub use registry::RuntimeRegistry;
-pub use runtime::{wait_for_runtime_port, Runtime};
+#[allow(unused_imports)]
+pub use runtime::{wait_for_runtime_port, Runtime, RuntimeState};

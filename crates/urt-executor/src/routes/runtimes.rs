@@ -20,7 +20,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Request body for creating a runtime
@@ -559,6 +561,97 @@ fn source_download_error(source: &str, error: ExecutorError) -> ExecutorError {
     }
 }
 
+/// Which pool a create draws its concurrency permit from.
+///
+/// The two shapes of create have nothing in common in cost: a build runs a user
+/// command inside the container and can last minutes, while a serve-style create
+/// only has to get a container up. Sharing one pool let a handful of builds hold
+/// every permit and push cold starts into the queue-wait fast-fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateKind {
+    Build,
+    Serve,
+}
+
+impl CreateKind {
+    /// A create is build-style when it runs a command in the container, or when
+    /// it removes the container once it is done (which only a build does).
+    fn for_request(req: &CreateRuntimeRequest) -> Self {
+        if !req.command.trim().is_empty() || req.remove {
+            Self::Build
+        } else {
+            Self::Serve
+        }
+    }
+
+    fn limiter(self, state: &AppState) -> Option<Arc<Semaphore>> {
+        match self {
+            Self::Build => state.runtime_build_limiter.clone(),
+            Self::Serve => state.runtime_create_limiter.clone(),
+        }
+    }
+}
+
+/// Take a permit from `limiter`, giving up after `queue_wait`.
+///
+/// The fast-fail is what keeps a create burst from turning into a queue of
+/// clients all waiting out their own deadlines: past the wait the caller is told
+/// the executor is overloaded and can retry elsewhere.
+async fn acquire_create_permit(
+    limiter: Option<Arc<Semaphore>>,
+    queue_wait: Duration,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let Some(limiter) = limiter else {
+        return Ok(None);
+    };
+
+    let queue_wait_started = std::time::Instant::now();
+    match tokio::time::timeout(queue_wait, limiter.acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            metrics().observe_runtime_create_queue_wait(queue_wait_started.elapsed());
+            Ok(Some(permit))
+        }
+        Ok(Err(_)) => Err(ExecutorError::Unknown),
+        Err(_) => {
+            metrics().observe_runtime_create_queue_wait(queue_wait);
+            Err(ExecutorError::RuntimeOverloaded)
+        }
+    }
+}
+
+/// Give the permit back once the container is running.
+///
+/// A serve-style create spends the rest of its time on readiness polling and
+/// registry bookkeeping, neither of which touches the Docker daemon hard enough
+/// to need a slot. A build holds its permit until the build command returns.
+fn release_permit_after_start(kind: CreateKind, permit: &mut Option<OwnedSemaphorePermit>) {
+    if kind == CreateKind::Serve {
+        permit.take();
+    }
+}
+
+/// The keep-alive ID this create takes ownership of, if any.
+///
+/// A create with `remove = true` produces a build artefact and then deletes its
+/// container. Taking the ID would revoke cleanup protection from the runtime
+/// currently serving it, for the whole length of the build.
+fn keep_alive_owner_id(req: &CreateRuntimeRequest) -> Option<String> {
+    if req.remove {
+        return None;
+    }
+
+    req.keep_alive_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            req.variables
+                .to_map()
+                .get("URT_KEEP_ALIVE")
+                .cloned()
+                .filter(|s| !s.is_empty())
+        })
+}
+
 /// Everything a build needs once the request has been validated.
 ///
 /// Collected into one owned value so the build can be handed to a detached task
@@ -570,9 +663,10 @@ struct RuntimeBuild {
     full_name: String,
     start_time: std::time::Instant,
     start_timestamp: f64,
-    /// Held for the life of the build, so the create concurrency limit bounds
-    /// builds actually running rather than clients still connected.
-    create_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    create_kind: CreateKind,
+    /// Held while the create needs its slot, so the concurrency limits bound
+    /// work actually running rather than clients still connected.
+    create_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// POST /v1/runtimes - Create a new runtime
@@ -585,31 +679,28 @@ pub async fn create_runtime(
     let start_time = std::time::Instant::now();
     let start_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
 
-    let queue_wait_started = std::time::Instant::now();
-    let runtime_create_permit = match &state.runtime_create_limiter {
-        Some(limiter) => {
-            let queue_wait_timeout =
-                Duration::from_millis(state.config.runtime_create_queue_wait_ms);
-            match tokio::time::timeout(queue_wait_timeout, limiter.clone().acquire_owned()).await {
-                Ok(Ok(permit)) => {
-                    metrics().observe_runtime_create_queue_wait(queue_wait_started.elapsed());
-                    Some(permit)
-                }
-                Ok(Err(_)) => return Err(ExecutorError::Unknown),
-                Err(_) => {
-                    metrics().observe_runtime_create_queue_wait(queue_wait_timeout);
-                    metrics().inc_error_class("create_runtime", "overload");
-                    operation_timer.mark_overload();
-                    return Err(ExecutorError::RuntimeOverloaded);
-                }
-            }
-        }
-        None => None,
-    };
-
-    // Parse JSON body manually for backwards compatibility (no Content-Type requirement)
+    // Parse JSON body manually for backwards compatibility (no Content-Type requirement).
+    // Parsed before the permit is taken because the request decides which pool
+    // the create draws from.
     let req: CreateRuntimeRequest = serde_json::from_str(&body)
         .map_err(|e| ExecutorError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    let create_kind = CreateKind::for_request(&req);
+    let runtime_create_permit = match acquire_create_permit(
+        create_kind.limiter(&state),
+        Duration::from_millis(state.config.runtime_create_queue_wait_ms),
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(ExecutorError::RuntimeOverloaded) => {
+            metrics().inc_error_class("create_runtime", "overload");
+            operation_timer.mark_overload();
+            return Err(ExecutorError::RuntimeOverloaded);
+        }
+        Err(error) => return Err(error),
+    };
+
     let resolved_image = state.config.resolve_runtime_image(
         &req.image,
         &req.entrypoint,
@@ -659,6 +750,7 @@ pub async fn create_runtime(
         full_name: full_name.clone(),
         start_time,
         start_timestamp,
+        create_kind,
         create_permit: runtime_create_permit,
     });
 
@@ -684,12 +776,16 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
         full_name,
         start_time,
         start_timestamp,
-        create_permit: _create_permit,
+        create_kind,
+        mut create_permit,
     } = build;
 
-    if state.registry.exists(&full_name).await {
-        reconcile_existing_runtime_id(&state, &req.runtime_id, &full_name).await?;
-    }
+    // Settles whatever Docker and the registry hold for this name, registry
+    // entry or not. A create that failed after Docker had created the container
+    // leaves the name taken with nothing in the registry to show for it, and
+    // skipping the check in that case is what turns the leftover container into
+    // a 409 on every retry.
+    reconcile_existing_runtime_id(&state, &req.runtime_id, &full_name).await?;
 
     // Apply minimum resource overrides
     let (cpus, memory) = state.config.apply_min_resources(req.cpus, req.memory);
@@ -698,15 +794,10 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
         req.cpus, req.memory, cpus, memory
     );
 
-    // Determine keep_alive_id: prefer request field, fallback to URT_KEEP_ALIVE env var
-    let keep_alive_id = req.keep_alive_id.clone().or_else(|| {
-        req.variables
-            .to_map()
-            .get("URT_KEEP_ALIVE")
-            .cloned()
-            .filter(|s| !s.is_empty())
-    });
-    let _keep_alive_lock = match keep_alive_id.as_ref() {
+    // Determine keep_alive_id: prefer request field, fallback to URT_KEEP_ALIVE
+    // variable, and never for a build that removes its own container.
+    let keep_alive_id = keep_alive_owner_id(&req);
+    let mut keep_alive_lock = match keep_alive_id.as_ref() {
         Some(ka_id) => Some(state.keep_alive_registry.lock(ka_id).await),
         None => None,
     };
@@ -1082,6 +1173,8 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
         )));
     }
 
+    release_permit_after_start(create_kind, &mut create_permit);
+
     // Note: runtime_entrypoint is now the container CMD (Docker.php line 463)
     // It runs as the main container process, not via exec
 
@@ -1284,17 +1377,33 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
         state.readiness_notify_and_remove(&full_name);
     }
 
-    // If a keep-alive ID was transferred, clean up the previous owner now that
-    // this runtime is successfully running (avoid removing the new runtime).
-    if !req.remove {
-        if let (Some(prev), Some(ka_id)) = (previous_keep_alive_owner, keep_alive_id.as_ref()) {
-            if prev != runtime.name {
-                cleanup_previous_keep_alive_runtime(&state, &prev, ka_id, keep_alive_generation)
-                    .await;
-            }
-        }
+    keep_alive_guard.commit();
 
-        keep_alive_guard.commit();
+    // The new runtime is registered and serving, so removing the previous owner
+    // is bookkeeping. Doing it inline charged the create for a container stop:
+    // a runtime whose PID 1 is `tail -f` or `bash -c` ignores SIGTERM, so Docker
+    // waited out the whole grace period before the SIGKILL. That is paid on the
+    // background task now, under the keep-alive lock this create already holds.
+    if let (Some(prev), Some(ka_id)) = (previous_keep_alive_owner, keep_alive_id.clone()) {
+        if prev != runtime.name {
+            info!(
+                "Keep-alive ID '{}' now served by {}; removing previous owner {} in the background",
+                ka_id, runtime.name, prev
+            );
+
+            let cleanup_state = state.clone();
+            let cleanup_lock = keep_alive_lock.take();
+            tokio::spawn(async move {
+                let _keep_alive_lock = cleanup_lock;
+                cleanup_previous_keep_alive_runtime(
+                    &cleanup_state,
+                    &prev,
+                    &ka_id,
+                    keep_alive_generation,
+                )
+                .await;
+            });
+        }
     }
 
     let duration = start_time.elapsed().as_secs_f64();
@@ -1422,6 +1531,14 @@ pub async fn delete_runtime(
     Ok(StatusCode::OK)
 }
 
+/// Grace given to a replaced keep-alive container before it is killed.
+///
+/// Runtime images run `tail -f /dev/null` or `bash -c ...` as PID 1, neither of
+/// which handles SIGTERM, so a longer grace is time spent waiting for a process
+/// that will never exit on its own. The force-remove that follows kills it
+/// either way; the one second is for an image that does handle the signal.
+const PREVIOUS_OWNER_STOP_GRACE_SECS: i64 = 1;
+
 async fn cleanup_previous_keep_alive_runtime(
     state: &AppState,
     previous_owner: &str,
@@ -1477,7 +1594,11 @@ async fn cleanup_previous_keep_alive_runtime(
         }
     }
 
-    if let Err(e) = state.docker.stop_container(previous_owner, 10).await {
+    if let Err(e) = state
+        .docker
+        .stop_container(previous_owner, PREVIOUS_OWNER_STOP_GRACE_SECS)
+        .await
+    {
         metrics().inc_keep_alive_cleanup("stop_error");
         debug!(
             "Previous keep-alive container {} stop returned non-fatal error: {}",
@@ -1516,12 +1637,183 @@ async fn cleanup_previous_keep_alive_runtime(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_runtime_env_vars, is_legacy_v2, is_live_container_state, sanitize_tar_flags,
-        source_mount_file_name, uses_modern_runtime_layout, KeepAliveRegistrationGuard,
-        RuntimeEnvVars, DEFAULT_RUNTIME_BIND_HOSTNAME, RUNTIME_BIND_HOSTNAME_VAR,
+        acquire_create_permit, apply_runtime_env_vars, is_legacy_v2, is_live_container_state,
+        keep_alive_owner_id, release_permit_after_start, sanitize_tar_flags,
+        source_mount_file_name, uses_modern_runtime_layout, CreateKind, CreateRuntimeRequest,
+        KeepAliveRegistrationGuard, RuntimeEnvVars, DEFAULT_RUNTIME_BIND_HOSTNAME,
+        RUNTIME_BIND_HOSTNAME_VAR,
     };
+    use crate::error::ExecutorError;
     use crate::runtime::{KeepAliveRegistry, Runtime};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    fn create_request(body: serde_json::Value) -> CreateRuntimeRequest {
+        serde_json::from_value(body).expect("test request must parse")
+    }
+
+    fn serve_request() -> CreateRuntimeRequest {
+        create_request(serde_json::json!({
+            "runtimeId": "rt-serve",
+            "image": "openruntimes/node:v5-22",
+        }))
+    }
+
+    fn build_request() -> CreateRuntimeRequest {
+        create_request(serde_json::json!({
+            "runtimeId": "rt-build",
+            "image": "openruntimes/node:v5-22",
+            "command": "npm install",
+            "remove": true,
+        }))
+    }
+
+    #[test]
+    fn test_create_kind_separates_builds_from_serves() {
+        assert_eq!(CreateKind::for_request(&serve_request()), CreateKind::Serve);
+        assert_eq!(CreateKind::for_request(&build_request()), CreateKind::Build);
+
+        // A build that keeps its container is still a build.
+        let long_build = create_request(serde_json::json!({
+            "runtimeId": "rt",
+            "image": "img",
+            "command": "helpers/build.sh",
+        }));
+        assert_eq!(CreateKind::for_request(&long_build), CreateKind::Build);
+
+        // So is a create that only removes its container afterwards.
+        let removing = create_request(serde_json::json!({
+            "runtimeId": "rt",
+            "image": "img",
+            "remove": true,
+        }));
+        assert_eq!(CreateKind::for_request(&removing), CreateKind::Build);
+
+        // Whitespace is not a command.
+        let blank_command = create_request(serde_json::json!({
+            "runtimeId": "rt",
+            "image": "img",
+            "command": "   ",
+        }));
+        assert_eq!(CreateKind::for_request(&blank_command), CreateKind::Serve);
+    }
+
+    #[tokio::test]
+    async fn test_builds_do_not_consume_serve_permits() {
+        let serve_limiter = Arc::new(Semaphore::new(1));
+        let build_limiter = Arc::new(Semaphore::new(1));
+
+        // A build takes the last build permit.
+        let build_permit =
+            acquire_create_permit(Some(Arc::clone(&build_limiter)), Duration::from_millis(50))
+                .await
+                .expect("the build limiter has a permit free");
+        assert!(build_permit.is_some());
+
+        assert_eq!(
+            serve_limiter.available_permits(),
+            1,
+            "a build must not draw on the pool that serves cold starts"
+        );
+
+        // A serve-style create is unaffected by the exhausted build pool.
+        let serve_permit =
+            acquire_create_permit(Some(Arc::clone(&serve_limiter)), Duration::from_millis(50))
+                .await
+                .expect("serve permits are untouched by builds");
+        assert!(serve_permit.is_some());
+
+        // A second build fast-fails rather than queueing behind the first.
+        let queued =
+            acquire_create_permit(Some(Arc::clone(&build_limiter)), Duration::from_millis(20))
+                .await;
+        assert!(matches!(queued, Err(ExecutorError::RuntimeOverloaded)));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_create_permit_without_a_limiter_is_a_no_op() {
+        let permit = acquire_create_permit(None, Duration::from_millis(10))
+            .await
+            .expect("an unlimited executor never fast-fails");
+        assert!(permit.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_serve_permit_is_released_once_the_container_is_running() {
+        let limiter = Arc::new(Semaphore::new(1));
+
+        let mut permit = acquire_create_permit(Some(Arc::clone(&limiter)), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(limiter.available_permits(), 0);
+
+        release_permit_after_start(CreateKind::Serve, &mut permit);
+        assert!(permit.is_none());
+        assert_eq!(
+            limiter.available_permits(),
+            1,
+            "the readiness wait must not hold a create slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_permit_survives_container_start() {
+        let limiter = Arc::new(Semaphore::new(1));
+
+        let mut permit = acquire_create_permit(Some(Arc::clone(&limiter)), Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        release_permit_after_start(CreateKind::Build, &mut permit);
+        assert!(permit.is_some());
+        assert_eq!(
+            limiter.available_permits(),
+            0,
+            "a build holds its permit until the build command returns"
+        );
+    }
+
+    #[test]
+    fn test_build_create_does_not_take_keep_alive_ownership() {
+        let build = create_request(serde_json::json!({
+            "runtimeId": "rt",
+            "image": "img",
+            "command": "npm install",
+            "remove": true,
+            "keepAliveId": "svc-a",
+        }));
+
+        assert_eq!(
+            keep_alive_owner_id(&build),
+            None,
+            "a build tears its container down; the serving runtime keeps the ID"
+        );
+    }
+
+    #[test]
+    fn test_serve_create_takes_keep_alive_ownership() {
+        let from_field = create_request(serde_json::json!({
+            "runtimeId": "rt",
+            "image": "img",
+            "keepAliveId": "svc-a",
+        }));
+        assert_eq!(keep_alive_owner_id(&from_field), Some("svc-a".to_string()));
+
+        let from_variables = create_request(serde_json::json!({
+            "runtimeId": "rt",
+            "image": "img",
+            "variables": { "URT_KEEP_ALIVE": "svc-b" },
+        }));
+        assert_eq!(
+            keep_alive_owner_id(&from_variables),
+            Some("svc-b".to_string())
+        );
+
+        let none = create_request(serde_json::json!({ "runtimeId": "rt", "image": "img" }));
+        assert_eq!(keep_alive_owner_id(&none), None);
+    }
 
     #[test]
     fn test_sanitize_tar_flags_injects_portable_flags() {

@@ -43,6 +43,7 @@ fn test_config() -> ExecutorConfig {
         eager_runtime_readiness: false,
         max_concurrent_executions: None,
         max_concurrent_runtime_creates: None,
+        max_concurrent_builds: None,
         execution_queue_wait_ms: 2_000,
         runtime_create_queue_wait_ms: 5_000,
         max_body_size: 20 * 1024 * 1024,
@@ -79,6 +80,7 @@ async fn create_test_state() -> Option<AppState> {
         storage,
         execution_limiter: None,
         runtime_create_limiter: None,
+        runtime_build_limiter: None,
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -2471,6 +2473,7 @@ mod audit_fixes {
             eager_runtime_readiness: false,
             max_concurrent_executions: None,
             max_concurrent_runtime_creates: None,
+            max_concurrent_builds: None,
             execution_queue_wait_ms: 2_000,
             runtime_create_queue_wait_ms: 5_000,
             max_body_size: 20 * 1024 * 1024,
@@ -2890,6 +2893,7 @@ mod regression_pending_wait {
             eager_runtime_readiness: false,
             max_concurrent_executions: None,
             max_concurrent_runtime_creates: None,
+            max_concurrent_builds: None,
             execution_queue_wait_ms: 2_000,
             runtime_create_queue_wait_ms: 5_000,
             max_body_size: 20 * 1024 * 1024,
@@ -2927,6 +2931,7 @@ mod regression_pending_wait {
             storage,
             execution_limiter: None,
             runtime_create_limiter: None,
+            runtime_build_limiter: None,
             execution_limiter_capacity: None,
             runtime_create_limiter_capacity: None,
             readiness: Arc::new(dashmap::DashMap::new()),
@@ -3795,5 +3800,194 @@ mod cold_start_wedge {
         }
 
         assert_eq!(from_env.pending_max_age_secs, 45);
+    }
+}
+
+mod create_path_hardening {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use urt_executor::docker::container::ContainerConfig;
+    use urt_executor::error::ExecutorError;
+    use urt_executor::runtime::Runtime;
+
+    fn unique_id(prefix: &str) -> String {
+        format!(
+            "{}-{}",
+            prefix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn keep_alive_cmd() -> Vec<String> {
+        vec![
+            "tail".to_string(),
+            "-f".to_string(),
+            "/dev/null".to_string(),
+        ]
+    }
+
+    async fn container_exists(state: &AppState, name: &str) -> bool {
+        !matches!(
+            state.docker.inspect_container(name).await,
+            Err(ExecutorError::RuntimeNotFound)
+        )
+    }
+
+    /// A container that Docker created but that never started must not survive
+    /// the failure: its name would stay taken and every retry would get a 409.
+    #[tokio::test]
+    #[ignore] // Requires Docker and pulls alpine
+    async fn failed_start_removes_the_container_and_the_retry_succeeds() {
+        require_docker!(state);
+        let name = unique_id("test-executor-unstarted");
+
+        let doomed = ContainerConfig::new(&name, "alpine:latest")
+            .with_cmd(keep_alive_cmd())
+            .with_network(&unique_id("urt-network-that-does-not-exist"));
+
+        let result = state.docker.create_container(doomed).await;
+        assert!(
+            result.is_err(),
+            "attaching to a network that does not exist must fail the create"
+        );
+        assert!(
+            !container_exists(&state, &name).await,
+            "the container must be removed, otherwise the name stays taken"
+        );
+
+        let retry = state
+            .docker
+            .create_container(
+                ContainerConfig::new(&name, "alpine:latest").with_cmd(keep_alive_cmd()),
+            )
+            .await;
+        assert!(
+            retry.is_ok(),
+            "the retry must not hit a name conflict, got {:?}",
+            retry.err()
+        );
+
+        state.docker.remove_container(&name, true).await.ok();
+    }
+
+    /// `sync_status` must never publish an entry a create still owns: the
+    /// container exists long before the build behind it has finished.
+    #[tokio::test]
+    #[ignore] // Requires Docker and pulls alpine
+    async fn reading_a_pending_runtime_does_not_publish_it() {
+        require_docker!(state);
+        let runtime_id = unique_id("pending-read");
+        let name = format!("test-executor-{}", runtime_id);
+
+        state
+            .docker
+            .create_container(
+                ContainerConfig::new(&name, "alpine:latest").with_cmd(keep_alive_cmd()),
+            )
+            .await
+            .expect("container must be created");
+
+        state
+            .registry
+            .insert(Runtime::new(
+                &runtime_id,
+                "test-executor",
+                "alpine:latest",
+                "v5",
+                None,
+            ))
+            .await
+            .expect("pending entry must be inserted");
+
+        let app = create_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/runtimes/{}", runtime_id))
+                    .header("Authorization", "Bearer test-secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = parse_json_body(response.into_body()).await;
+        assert_eq!(
+            body["status"], "pending",
+            "a read must not advertise a runtime whose build is still running"
+        );
+
+        let entry = state.registry.get(&name).await.expect("entry must remain");
+        assert!(
+            entry.is_pending(),
+            "the entry must still belong to the create that inserted it"
+        );
+
+        state.docker.remove_container(&name, true).await.ok();
+        state.registry.remove(&name).await;
+    }
+
+    /// Replacing a keep-alive owner used to stop the previous container inline
+    /// with a 10s grace against a PID 1 that ignores SIGTERM, so the create paid
+    /// the whole grace. The removal happens on a background task now.
+    #[tokio::test]
+    #[ignore] // Requires Docker and pulls alpine
+    async fn keep_alive_transfer_does_not_block_the_create() {
+        require_docker!(state);
+        let keep_alive_id = unique_id("svc");
+        let first_id = unique_id("ka-first");
+        let second_id = unique_id("ka-second");
+        let first_name = format!("test-executor-{}", first_id);
+        let second_name = format!("test-executor-{}", second_id);
+        let app = create_router(state.clone());
+
+        let create = |runtime_id: &str| {
+            let payload = json!({
+                "runtimeId": runtime_id,
+                "image": "alpine:latest",
+                "keepAliveId": keep_alive_id,
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runtimes")
+                .header("Authorization", "Bearer test-secret-key")
+                .header("Content-Type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(create(&first_id)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let started = Instant::now();
+        let second = app.clone().oneshot(create(&second_id)).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the create must not wait out the previous owner's stop grace, took {:?}",
+            elapsed
+        );
+
+        // The previous owner still goes, just not on the create's clock.
+        let mut removed = false;
+        for _ in 0..60 {
+            if !container_exists(&state, &first_name).await {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            removed,
+            "the replaced keep-alive container must be removed in the background"
+        );
+
+        state.docker.remove_container(&second_name, true).await.ok();
+        state.docker.remove_container(&first_name, true).await.ok();
     }
 }
