@@ -97,6 +97,13 @@ async-trait = "0.1"
 # Workspace crates
 urt-core = { path = "crates/urt-core" }
 
+[patch.crates-io]
+# rust-s3 0.37.2 and aws-creds 0.39.1 still require vulnerable quick-xml 0.38.
+# Pin the two-manifest fix from https://github.com/durch/rust-s3/pull/468.
+# Remove both overrides once published versions depend on quick-xml >= 0.41.
+rust-s3 = { git = "https://github.com/durch/rust-s3", rev = "01b6ccb9babf858475163a4b9bcd7dea3d56fd00" }
+aws-creds = { git = "https://github.com/durch/rust-s3", rev = "01b6ccb9babf858475163a4b9bcd7dea3d56fd00" }
+
 [profile.release]
 lto = true
 codegen-units = 1
