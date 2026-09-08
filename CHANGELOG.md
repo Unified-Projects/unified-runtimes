@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Eight more runtime families in the auto-resolution table**: `cpp`, `flutter`, `go`, `java`, `kotlin`, `python-ml`, `rust` and `swift` join the nine that were already there. `OFFICIAL_RUNTIMES` now carries the full ordered list of published `v5` versions per family rather than a single latest image, so version-pinned shorthands resolve against real tags and a "current plus three previous" allowlist can be written without guessing. Tags were read from the Docker Hub API on 2026-09-08 and cross-checked against `ci/runtimes.toml` in `open-runtimes/open-runtimes`.
+- **`URT_RUNTIME_NAMESPACE`, `URT_RUNTIME_REGISTRY` and `URT_RUNTIME_NAMESPACE_FAMILIES`**: auto-resolution can be pointed at a mirror of the official images, for example `ghcr.io/unified-runtimes/node:v5-26`. `URT_RUNTIME_NAMESPACE_FAMILIES` limits the preference to named families; anything outside the list, and any family absent from the mirror, falls back to `openruntimes/<family>`. Image references that are not an official family are never rewritten.
+- **Entrypoint and command detection for the new families**: `.go`, `.rs`, `.swift`, `.kt`, `.kts`, `.java`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.hpp` and `.hh` entrypoints, plus `go build`, `cargo`/`Cargo.toml`, `swift build`, `gradlew`, `mvn`, `cmake` and `flutter build` style commands.
+- **`scripts/refresh-runtime-table.py`**: paginates the Docker Hub tag listing for every family and prints the `OFFICIAL_RUNTIMES` constant with a refreshed verification date. Documented in CONTRIBUTING.md and README.md.
+
+### Changed
+- **Shorthand expansion resolves through the runtime table**: a bare family name such as `go` now expands to the newest published tag instead of the unpublished `openruntimes/go:v5`, and a pin that upstream publishes with a trailing `.0` (`node-20`, `java-21`, `dotnet-8`) reaches `v5-20.0`, `v5-21.0` and `v5-8.0`. Versions the table does not know are still passed through verbatim, so tags published after the last refresh keep working.
+- **`flutter` commands no longer resolve to the `dart` family**: `flutter build`, `flutter run` and `flutter pub` select `openruntimes/flutter`. A caller that explicitly asked for a more specific family keeps it, so a `flutter` request with a `.dart` entrypoint stays on `flutter` and a `python-ml` request with a `.py` entrypoint stays on `python-ml`.
+- **Latest tags moved with upstream**: `node` v5-25 to v5-26, `bun` v5-1.3 to v5-1.4, `dart` v5-3.10 to v5-3.13.
+
 ## [0.4.1] - 2026-05-04
 
 ### Fixed
