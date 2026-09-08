@@ -371,6 +371,25 @@ pub struct ExecutorConfig {
     /// that repeated requests for an unknown runtime ID do not each cost a
     /// Docker inspect.  Zero disables the cache.  Defaults to 2000 ms.
     pub adoption_negative_cache_ms: u64,
+
+    /// Subscribe to Docker container events so a runtime death is noticed the
+    /// moment the daemon reports it. Defaults to true.
+    pub docker_events: bool,
+
+    /// Cap in seconds on the backoff between executor-initiated recreates of a
+    /// runtime that keeps dying (1s, 2s, 4s ... up to this). Defaults to 30.
+    pub restart_backoff_max_secs: u64,
+
+    /// Deaths inside `crash_loop_window_secs` that put a runtime into
+    /// quarantine. Defaults to 3.
+    pub crash_loop_threshold: u32,
+
+    /// Window in seconds over which deaths are counted. Defaults to 60.
+    pub crash_loop_window_secs: u64,
+
+    /// How long a crash-looping runtime stays quarantined, in seconds.
+    /// Defaults to 300.
+    pub quarantine_secs: u64,
 }
 
 impl ExecutorConfig {
@@ -520,6 +539,27 @@ impl ExecutorConfig {
             adoption_negative_cache_ms: env_urt_or_opr("ADOPTION_NEGATIVE_CACHE_MS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2000),
+
+            // Dead-runtime detection and crash-loop protection
+            docker_events: env_urt_or_opr("DOCKER_EVENTS")
+                .map(|v| parse_bool_flag(&v))
+                .unwrap_or(true),
+            restart_backoff_max_secs: env_urt_or_opr("RESTART_BACKOFF_MAX_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30)
+                .max(1),
+            crash_loop_threshold: env_urt_or_opr("CRASH_LOOP_THRESHOLD")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3)
+                .max(1),
+            crash_loop_window_secs: env_urt_or_opr("CRASH_LOOP_WINDOW_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60)
+                .max(1),
+            quarantine_secs: env_urt_or_opr("QUARANTINE_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300)
+                .max(1),
         }
     }
 

@@ -30,7 +30,8 @@ use execution_counter::active_executions;
 use platform::temp_dir;
 use routes::{create_router, AppState};
 use runtime::{
-    AdoptionNegativeCache, CreateTracker, KeepAliveRegistry, RuntimeConcurrency, RuntimeRegistry,
+    AdoptionNegativeCache, CrashLoopConfig, CreateTracker, KeepAliveRegistry, RuntimeConcurrency,
+    RuntimeHealth, RuntimeRegistry,
 };
 use storage::{Storage, StorageFileCache};
 
@@ -295,6 +296,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let readiness: Arc<DashMap<String, Arc<tokio::sync::Notify>>> = Arc::new(DashMap::new());
     let create_tracker = CreateTracker::new();
     let runtime_concurrency = RuntimeConcurrency::new();
+    let health = RuntimeHealth::new(CrashLoopConfig::from_executor_config(&config));
 
     let maintenance_handles = tasks::MaintenanceHandles {
         docker: docker.clone(),
@@ -302,6 +304,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         keep_alive_registry: keep_alive_registry.clone(),
         readiness: readiness.clone(),
         create_tracker: create_tracker.clone(),
+        health: health.clone(),
     };
     let maintenance_config = config.clone();
     let maintenance_storage = storage.clone();
@@ -328,6 +331,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         registry: registry.clone(),
         keep_alive_registry: keep_alive_registry.clone(),
         runtime_concurrency: runtime_concurrency.clone(),
+        readiness: readiness.clone(),
+        health: health.clone(),
     };
     let listening_watch_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
@@ -353,7 +358,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         adoption_negative_cache: AdoptionNegativeCache::new(Duration::from_millis(
             config.adoption_negative_cache_ms,
         )),
+        health,
     };
+
+    if config.docker_events {
+        let events_state = state.clone();
+        let events_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tasks::run_docker_events(events_state, events_shutdown).await;
+        });
+    } else {
+        info!("Docker events subscription disabled (URT_DOCKER_EVENTS=false)");
+    }
 
     // Create router
     let app = create_router(state);

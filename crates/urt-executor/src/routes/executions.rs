@@ -8,9 +8,10 @@ use super::runtimes::{
 use super::AppState;
 use crate::error::{ExecutorError, Result};
 use crate::execution_counter::ExecutionGuard;
-use crate::resilience::retry_with_backoff;
+use crate::runtime::liveness::{self, RecoveryOutcome};
 use crate::runtime::{
-    get_protocol, wait_for_runtime_port, ExecuteRequest, ExecuteResponse, RUNTIME_PORT,
+    get_protocol, wait_for_runtime_port, ExecuteRequest, ExecuteResponse, RuntimeProtocol,
+    RUNTIME_PORT,
 };
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
@@ -24,7 +25,12 @@ use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// A connect failure reported faster than this is retried once after a short
+/// pause: it was a refusal, not a connect timeout, and nothing was sent.
+const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(1);
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Request body for execution
 #[derive(Debug, Deserialize)]
@@ -442,22 +448,54 @@ pub async fn create_execution(
     };
 
     let full_name = format!("{}-{}", state.config.hostname, runtime_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(req.timeout as u64);
 
-    let runtime = resolve_runtime(&state, &runtime_id, &full_name, &req).await?;
+    if let Some(detail) = liveness::quarantine_for(&state, &full_name).await {
+        metrics().inc_error_class("create_execution", "runtime_quarantined");
+        return Err(ExecutorError::RuntimeQuarantined(detail));
+    }
 
-    // Per-runtime admission control. A runtime created with `maxConcurrency`
-    // admits that many executions at once; the rest queue for the executor's
-    // execution queue wait and are then refused, rather than piling onto a
-    // runtime that cannot keep up with them.
-    let _runtime_slot = match runtime.max_concurrency {
-        Some(limit) => {
+    let mut req = req;
+    let exec_req = build_execute_request(&mut req);
+
+    // A runtime found dead is handled once per request: either Docker brings
+    // it back and the execution is retried, or its entry is dropped and the
+    // runtime is resolved again (recreated when the caller supplied an image).
+    let mut recovery_attempted = false;
+    // Admission is per attempt: a retry gives its slot back before taking
+    // another, and the slot taken by the attempt that succeeds is held until
+    // the response has been read.
+    let mut runtime_slot = None;
+    let response: ExecuteResponse = loop {
+        let runtime = resolve_runtime(&state, &runtime_id, &full_name, &req, deadline).await?;
+
+        if let Some(remaining) = state.health.unreachable_remaining(&full_name) {
+            metrics().inc_error_class("create_execution", "runtime_unreachable");
+            return Err(ExecutorError::RuntimeUnreachable {
+                runtime: full_name,
+                cause: format!(
+                    "runtime is being checked after a failed connection; retry in {}s",
+                    remaining.as_secs().max(1)
+                ),
+            });
+        }
+
+        // Per-runtime admission control. A runtime created with `maxConcurrency`
+        // admits that many executions at once; the rest queue for the executor's
+        // execution queue wait and are then refused, rather than piling onto a
+        // runtime that cannot keep up with them. It sits behind the liveness
+        // checks so a dead runtime is reported as such rather than queued for.
+        // Give back the slot from a previous attempt before taking another, so
+        // a runtime capped at one execution cannot queue behind itself.
+        drop(runtime_slot.take());
+        if let Some(limit) = runtime.max_concurrency {
             let queue_wait = Duration::from_millis(state.config.execution_queue_wait_ms);
             match state
                 .runtime_concurrency
                 .acquire(&full_name, limit, queue_wait)
                 .await
             {
-                Some(permit) => Some(permit),
+                Some(permit) => runtime_slot = Some(permit),
                 None => {
                     metrics().inc_error_class("create_execution", "runtime_at_capacity");
                     operation_timer.mark_overload();
@@ -468,83 +506,70 @@ pub async fn create_execution(
                 }
             }
         }
-        None => None,
+
+        // TCP port readiness check (matching executor-main Docker.php:1088-1115)
+        // On first execution, wait for the runtime to start listening on port 3000
+        if !runtime.is_listening() {
+            debug!(
+                "Checking if runtime {} is listening on port {}",
+                runtime.name, RUNTIME_PORT
+            );
+            let port_timeout = Duration::from_secs(req.timeout as u64);
+            match wait_for_runtime_port(&runtime.name, RUNTIME_PORT, port_timeout).await {
+                Ok(()) => {
+                    // Mark runtime as listening so we skip this check on subsequent executions
+                    if let Err(e) = state.registry.set_listening(&full_name).await {
+                        debug!("Failed to mark runtime as listening: {}", e);
+                    }
+                    // An answered probe disproves an unreachable marker another
+                    // request may have left behind.
+                    state.health.clear_unreachable(&full_name);
+                    debug!("Runtime {} is now listening", runtime.hostname);
+                }
+                Err(error) => {
+                    if recovery_attempted {
+                        return Err(error);
+                    }
+                    recovery_attempted = true;
+                    match liveness::recover_unreachable(&state, &full_name, deadline).await {
+                        RecoveryOutcome::Ready | RecoveryOutcome::Removed => continue,
+                        RecoveryOutcome::Unresponsive => return Err(error),
+                        RecoveryOutcome::Quarantined(detail) => {
+                            return Err(ExecutorError::RuntimeQuarantined(detail));
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("Executing with protocol {}", runtime.version);
+        let protocol = get_protocol(&runtime.version);
+
+        match execute_with_connect_retry(protocol, &runtime, &exec_req, &state.http_client).await {
+            Ok(response) => break response,
+            Err(error @ ExecutorError::RuntimeUnreachable { .. }) => {
+                if recovery_attempted {
+                    return Err(error);
+                }
+                recovery_attempted = true;
+                match liveness::recover_unreachable(&state, &full_name, deadline).await {
+                    RecoveryOutcome::Ready | RecoveryOutcome::Removed => continue,
+                    RecoveryOutcome::Unresponsive => return Err(error),
+                    RecoveryOutcome::Quarantined(detail) => {
+                        return Err(ExecutorError::RuntimeQuarantined(detail));
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
     };
+
+    // The winning attempt's admission slot is held until the response has been
+    // built and returned.
+    let _runtime_slot = runtime_slot;
 
     // Coalesce activity updates to reduce write contention on the runtime registry.
     state.registry.touch_if_stale(&full_name, 1.0).await.ok();
-
-    // TCP port readiness check (matching executor-main Docker.php:1088-1115)
-    // On first execution, wait for the runtime to start listening on port 3000
-    if !runtime.is_listening() {
-        debug!(
-            "Checking if runtime {} is listening on port {}",
-            runtime.name, RUNTIME_PORT
-        );
-        let port_timeout = Duration::from_secs(req.timeout as u64);
-        wait_for_runtime_port(&runtime.name, RUNTIME_PORT, port_timeout).await?;
-
-        // Observing the port is what marks the runtime initialised, and it also
-        // skips this check on subsequent executions.
-        if let Err(e) = state.registry.set_listening(&full_name).await {
-            debug!("Failed to mark runtime as listening: {}", e);
-        }
-        debug!("Runtime {} is now listening", runtime.name);
-    }
-
-    // Build execution request
-    // IMPORTANT: Always force identity encoding when talking to the runtime.
-    // If we forward an incoming `accept-encoding` (e.g. gzip), different HTTP clients/proxies may
-    // transparently decode/encode which can lead to mismatched lengths / truncated bodies.
-    let ExecutionRequest {
-        body,
-        path,
-        method,
-        headers: request_headers,
-        timeout,
-        logging,
-        ..
-    } = req;
-
-    let mut exec_headers = request_headers.into_map();
-    exec_headers.insert("accept-encoding".to_string(), "identity".to_string());
-
-    let mut method = method;
-    method.make_ascii_uppercase();
-
-    let exec_req = ExecuteRequest {
-        body: Bytes::from(body),
-        path,
-        method,
-        headers: exec_headers,
-        timeout,
-        logging,
-    };
-
-    debug!("Executing with protocol {}", runtime.version);
-
-    // Get protocol handler
-    let protocol = get_protocol(&runtime.version);
-
-    // Execute with jittered retries for transient runtime networking failures.
-    let response: ExecuteResponse = retry_with_backoff(
-        "execution_protocol",
-        state.config.retry_attempts,
-        state.config.retry_delay_ms,
-        |_| async {
-            protocol
-                .execute(&runtime, &exec_req, &state.http_client)
-                .await
-        },
-    )
-    .await
-    .map_err(|err| {
-        if matches!(err, ExecutorError::Network(_)) {
-            ExecutorError::RuntimeTimeout
-        } else {
-            err
-        }
-    })?;
 
     let response_format = headers
         .get("x-executor-response-format")
@@ -589,11 +614,67 @@ pub async fn create_execution(
     .into_response())
 }
 
+/// Turn the execution parameters into the request sent to the runtime, leaving
+/// the creation parameters in `req` for a possible on-the-fly create.
+///
+/// The `accept-encoding` header is always forced to identity: forwarding an
+/// incoming value such as gzip lets intermediate HTTP clients transparently
+/// decode or encode, which can produce mismatched lengths or truncated bodies.
+fn build_execute_request(req: &mut ExecutionRequest) -> ExecuteRequest {
+    let mut exec_headers = std::mem::take(&mut req.headers).into_map();
+    exec_headers.insert("accept-encoding".to_string(), "identity".to_string());
+
+    let mut method = std::mem::take(&mut req.method);
+    method.make_ascii_uppercase();
+
+    ExecuteRequest {
+        body: Bytes::from(std::mem::take(&mut req.body)),
+        path: std::mem::take(&mut req.path),
+        method,
+        headers: exec_headers,
+        timeout: req.timeout,
+        logging: req.logging,
+    }
+}
+
+/// Send the execution, repeating it once only when the first dial was refused
+/// outright. A connect timeout is not repeated (it would double the latency
+/// for nothing) and neither is any failure after the request was sent, since
+/// the runtime may already have run the function.
+async fn execute_with_connect_retry(
+    protocol: &dyn RuntimeProtocol,
+    runtime: &crate::runtime::Runtime,
+    request: &ExecuteRequest,
+    client: &reqwest::Client,
+) -> Result<ExecuteResponse> {
+    let started = Instant::now();
+    match protocol.execute(runtime, request, client).await {
+        Err(ExecutorError::RuntimeUnreachable { .. })
+            if started.elapsed() < CONNECT_RETRY_WINDOW =>
+        {
+            metrics().inc_retry("execution_protocol", "retry");
+            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            match protocol.execute(runtime, request, client).await {
+                Ok(response) => {
+                    metrics().inc_retry("execution_protocol", "success_after_retry");
+                    Ok(response)
+                }
+                Err(error) => {
+                    metrics().inc_retry("execution_protocol", "failed");
+                    Err(error)
+                }
+            }
+        }
+        other => other,
+    }
+}
+
 async fn resolve_runtime(
     state: &AppState,
     runtime_id: &str,
     full_name: &str,
     req: &ExecutionRequest,
+    deadline: tokio::time::Instant,
 ) -> Result<crate::runtime::Runtime> {
     use crate::runtime::readiness::resolve_runtime_with_readiness;
 
@@ -629,6 +710,25 @@ async fn resolve_runtime(
         return Err(ExecutorError::RuntimeNotFound);
     }
 
+    // A runtime that died recently is recreated after a backoff that grows
+    // with each death, so a crashing function does not restart in a tight loop.
+    let backoff = state.health.restart_wait(full_name);
+    if !backoff.is_zero() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ExecutorError::RuntimeTimeout);
+        }
+        info!(
+            runtime = %full_name,
+            backoff_ms = backoff.as_millis() as u64,
+            "Delaying runtime recreate after a recent death"
+        );
+        tokio::time::sleep(backoff.min(remaining)).await;
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ExecutorError::RuntimeTimeout);
+    }
+
     debug!("Creating runtime on-the-fly: {}", runtime_id);
 
     let create_req_json = serde_json::json!({
@@ -657,7 +757,13 @@ async fn resolve_runtime(
         State(state.clone()),
         serde_json::to_string(&create_req_json).unwrap_or_default(),
     )
-    .await?;
+    .await
+    .map_err(|error| match error {
+        ExecutorError::RuntimeCreateQuarantined(detail) => {
+            ExecutorError::RuntimeQuarantined(detail)
+        }
+        other => other,
+    })?;
 
     // create_runtime completes synchronously (the runtime is already running or
     // removed by the time it returns Ok). A single registry.get is sufficient.
@@ -1210,6 +1316,16 @@ mod tests {
         #[test]
         fn test_default_logging() {
             assert!(default_logging());
+        }
+
+        #[test]
+        fn test_default_restart_policy_lets_docker_retry_failures() {
+            let req: ExecutionRequest = serde_json::from_str("{}").unwrap();
+            assert_eq!(req.restart_policy, "on-failure:3");
+
+            let explicit: ExecutionRequest =
+                serde_json::from_str(r#"{"restartPolicy": "no"}"#).unwrap();
+            assert_eq!(explicit.restart_policy, "no");
         }
     }
 

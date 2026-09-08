@@ -3,7 +3,9 @@
 mod adoption;
 pub mod concurrency;
 pub(crate) mod create_tracker;
+pub mod health;
 mod keep_alive;
+pub mod liveness;
 mod protocol;
 pub(crate) mod readiness;
 mod registry;
@@ -13,11 +15,12 @@ mod runtime;
 pub use adoption::AdoptionNegativeCache;
 pub use concurrency::RuntimeConcurrency;
 pub use create_tracker::CreateTracker;
+pub use health::{CrashLoopConfig, RuntimeHealth};
 pub use keep_alive::KeepAliveRegistry;
 #[allow(unused_imports)]
 pub use protocol::{
-    get_protocol, runtime_network_host, ExecuteRequest, ExecuteResponse, RuntimeProtocol,
-    V2Protocol, V5Protocol,
+    classify_transport_error, error_chain, get_protocol, runtime_network_host, transport_error_for,
+    ExecuteRequest, ExecuteResponse, RuntimeProtocol, TransportFailure, V2Protocol, V5Protocol,
 };
 pub use registry::RuntimeRegistry;
 #[allow(unused_imports)]

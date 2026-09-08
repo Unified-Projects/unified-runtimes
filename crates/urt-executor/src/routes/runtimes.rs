@@ -109,7 +109,9 @@ pub fn default_memory() -> u64 {
 pub fn default_version() -> String {
     "v5".to_string()
 }
-const DEFAULT_RESTART_POLICY: &str = "no";
+/// Docker restarts a runtime that exits non-zero up to three times; the
+/// executor's crash-loop protection quarantines it if it keeps dying.
+const DEFAULT_RESTART_POLICY: &str = "on-failure:3";
 pub fn default_restart_policy() -> String {
     DEFAULT_RESTART_POLICY.to_string()
 }
@@ -688,6 +690,7 @@ fn keep_alive_owner_id(req: &CreateRuntimeRequest) -> Option<String> {
 /// watchdog owns the decision to give up on it.
 fn spawn_listening_probe(state: &AppState, full_name: String, startup_timeout: u64) {
     let registry = state.registry.clone();
+    let health = state.health.clone();
 
     tokio::spawn(async move {
         let window = Duration::from_secs(startup_timeout.max(1));
@@ -695,6 +698,9 @@ fn spawn_listening_probe(state: &AppState, full_name: String, startup_timeout: u
         match wait_for_runtime_port(&full_name, RUNTIME_PORT, window).await {
             Ok(()) => {
                 if registry.set_listening(&full_name).await.is_ok() {
+                    // The runtime answered, so any unreachable marker left by a
+                    // request that raced the create no longer holds.
+                    health.clear_unreachable(&full_name);
                     debug!(
                         "Runtime {} is listening on port {}",
                         full_name, RUNTIME_PORT
@@ -796,6 +802,15 @@ pub async fn create_runtime(
     }
 
     let full_name = format!("{}-{}", state.config.hostname, req.runtime_id);
+
+    if let Some(detail) = crate::runtime::liveness::quarantine_for(&state, &full_name).await {
+        warn!(
+            runtime_id = %req.runtime_id,
+            expires_at = %detail.expires_at,
+            "Refusing to create quarantined runtime"
+        );
+        return Err(ExecutorError::RuntimeCreateQuarantined(detail));
+    }
 
     // The build runs on a detached task from here on. A client that hangs up
     // mid-download no longer cancels it, so the pending registry entry this
@@ -1554,6 +1569,9 @@ pub async fn delete_runtime(
 
     info!("Deleting runtime: {}", full_name);
 
+    state.health.clear_unreachable(&full_name);
+    state.health.invalidate_liveness(&full_name);
+
     // Get runtime info before deletion to check keep_alive_id
     let runtime_info = state.registry.get(&full_name).await;
     let _keep_alive_lock = match runtime_info
@@ -2194,6 +2212,28 @@ mod tests {
         // An explicit zero threshold is honoured: it means "reclaim as soon as idle".
         assert_eq!(lifecycle.inactive_threshold, 0);
         assert_eq!(lifecycle.max_concurrency, Some(3));
+    }
+
+    #[test]
+    fn test_default_restart_policy_is_on_failure_with_a_retry_cap() {
+        use crate::docker::container::RestartPolicySpec;
+
+        assert_eq!(super::default_restart_policy(), "on-failure:3");
+        assert_eq!(
+            RestartPolicySpec::parse(&super::default_restart_policy()),
+            RestartPolicySpec::OnFailure(Some(3))
+        );
+
+        let request: super::CreateRuntimeRequest =
+            serde_json::from_str(r#"{"runtimeId": "rt", "image": "openruntimes/node:v5-22"}"#)
+                .unwrap();
+        assert_eq!(request.restart_policy, "on-failure:3");
+
+        let explicit: super::CreateRuntimeRequest = serde_json::from_str(
+            r#"{"runtimeId": "rt", "image": "openruntimes/node:v5-22", "restartPolicy": "always"}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.restart_policy, "always");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::path::Path;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maximum log file size (5MB, matching executor-main)
 const MAX_LOG_SIZE: usize = 5 * 1024 * 1024;
@@ -133,13 +133,7 @@ impl RuntimeProtocol for V2Protocol {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ExecutorError::ExecutionTimeout
-                } else {
-                    ExecutorError::Network(e.to_string())
-                }
-            })?;
+            .map_err(|e| report_transport_failure(runtime, start_instant, e))?;
 
         let status = response.status().as_u16();
 
@@ -151,10 +145,13 @@ impl RuntimeProtocol for V2Protocol {
             stderr: Option<String>,
         }
 
-        let v2_resp: V2Response = response
-            .json()
-            .await
-            .map_err(|e| ExecutorError::ExecutionBadJson(e.to_string()))?;
+        let v2_resp: V2Response = match response.json().await {
+            Ok(parsed) => parsed,
+            Err(e) if e.is_decode() => {
+                return Err(ExecutorError::ExecutionBadJson(e.to_string()));
+            }
+            Err(e) => return Err(report_transport_failure(runtime, start_instant, e)),
+        };
 
         let duration = start_instant.elapsed().as_secs_f64();
 
@@ -232,13 +229,10 @@ impl RuntimeProtocol for V5Protocol {
             req_builder = req_builder.body(request.body.clone());
         }
 
-        let response = req_builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                ExecutorError::ExecutionTimeout
-            } else {
-                ExecutorError::Network(e.to_string())
-            }
-        })?;
+        let response = req_builder
+            .send()
+            .await
+            .map_err(|e| report_transport_failure(runtime, start_instant, e))?;
 
         let status = response.status().as_u16();
 
@@ -288,7 +282,7 @@ impl RuntimeProtocol for V5Protocol {
             response
                 .bytes()
                 .await
-                .map_err(|e| ExecutorError::Network(e.to_string()))
+                .map_err(|e| report_transport_failure(runtime, start_instant, e))
         };
         let logs_fut = async {
             if !request.logging {
@@ -328,6 +322,84 @@ impl RuntimeProtocol for V5Protocol {
 
 pub fn runtime_network_host(runtime: &Runtime) -> &str {
     &runtime.name
+}
+
+/// Where a runtime request failed, decided from the `reqwest::Error` itself
+/// rather than from its rendered text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    /// The dial never completed: DNS failure, connection refused or a connect
+    /// timeout. Nothing was sent, so the request can be retried safely.
+    Unreachable,
+    /// The connection was established and the request sent, but no complete
+    /// response arrived inside the deadline.
+    Timeout,
+    /// The connection broke after the request went out: reset, closed
+    /// mid-response, truncated body. The runtime may have run the function.
+    ConnectionFailed,
+}
+
+/// Classify a `reqwest::Error` from a runtime request.
+///
+/// The connect check runs first because reqwest reports a connect timeout as
+/// both a connect error and a timeout, and only the connect classification is
+/// safe to retry.
+pub fn classify_transport_error(error: &reqwest::Error) -> TransportFailure {
+    if error.is_connect() {
+        TransportFailure::Unreachable
+    } else if error.is_timeout() {
+        TransportFailure::Timeout
+    } else {
+        TransportFailure::ConnectionFailed
+    }
+}
+
+/// Render an error and its source chain on one line, without the request URL
+/// that reqwest puts in its own `Display` output.
+pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        let text = err.to_string();
+        if !parts.iter().any(|seen| seen == &text) {
+            parts.push(text);
+        }
+        current = err.source();
+    }
+    parts.join(": ")
+}
+
+/// Map a transport failure onto the executor error the caller sees.
+pub fn transport_error_for(runtime: &Runtime, error: &reqwest::Error) -> ExecutorError {
+    match classify_transport_error(error) {
+        TransportFailure::Unreachable => ExecutorError::RuntimeUnreachable {
+            runtime: runtime.name.clone(),
+            cause: error_chain(error),
+        },
+        TransportFailure::Timeout => ExecutorError::ExecutionTimeout,
+        TransportFailure::ConnectionFailed => ExecutorError::RuntimeConnectionFailed {
+            runtime: runtime.name.clone(),
+            cause: error_chain(error),
+        },
+    }
+}
+
+/// Log a runtime-side transport failure and convert it.
+fn report_transport_failure(
+    runtime: &Runtime,
+    started: std::time::Instant,
+    error: reqwest::Error,
+) -> ExecutorError {
+    let failure = classify_transport_error(&error);
+    warn!(
+        runtime = %runtime.name,
+        runtime_id = %runtime.runtime_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        failure = ?failure,
+        error = ?error,
+        "Runtime request failed"
+    );
+    transport_error_for(runtime, &error)
 }
 
 /// Read log files from disk and clean up (matching executor-main behavior)
@@ -533,6 +605,9 @@ mod tests {
             max_concurrency: None,
             keep_alive_id: None,
             authorization_header: "Basic dummy".to_string(),
+            quarantined_until: None,
+            last_exit_code: None,
+            restart_count: 0,
         };
 
         assert_eq!(runtime_network_host(&runtime), "exc1-myruntime123");
@@ -561,6 +636,9 @@ mod tests {
             max_concurrency: None,
             keep_alive_id: None,
             authorization_header: "Basic dummy".to_string(),
+            quarantined_until: None,
+            last_exit_code: None,
+            restart_count: 0,
         };
 
         assert_eq!(runtime_network_host(&runtime), "exc1-myruntime123");
@@ -639,5 +717,160 @@ mod tests {
         let content = "a".repeat(MAX_BUILD_LOG_SIZE + 50);
         let truncated = truncate_build_logs(content);
         assert_eq!(truncated.len(), MAX_BUILD_LOG_SIZE);
+    }
+
+    mod transport_classification {
+        use super::super::*;
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        fn test_runtime() -> Runtime {
+            let mut runtime = Runtime::new("rt-503", "exc1", "img", "v5", None);
+            runtime.mark_running("running");
+            runtime
+        }
+
+        fn client() -> reqwest::Client {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+        }
+
+        /// Issue a GET against `addr` and return the transport error, reading
+        /// the body so failures after the headers are surfaced too.
+        async fn request_error(addr: SocketAddr, timeout: Duration) -> reqwest::Error {
+            let result = client()
+                .get(format!("http://{}/", addr))
+                .timeout(timeout)
+                .send()
+                .await;
+            match result {
+                Err(e) => e,
+                Ok(response) => response
+                    .bytes()
+                    .await
+                    .expect_err("response must fail on read"),
+            }
+        }
+
+        /// Bind a listener, hand it to `serve` and return its address.
+        async fn serve<F, Fut>(serve: F) -> SocketAddr
+        where
+            F: FnOnce(TcpListener) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve(listener));
+            addr
+        }
+
+        #[tokio::test]
+        async fn connection_refused_is_unreachable() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+
+            let error = request_error(addr, Duration::from_secs(5)).await;
+            assert_eq!(
+                classify_transport_error(&error),
+                TransportFailure::Unreachable
+            );
+
+            let mapped = transport_error_for(&test_runtime(), &error);
+            assert!(
+                matches!(mapped, ExecutorError::RuntimeUnreachable { ref runtime, .. } if runtime == "exc1-rt-503"),
+                "got {:?}",
+                mapped
+            );
+            assert_eq!(
+                mapped.status_code(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+
+        #[tokio::test]
+        async fn peer_closing_without_a_response_is_a_connection_failure() {
+            let addr = serve(|listener| async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            })
+            .await;
+
+            let error = request_error(addr, Duration::from_secs(5)).await;
+            assert_eq!(
+                classify_transport_error(&error),
+                TransportFailure::ConnectionFailed
+            );
+
+            let mapped = transport_error_for(&test_runtime(), &error);
+            assert!(
+                matches!(mapped, ExecutorError::RuntimeConnectionFailed { .. }),
+                "got {:?}",
+                mapped
+            );
+            assert_eq!(mapped.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+        }
+
+        #[tokio::test]
+        async fn peer_closing_mid_body_is_a_connection_failure() {
+            let addr = serve(|listener| async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\npartial")
+                    .await
+                    .unwrap();
+                drop(socket);
+            })
+            .await;
+
+            let error = request_error(addr, Duration::from_secs(5)).await;
+            assert_eq!(
+                classify_transport_error(&error),
+                TransportFailure::ConnectionFailed
+            );
+            let mapped = transport_error_for(&test_runtime(), &error);
+            assert!(
+                matches!(mapped, ExecutorError::RuntimeConnectionFailed { ref cause, .. } if !cause.is_empty()),
+                "got {:?}",
+                mapped
+            );
+        }
+
+        #[tokio::test]
+        async fn peer_that_never_answers_is_a_timeout() {
+            let addr = serve(|listener| async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(socket);
+            })
+            .await;
+
+            let error = request_error(addr, Duration::from_millis(200)).await;
+            assert_eq!(classify_transport_error(&error), TransportFailure::Timeout);
+
+            let mapped = transport_error_for(&test_runtime(), &error);
+            assert!(matches!(mapped, ExecutorError::ExecutionTimeout));
+            assert_eq!(
+                mapped.status_code(),
+                axum::http::StatusCode::GATEWAY_TIMEOUT
+            );
+        }
+
+        #[test]
+        fn error_chain_joins_sources_without_repeating_them() {
+            let inner = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer");
+            let outer = std::io::Error::other(inner);
+            assert_eq!(error_chain(&outer), "reset by peer");
+        }
     }
 }

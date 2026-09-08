@@ -6,8 +6,8 @@ use crate::docker::DockerManager;
 use crate::error::ExecutorError;
 use crate::resilience::retry_with_backoff;
 use crate::runtime::{
-    wait_for_runtime_port, CreateTracker, KeepAliveRegistry, Runtime, RuntimeLifecycle,
-    RuntimeRegistry, RUNTIME_PORT,
+    wait_for_runtime_port, CreateTracker, KeepAliveRegistry, Runtime, RuntimeHealth,
+    RuntimeLifecycle, RuntimeRegistry, RUNTIME_PORT,
 };
 use crate::storage::{BuildCache, Storage};
 use dashmap::DashMap;
@@ -395,6 +395,7 @@ pub struct MaintenanceHandles {
     pub keep_alive_registry: KeepAliveRegistry,
     pub readiness: Arc<DashMap<String, Arc<Notify>>>,
     pub create_tracker: CreateTracker,
+    pub health: RuntimeHealth,
 }
 
 /// Run the maintenance worker
@@ -413,6 +414,7 @@ pub async fn run_maintenance<S: Storage + 'static>(
         keep_alive_registry,
         readiness,
         create_tracker,
+        health,
     } = handles;
     let interval = Duration::from_secs(config.maintenance_interval);
     let build_cache = BuildCache::new(storage, "builds");
@@ -450,6 +452,11 @@ pub async fn run_maintenance<S: Storage + 'static>(
                 // Runs before the untracked-container sweep so a container left
                 // behind by a reaped entry is cleaned up in the same cycle.
                 cleanup_stale_pending(&registry, &readiness, &create_tracker, config.pending_max_age_secs).await;
+
+                let released = crate::runtime::liveness::sweep_expired_quarantines(&registry, &health).await;
+                if released > 0 {
+                    info!("Released {} runtimes whose quarantine expired", released);
+                }
 
                 cleanup_untracked_managed_containers(&docker, &registry, &config.hostname, &managed_containers).await;
 
@@ -525,6 +532,11 @@ pub async fn cleanup_idle(
                     "Skipping cleanup of {} - still in pending state",
                     runtime.name
                 );
+                return false;
+            }
+            // Quarantined entries have no container; they stay listed until the
+            // quarantine lapses and the sweep above releases them.
+            if runtime.is_quarantined() {
                 return false;
             }
             // If runtime has a keep_alive_id AND owns it, skip cleanup
@@ -924,6 +936,11 @@ mod tests {
             labels: HashMap::new(),
             env: HashMap::new(),
             hostname: String::new(),
+            exit_code: None,
+            oom_killed: false,
+            restart_policy: String::new(),
+            restart_max_retries: 0,
+            restart_count: 0,
         }
     }
 

@@ -57,6 +57,11 @@ fn test_config() -> ExecutorConfig {
         pending_wait_max_secs: 60,
         pending_max_age_secs: 300,
         adoption_negative_cache_ms: 2000,
+        docker_events: false,
+        restart_backoff_max_secs: 30,
+        crash_loop_threshold: 3,
+        crash_loop_window_secs: 60,
+        quarantine_secs: 300,
     }
 }
 
@@ -91,6 +96,7 @@ async fn create_test_state() -> Option<AppState> {
         adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
             std::time::Duration::from_millis(2000),
         ),
+        health: urt_executor::runtime::RuntimeHealth::default(),
     })
 }
 
@@ -2489,6 +2495,11 @@ mod audit_fixes {
             pending_wait_max_secs: 60,
             pending_max_age_secs: 300,
             adoption_negative_cache_ms: 2000,
+            docker_events: false,
+            restart_backoff_max_secs: 30,
+            crash_loop_threshold: 3,
+            crash_loop_window_secs: 60,
+            quarantine_secs: 300,
         };
 
         assert!(
@@ -2913,6 +2924,11 @@ mod regression_pending_wait {
             pending_wait_max_secs: 1,
             pending_max_age_secs: 300,
             adoption_negative_cache_ms: 2000,
+            docker_events: false,
+            restart_backoff_max_secs: 30,
+            crash_loop_threshold: 3,
+            crash_loop_window_secs: 60,
+            quarantine_secs: 300,
         };
 
         let docker = match DockerManager::new(config.clone()).await {
@@ -2947,6 +2963,7 @@ mod regression_pending_wait {
             adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
                 std::time::Duration::from_millis(2000),
             ),
+            health: urt_executor::runtime::RuntimeHealth::default(),
         };
 
         let hostname = state.config.hostname.clone();
@@ -3572,10 +3589,14 @@ mod cold_start {
 
         let elapsed = start.elapsed();
 
+        // The entry is resolved without a cold-start park. The dial then fails
+        // because no container exists, which the dead-runtime handling turns
+        // into a fast removal and a 404 (no image to recreate from); a 504
+        // here would mean the readiness poll fired for a running runtime.
         assert_ne!(
             response.status(),
-            StatusCode::NOT_FOUND,
-            "Got 404: runtime was not resolved from the registry (full_name: {})",
+            StatusCode::GATEWAY_TIMEOUT,
+            "Got 504: cold-start polling fired for a running runtime (full_name: {})",
             full_name
         );
 
@@ -4106,12 +4127,7 @@ mod lifecycle_policy {
             .await
             .expect("insert failed runtime");
 
-        let reaped = urt_executor::tasks::reap_failed_runtimes(
-            &state.docker,
-            &state.registry,
-            &state.keep_alive_registry,
-        )
-        .await;
+        let reaped = urt_executor::tasks::reap_failed_runtimes(&state.teardown_targets()).await;
 
         assert_eq!(reaped, 1);
         assert!(
@@ -4304,5 +4320,497 @@ mod lifecycle_policy {
             120,
             "the defaults handed to a create must follow the environment"
         );
+    }
+}
+
+/// Dead-runtime detection, restart backoff and crash-loop quarantine.
+///
+/// The accounting (`runtime::health`, `runtime::liveness::observe_death`) and
+/// the Docker event parsing are exercised without Docker; the request-path
+/// tests build a router and therefore need a daemon.
+mod dead_runtime_detection {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use urt_executor::runtime::health::{CrashLoopConfig, DeathOutcome, QuarantineState};
+    use urt_executor::runtime::liveness::{self, DeathHandling};
+    use urt_executor::runtime::{Runtime, RuntimeHealth, RuntimeRegistry};
+    use urt_executor::tasks::docker_events::{
+        apply_container_event, parse_container_event, ContainerEvent, ContainerEventKind,
+        EventDisposition, OomTracker,
+    };
+
+    const HOSTNAME: &str = "test-executor";
+
+    fn listening_runtime(runtime_id: &str) -> Runtime {
+        let mut runtime = Runtime::new(runtime_id, HOSTNAME, "openruntimes/node:v5-22", "v5", None);
+        runtime.mark_running("running");
+        runtime.set_listening();
+        runtime
+    }
+
+    fn exec_payload(timeout_secs: u32, image: &str) -> String {
+        serde_json::json!({
+            "body": "",
+            "path": "/",
+            "method": "GET",
+            "headers": {},
+            "timeout": timeout_secs,
+            "image": image
+        })
+        .to_string()
+    }
+
+    async fn post_execution(
+        app: axum::Router,
+        runtime_id: &str,
+        payload: String,
+    ) -> axum::http::Response<Body> {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/runtimes/{}/executions", runtime_id))
+                .header("Authorization", "Bearer test-secret-key")
+                .header("Content-Type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Kill the runtime `times` times through the same path the events task
+    /// and the execution path use, restoring `running` in between as a Docker
+    /// restart would.
+    async fn crash(
+        registry: &RuntimeRegistry,
+        health: &RuntimeHealth,
+        name: &str,
+        exit_code: i64,
+        times: usize,
+    ) -> Vec<DeathOutcome> {
+        let mut outcomes = Vec::new();
+        for _ in 0..times {
+            registry.set_status(name, "running").await;
+            outcomes.push(
+                liveness::observe_death(registry, health, name, Some(exit_code))
+                    .await
+                    .expect("a running runtime that dies is recorded"),
+            );
+        }
+        outcomes
+    }
+
+    #[tokio::test]
+    async fn synthetic_die_event_marks_the_runtime_dead_without_docker() {
+        let event = bollard::models::EventMessage {
+            typ: Some(bollard::models::EventMessageTypeEnum::CONTAINER),
+            action: Some("die".to_string()),
+            actor: Some(bollard::models::EventActor {
+                id: Some("0123".to_string()),
+                attributes: Some(
+                    [
+                        ("name", "test-executor-events-die"),
+                        ("urt.managed", "true"),
+                        ("urt.executor_hostname", HOSTNAME),
+                        ("exitCode", "134"),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ),
+            }),
+            scope: None,
+            time: None,
+            time_nano: None,
+        };
+
+        let parsed = parse_container_event(&event, HOSTNAME).expect("managed die event parses");
+        assert_eq!(parsed.kind, ContainerEventKind::Die);
+        assert_eq!(parsed.exit_code, Some(134));
+
+        let registry = RuntimeRegistry::new();
+        let health = RuntimeHealth::default();
+        registry
+            .insert(listening_runtime("events-die"))
+            .await
+            .unwrap();
+
+        let outcome = liveness::observe_death(&registry, &health, &parsed.name, parsed.exit_code)
+            .await
+            .expect("first death is recorded");
+        assert!(matches!(
+            outcome,
+            DeathOutcome::Recorded {
+                deaths_in_window: 1,
+                restart_delay
+            } if restart_delay == Duration::from_secs(1)
+        ));
+
+        let entry = registry.get(&parsed.name).await.unwrap();
+        assert_eq!(entry.status, "exited");
+        assert!(!entry.is_listening(), "a dead runtime must be probed again");
+        assert_eq!(entry.last_exit_code, Some(134));
+
+        // The same death observed a second time (events task and execution
+        // path both saw it) is not counted twice.
+        assert!(
+            liveness::observe_death(&registry, &health, &parsed.name, Some(134))
+                .await
+                .is_none()
+        );
+        assert_eq!(health.deaths(&parsed.name).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn three_deaths_quarantine_the_entry_and_backoff_grows() {
+        let registry = RuntimeRegistry::new();
+        let health = RuntimeHealth::default();
+        let name = format!("{}-crash-loop", HOSTNAME);
+        registry
+            .insert(listening_runtime("crash-loop"))
+            .await
+            .unwrap();
+
+        let outcomes = crash(&registry, &health, &name, 134, 3).await;
+        assert!(matches!(
+            outcomes[0],
+            DeathOutcome::Recorded { restart_delay, .. } if restart_delay == Duration::from_secs(1)
+        ));
+        assert!(matches!(
+            outcomes[1],
+            DeathOutcome::Recorded { restart_delay, .. } if restart_delay == Duration::from_secs(2)
+        ));
+        let DeathOutcome::Quarantined(detail) = &outcomes[2] else {
+            panic!(
+                "third death within the window must quarantine, got {:?}",
+                outcomes[2]
+            );
+        };
+        assert_eq!(detail.deaths, 3);
+        assert_eq!(detail.last_exit_code, Some(134));
+
+        let entry = registry.get(&name).await.unwrap();
+        assert!(entry.is_quarantined());
+        assert_eq!(entry.status, "quarantined");
+        assert!(entry.quarantined_until.is_some());
+        assert_eq!(entry.last_exit_code, Some(134));
+        assert!(health.active_quarantine(&name).is_some());
+        assert!(
+            health.restart_wait(&name) >= Duration::from_millis(3_900),
+            "the third death carries a 4s recreate backoff"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quarantine_expires_and_the_entry_is_released() {
+        let registry = RuntimeRegistry::new();
+        let health = RuntimeHealth::new(CrashLoopConfig {
+            quarantine: Duration::from_secs(300),
+            ..CrashLoopConfig::default()
+        });
+        let name = format!("{}-expiring", HOSTNAME);
+        registry
+            .insert(listening_runtime("expiring"))
+            .await
+            .unwrap();
+
+        crash(&registry, &health, &name, 137, 3).await;
+        assert!(registry.get(&name).await.unwrap().is_quarantined());
+
+        tokio::time::advance(Duration::from_secs(299)).await;
+        assert!(matches!(
+            health.quarantine_state(&name),
+            QuarantineState::Active(_)
+        ));
+        assert_eq!(
+            liveness::sweep_expired_quarantines(&registry, &health).await,
+            0
+        );
+        assert!(registry.exists(&name).await);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            liveness::sweep_expired_quarantines(&registry, &health).await,
+            1
+        );
+        assert!(
+            !registry.exists(&name).await,
+            "an expired quarantine releases the registry entry"
+        );
+        assert_eq!(health.quarantine_state(&name), QuarantineState::None);
+        assert_eq!(health.restart_wait(&name), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn execution_fails_fast_while_the_runtime_is_marked_unreachable() {
+        require_docker!(state);
+
+        let runtime_id = "unreachable-marked";
+        let full_name = format!("{}-{}", HOSTNAME, runtime_id);
+        state
+            .registry
+            .insert(listening_runtime(runtime_id))
+            .await
+            .unwrap();
+        state
+            .health
+            .mark_unreachable(&full_name, Duration::from_secs(10));
+
+        let app = create_router(state);
+        let start = Instant::now();
+        let response = post_execution(app, runtime_id, exec_payload(15, "")).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a marked runtime must fail without dialling, took {:?}",
+            elapsed
+        );
+        let body = parse_json_body(response.into_body()).await;
+        assert_eq!(body["type"], "runtime_unreachable");
+        assert_eq!(body["code"], 503);
+    }
+
+    #[tokio::test]
+    async fn execution_against_a_dead_runtime_drops_the_entry_fast() {
+        require_docker!(state);
+
+        let runtime_id = "dead-no-image";
+        let full_name = format!("{}-{}", HOSTNAME, runtime_id);
+        state
+            .registry
+            .insert(listening_runtime(runtime_id))
+            .await
+            .unwrap();
+
+        let registry = state.registry.clone();
+        let app = create_router(state);
+        let start = Instant::now();
+        let response = post_execution(app, runtime_id, exec_payload(15, "")).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "without an image a dead runtime is reported gone"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the request must not burn the full connect timeout twice, took {:?}",
+            elapsed
+        );
+        assert!(
+            !registry.exists(&full_name).await,
+            "the stale entry must be removed so the next create is not refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_runtime_is_recreated_on_the_fly_when_an_image_is_supplied() {
+        require_docker!(state);
+
+        let runtime_id = format!("dead-recreate-{}", uuid::Uuid::new_v4().simple());
+        let full_name = format!("{}-{}", HOSTNAME, runtime_id);
+        state
+            .registry
+            .insert(listening_runtime(&runtime_id))
+            .await
+            .unwrap();
+
+        let registry = state.registry.clone();
+        let docker = state.docker.clone();
+        let app = create_router(state);
+        let response = post_execution(app, &runtime_id, exec_payload(20, "alpine:latest")).await;
+
+        // alpine never listens on 3000, so the execution itself cannot
+        // succeed; what matters is that the create ran.
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "with an image the dead runtime must be recreated rather than reported gone"
+        );
+        let recreated = registry.get(&full_name).await;
+        assert!(
+            recreated.as_ref().is_some_and(|rt| !rt.is_quarantined()),
+            "a fresh entry must exist after the on-the-fly create, got {:?}",
+            recreated
+        );
+        assert!(
+            docker.inspect_container(&full_name).await.is_ok(),
+            "the recreated container must exist"
+        );
+
+        docker.remove_container(&full_name, true).await.ok();
+        registry.remove(&full_name).await;
+        tokio::fs::remove_dir_all(std::env::temp_dir().join(&full_name))
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn quarantined_runtime_returns_503_on_execute_and_409_on_create() {
+        require_docker!(state);
+
+        let runtime_id = "quarantined-rt";
+        let full_name = format!("{}-{}", HOSTNAME, runtime_id);
+        state
+            .registry
+            .insert(listening_runtime(runtime_id))
+            .await
+            .unwrap();
+        crash(&state.registry, &state.health, &full_name, 134, 3).await;
+
+        let app = create_router(state.clone());
+        let response = post_execution(app, runtime_id, exec_payload(15, "")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("quarantine responses carry Retry-After");
+        assert!(retry_after > 0 && retry_after <= 300);
+        let body = parse_json_body(response.into_body()).await;
+        assert_eq!(body["type"], "runtime_quarantined");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("exit code 134"), "{}", message);
+        assert!(message.contains("expires at"), "{}", message);
+
+        // An execution that carries an image must not recreate it either.
+        let app = create_router(state.clone());
+        let response = post_execution(app, runtime_id, exec_payload(15, "alpine:latest")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let create = serde_json::json!({
+            "runtimeId": runtime_id,
+            "image": "alpine:latest",
+            "version": "v5"
+        });
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(create.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = parse_json_body(response.into_body()).await;
+        assert_eq!(body["type"], "runtime_quarantined");
+        assert!(body["message"].as_str().unwrap().contains("exit code 134"));
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/runtimes")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed = parse_json_body(response.into_body()).await;
+        let entry = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rt| rt["name"] == full_name)
+            .expect("quarantined runtime stays visible in GET /v1/runtimes");
+        assert_eq!(entry["status"], "quarantined");
+        assert_eq!(entry["last_exit_code"], 134);
+
+        state.registry.remove(&full_name).await;
+    }
+
+    #[tokio::test]
+    async fn synthetic_die_event_removes_a_runtime_whose_container_is_gone() {
+        require_docker!(state);
+
+        let runtime_id = "events-removed";
+        let full_name = format!("{}-{}", HOSTNAME, runtime_id);
+        state
+            .registry
+            .insert(listening_runtime(runtime_id))
+            .await
+            .unwrap();
+
+        let mut oom = OomTracker::default();
+        let disposition = apply_container_event(
+            &state,
+            &mut oom,
+            ContainerEvent {
+                kind: ContainerEventKind::Die,
+                name: full_name.clone(),
+                exit_code: Some(137),
+            },
+        )
+        .await;
+
+        assert_eq!(disposition, EventDisposition::Death(DeathHandling::Removed));
+        assert!(
+            !state.registry.exists(&full_name).await,
+            "a runtime with no container and no restart policy is dropped"
+        );
+        assert_eq!(state.health.deaths(&full_name).len(), 1);
+        assert_eq!(state.health.deaths(&full_name)[0].exit_code, Some(137));
+
+        // A second die for the same name, now untracked, is ignored.
+        let disposition = apply_container_event(
+            &state,
+            &mut oom,
+            ContainerEvent {
+                kind: ContainerEventKind::Die,
+                name: full_name.clone(),
+                exit_code: Some(137),
+            },
+        )
+        .await;
+        assert!(matches!(
+            disposition,
+            EventDisposition::Death(DeathHandling::Ignored(_))
+        ));
+    }
+
+    #[test]
+    fn crash_loop_config_knobs_are_parsed() {
+        use urt_executor::config::ExecutorConfig;
+
+        let defaults = test_config();
+        assert!(!defaults.docker_events);
+        assert_eq!(defaults.restart_backoff_max_secs, 30);
+        assert_eq!(defaults.crash_loop_threshold, 3);
+        assert_eq!(defaults.crash_loop_window_secs, 60);
+        assert_eq!(defaults.quarantine_secs, 300);
+
+        // SAFETY: single-threaded test; no concurrent env mutation.
+        unsafe {
+            std::env::set_var("URT_DOCKER_EVENTS", "false");
+            std::env::set_var("URT_RESTART_BACKOFF_MAX_SECS", "12");
+            std::env::set_var("URT_CRASH_LOOP_THRESHOLD", "5");
+            std::env::set_var("URT_CRASH_LOOP_WINDOW_SECS", "90");
+            std::env::set_var("URT_QUARANTINE_SECS", "45");
+        }
+        let from_env = ExecutorConfig::from_env();
+        unsafe {
+            std::env::remove_var("URT_DOCKER_EVENTS");
+            std::env::remove_var("URT_RESTART_BACKOFF_MAX_SECS");
+            std::env::remove_var("URT_CRASH_LOOP_THRESHOLD");
+            std::env::remove_var("URT_CRASH_LOOP_WINDOW_SECS");
+            std::env::remove_var("URT_QUARANTINE_SECS");
+        }
+
+        assert!(!from_env.docker_events);
+        assert_eq!(from_env.restart_backoff_max_secs, 12);
+        assert_eq!(from_env.crash_loop_threshold, 5);
+        assert_eq!(from_env.crash_loop_window_secs, 90);
+        assert_eq!(from_env.quarantine_secs, 45);
+
+        let fresh = ExecutorConfig::from_env();
+        assert!(fresh.docker_events, "events subscription is on by default");
     }
 }

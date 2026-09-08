@@ -79,6 +79,9 @@ pub struct ExecutorMetrics {
     network_attach_failures_total: IntCounterVec,
     readiness_wait_seconds: HistogramVec,
     readiness_timeout_total: IntCounter,
+    runtime_deaths_total: IntCounterVec,
+    runtime_quarantined_total: IntCounter,
+    runtime_unreachable_total: IntCounter,
 }
 
 impl ExecutorMetrics {
@@ -338,6 +341,28 @@ impl ExecutorMetrics {
         )
         .expect("failed to register readiness_timeout_total");
 
+        let runtime_deaths_total = Self::register_int_counter_vec(
+            &registry,
+            "urt_runtime_deaths_total",
+            "Runtime container deaths observed, by exit code",
+            &["exit_code"],
+        )
+        .expect("failed to register runtime_deaths_total");
+
+        let runtime_quarantined_total = Self::register_int_counter(
+            &registry,
+            "urt_runtime_quarantined_total",
+            "Runtimes placed in crash-loop quarantine",
+        )
+        .expect("failed to register runtime_quarantined_total");
+
+        let runtime_unreachable_total = Self::register_int_counter(
+            &registry,
+            "urt_runtime_unreachable_total",
+            "Executions that could not connect to their runtime",
+        )
+        .expect("failed to register runtime_unreachable_total");
+
         Self {
             registry,
             runtimes_total,
@@ -366,7 +391,27 @@ impl ExecutorMetrics {
             network_attach_failures_total,
             readiness_wait_seconds,
             readiness_timeout_total,
+            runtime_deaths_total,
+            runtime_quarantined_total,
+            runtime_unreachable_total,
         }
+    }
+
+    pub fn inc_runtime_death(&self, exit_code: Option<i64>) {
+        let label = exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        self.runtime_deaths_total
+            .with_label_values(&[label.as_str()])
+            .inc();
+    }
+
+    pub fn inc_runtime_quarantined(&self) {
+        self.runtime_quarantined_total.inc();
+    }
+
+    pub fn inc_runtime_unreachable(&self) {
+        self.runtime_unreachable_total.inc();
     }
 
     pub fn set_runtime_counts(&self, total: i64, running: i64, pending: i64, listening: i64) {

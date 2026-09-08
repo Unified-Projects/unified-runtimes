@@ -168,6 +168,11 @@ mod tests {
             labels,
             env: HashMap::new(),
             hostname: String::new(),
+            exit_code: None,
+            oom_killed: false,
+            restart_policy: String::new(),
+            restart_max_retries: 0,
+            restart_count: 0,
         }
     }
 

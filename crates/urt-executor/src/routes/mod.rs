@@ -15,7 +15,8 @@ use crate::middleware::{
     auth::auth_middleware, request_context_middleware, security_headers_middleware,
 };
 use crate::runtime::{
-    AdoptionNegativeCache, CreateTracker, KeepAliveRegistry, RuntimeConcurrency, RuntimeRegistry,
+    AdoptionNegativeCache, CreateTracker, KeepAliveRegistry, RuntimeConcurrency, RuntimeHealth,
+    RuntimeRegistry,
 };
 use crate::storage::Storage;
 use axum::{
@@ -58,6 +59,9 @@ pub struct AppState {
     /// Container names a recent adoption attempt did not find. Keeps a scan over
     /// unknown runtime IDs from costing one Docker inspect per request.
     pub adoption_negative_cache: AdoptionNegativeCache,
+    /// Death history, restart backoff, quarantine and unreachable markers per
+    /// runtime, shared with the Docker events task and maintenance.
+    pub health: RuntimeHealth,
 }
 
 impl AppState {

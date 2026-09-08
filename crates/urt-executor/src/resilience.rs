@@ -34,23 +34,13 @@ fn storage_response_status(message: &str) -> Option<u16> {
 
 pub fn is_transient_error(error: &ExecutorError) -> bool {
     match error {
-        ExecutorError::Network(message) => contains_any(
-            message,
-            &[
-                "timed out",
-                "timeout",
-                "connection reset",
-                "connection refused",
-                "temporarily unavailable",
-                "broken pipe",
-                "eof",
-                "tls",
-                "502",
-                "503",
-                "504",
-                "429",
-            ],
-        ),
+        // A dial that never completed sent nothing, so repeating it is safe.
+        ExecutorError::RuntimeUnreachable { .. } => true,
+        // Anything that failed after the request went out may already have run
+        // the function once; it is never repeated.
+        ExecutorError::RuntimeConnectionFailed { .. }
+        | ExecutorError::ExecutionTimeout
+        | ExecutorError::Network(_) => false,
         ExecutorError::Storage(message) => {
             if let Some(status) = storage_response_status(message) {
                 // A status is authoritative: server faults and throttling are
@@ -174,9 +164,28 @@ mod tests {
     }
 
     #[test]
-    fn test_network_timeout_is_retryable() {
+    fn test_network_errors_are_not_classified_by_their_text() {
         let err = ExecutorError::Network("connection reset by peer".to_string());
-        assert!(is_transient_error(&err));
+        assert!(!is_transient_error(&err));
+        let err = ExecutorError::Network(
+            "error sending request for url (http://exc1-fn-503:3000/)".to_string(),
+        );
+        assert!(!is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_only_connect_phase_runtime_failures_are_retryable() {
+        assert!(is_transient_error(&ExecutorError::RuntimeUnreachable {
+            runtime: "exc1-fn-503".to_string(),
+            cause: "connection refused".to_string(),
+        }));
+        assert!(!is_transient_error(
+            &ExecutorError::RuntimeConnectionFailed {
+                runtime: "exc1-fn-503".to_string(),
+                cause: "connection reset".to_string(),
+            }
+        ));
+        assert!(!is_transient_error(&ExecutorError::ExecutionTimeout));
     }
 
     #[test]
@@ -250,7 +259,7 @@ mod tests {
             attempts += 1;
             async move {
                 if attempts < 2 {
-                    Err(ExecutorError::Network("timeout".to_string()))
+                    Err(ExecutorError::Docker("i/o timeout".to_string()))
                 } else {
                     Ok(42)
                 }

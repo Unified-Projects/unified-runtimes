@@ -15,9 +15,10 @@
 //! function that is returning errors.
 
 use crate::docker::DockerManager;
+use crate::runtime::liveness::{release_runtime, OnContainerFailure, RuntimeTeardown};
 use crate::runtime::{
-    is_runtime_listening, KeepAliveRegistry, Runtime, RuntimeConcurrency, RuntimeRegistry,
-    RUNTIME_PORT,
+    is_runtime_listening, KeepAliveRegistry, Runtime, RuntimeConcurrency, RuntimeHealth,
+    RuntimeRegistry, RUNTIME_PORT,
 };
 use futures_util::stream::{self, StreamExt};
 use std::collections::HashSet;
@@ -46,6 +47,11 @@ pub struct ListeningWatchHandles {
     pub registry: RuntimeRegistry,
     pub keep_alive_registry: KeepAliveRegistry,
     pub runtime_concurrency: RuntimeConcurrency,
+    /// Readiness notifiers, so reaping a failed runtime wakes anyone parked on
+    /// it instead of leaving them to their own deadlines.
+    pub readiness: Arc<dashmap::DashMap<String, Arc<tokio::sync::Notify>>>,
+    /// Health markers, cleared alongside the entry.
+    pub health: RuntimeHealth,
 }
 
 /// Worth probing: up, not pending, not failed, and not yet known to listen.
@@ -129,12 +135,9 @@ pub async fn sweep_listening_state(registry: &RuntimeRegistry) -> Vec<String> {
 /// containers, so the next request for that runtime ID builds a fresh one.
 ///
 /// Returns the number removed.
-pub async fn reap_failed_runtimes(
-    docker: &DockerManager,
-    registry: &RuntimeRegistry,
-    keep_alive_registry: &KeepAliveRegistry,
-) -> usize {
-    let failed: Vec<Runtime> = registry
+pub async fn reap_failed_runtimes(targets: &RuntimeTeardown<'_>) -> usize {
+    let failed: Vec<Runtime> = targets
+        .registry
         .list()
         .await
         .into_iter()
@@ -149,34 +152,12 @@ pub async fn reap_failed_runtimes(
             runtime.name, RUNTIME_PORT
         );
 
-        match docker.remove_container(&runtime.name, true).await {
-            Ok(_) | Err(crate::error::ExecutorError::RuntimeNotFound) => {}
-            Err(e) => {
-                warn!(
-                    "Failed to remove container for failed runtime {}: {}",
-                    runtime.name, e
-                );
-                // Leave the entry in place; the next cycle tries again rather
-                // than losing track of a container that is still there.
-                continue;
-            }
+        // The same teardown the execution path uses for a dead runtime, so a
+        // failed one releases its keep-alive ownership, readiness waiters,
+        // working directory and health markers alongside its container.
+        if release_runtime(targets, &runtime.name, true, OnContainerFailure::Retain).await {
+            reaped += 1;
         }
-
-        if let Some(ref ka_id) = runtime.keep_alive_id {
-            keep_alive_registry.unregister(ka_id, &runtime.name);
-        }
-
-        registry.remove(&runtime.name).await;
-
-        let tmp_folder = crate::platform::temp_dir().join(&runtime.name);
-        if let Err(e) = tokio::fs::remove_dir_all(&tmp_folder).await {
-            debug!(
-                "No temp directory removed for failed runtime {}: {}",
-                runtime.name, e
-            );
-        }
-
-        reaped += 1;
     }
 
     reaped
@@ -192,7 +173,17 @@ pub async fn run_listening_watch(
         registry,
         keep_alive_registry,
         runtime_concurrency,
+        readiness,
+        health,
     } = handles;
+
+    let teardown = RuntimeTeardown {
+        docker: &docker,
+        registry: &registry,
+        keep_alive_registry: &keep_alive_registry,
+        readiness: &readiness,
+        health: &health,
+    };
 
     debug!(
         "Starting listening watchdog (scan interval: {}s)",
@@ -210,7 +201,7 @@ pub async fn run_listening_watch(
             _ = tokio::time::sleep(SCAN_INTERVAL) => {
                 // Reap before sweeping, so a runtime marked failed on the last
                 // cycle is visible as failed for one full cycle before it goes.
-                reap_failed_runtimes(&docker, &registry, &keep_alive_registry).await;
+                reap_failed_runtimes(&teardown).await;
                 sweep_listening_state(&registry).await;
 
                 let live: HashSet<String> = registry

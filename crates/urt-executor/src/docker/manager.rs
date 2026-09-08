@@ -3,7 +3,7 @@
 #![allow(deprecated)]
 
 use super::build::{build_image, BuildRequest, BuildResult};
-use super::container::{belongs_to_executor, ContainerConfig, ContainerInfo};
+use super::container::{belongs_to_executor, ContainerConfig, ContainerInfo, RestartPolicySpec};
 use super::exec::{exec_bash, exec_shell, ExecResult};
 use super::network::{connect_container, ensure_network};
 use super::self_container;
@@ -18,10 +18,12 @@ use bollard::query_parameters::{
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::Docker;
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
@@ -63,27 +65,39 @@ fn container_info(summary: bollard::models::ContainerSummary) -> ContainerInfo {
         labels: summary.labels.unwrap_or_default(),
         env: HashMap::new(),
         hostname: String::new(),
+        exit_code: None,
+        oom_killed: false,
+        restart_policy: String::new(),
+        restart_max_retries: 0,
+        restart_count: 0,
     }
 }
 
-fn restart_policy_for(policy: &str) -> Option<RestartPolicy> {
-    let name = match policy {
-        "always" => RestartPolicyNameEnum::ALWAYS,
-        "on-failure" => {
-            return Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::ON_FAILURE),
-                maximum_retry_count: Some(3),
-            })
-        }
-        "unless-stopped" => RestartPolicyNameEnum::UNLESS_STOPPED,
-        _ => RestartPolicyNameEnum::NO,
-    };
-
-    Some(RestartPolicy {
-        name: Some(name),
-        maximum_retry_count: None,
-    })
+/// Translate a `restartPolicy` request value into the Docker host config form.
+fn docker_restart_policy(value: &str) -> RestartPolicy {
+    match RestartPolicySpec::parse(value) {
+        RestartPolicySpec::Always => RestartPolicy {
+            name: Some(RestartPolicyNameEnum::ALWAYS),
+            maximum_retry_count: None,
+        },
+        RestartPolicySpec::UnlessStopped => RestartPolicy {
+            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+            maximum_retry_count: None,
+        },
+        RestartPolicySpec::OnFailure(max_retries) => RestartPolicy {
+            name: Some(RestartPolicyNameEnum::ON_FAILURE),
+            maximum_retry_count: max_retries.map(i64::from),
+        },
+        RestartPolicySpec::No => RestartPolicy {
+            name: Some(RestartPolicyNameEnum::NO),
+            maximum_retry_count: None,
+        },
+    }
 }
+
+/// How long a deliberate stop or removal is remembered so the Docker events
+/// task can tell it from a crash.
+const DELIBERATE_REMOVAL_TTL: Duration = Duration::from_secs(60);
 
 /// Host configuration for a runtime container: resource limits, mounts, the
 /// security hardening URT adds over executor-main, and the network the
@@ -99,7 +113,7 @@ fn build_host_config(container_config: &ContainerConfig) -> HostConfig {
     HostConfig {
         memory: Some(container_config.memory as i64),
         nano_cpus: Some((container_config.cpus * 1_000_000_000.0) as i64),
-        restart_policy: restart_policy_for(&container_config.restart_policy),
+        restart_policy: Some(docker_restart_policy(&container_config.restart_policy)),
         network_mode: container_config.network.clone(),
         binds: Some(
             container_config
@@ -171,9 +185,35 @@ pub struct DockerManager {
     config: ExecutorConfig,
     stats_cache: StatsCache,
     pull_semaphore: Arc<Semaphore>,
+    /// Containers this executor has stopped or removed on purpose, with the
+    /// time the operation was issued. Consulted by the Docker events task so a
+    /// `die` caused by our own `stop` or `rm` is not counted as a crash.
+    deliberate_removals: Arc<DashMap<String, Instant>>,
 }
 
 impl DockerManager {
+    /// Remember that `name` is being stopped or removed by this executor.
+    fn note_deliberate_removal(&self, name: &str) {
+        let now = Instant::now();
+        self.deliberate_removals
+            .retain(|_, issued| now.duration_since(*issued) < DELIBERATE_REMOVAL_TTL);
+        self.deliberate_removals.insert(name.to_string(), now);
+    }
+
+    /// Whether a stop or removal of `name` was issued by this executor within
+    /// the last minute.
+    pub fn was_removed_deliberately(&self, name: &str) -> bool {
+        self.deliberate_removals
+            .get(name)
+            .map(|issued| issued.elapsed() < DELIBERATE_REMOVAL_TTL)
+            .unwrap_or(false)
+    }
+
+    /// Raw bollard client, for callers that stream from the daemon directly.
+    pub fn client(&self) -> &Docker {
+        &self.docker
+    }
+
     async fn create_container_inner(
         &self,
         options: CreateContainerOptions,
@@ -252,6 +292,7 @@ impl DockerManager {
             config,
             stats_cache: StatsCache::new(),
             pull_semaphore: Arc::new(Semaphore::new(4)), // Max 4 concurrent pulls
+            deliberate_removals: Arc::new(DashMap::new()),
         })
     }
 
@@ -442,6 +483,7 @@ impl DockerManager {
     /// Stop a container
     pub async fn stop_container(&self, name: &str, timeout_secs: i64) -> Result<()> {
         debug!("Stopping container: {}", name);
+        self.note_deliberate_removal(name);
 
         let options = StopContainerOptions {
             t: Some(timeout_secs as i32),
@@ -471,6 +513,7 @@ impl DockerManager {
     /// Remove a container
     pub async fn remove_container(&self, name: &str, force: bool) -> Result<()> {
         debug!("Removing container: {} (force={})", name, force);
+        self.note_deliberate_removal(name);
 
         let options = RemoveContainerOptions {
             force,
@@ -512,6 +555,10 @@ impl DockerManager {
 
         let config = info.config.unwrap_or_default();
         let state = info.state.unwrap_or_default();
+        let restart_policy = info
+            .host_config
+            .and_then(|host| host.restart_policy)
+            .unwrap_or_default();
 
         Ok(ContainerInfo {
             id: info.id.unwrap_or_default(),
@@ -531,6 +578,14 @@ impl DockerManager {
             labels: config.labels.unwrap_or_default(),
             env: parse_env_vars(config.env),
             hostname: config.hostname.unwrap_or_default(),
+            exit_code: state.exit_code,
+            oom_killed: state.oom_killed.unwrap_or(false),
+            restart_policy: restart_policy
+                .name
+                .map(|name| name.to_string())
+                .unwrap_or_default(),
+            restart_max_retries: restart_policy.maximum_retry_count.unwrap_or(0),
+            restart_count: info.restart_count.unwrap_or(0),
         })
     }
 
@@ -609,30 +664,35 @@ impl DockerManager {
     }
 }
 
-fn connect_to_docker() -> Result<Docker> {
-    // Only unix has a second candidate socket to push.
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut attempts: Vec<(
-        &'static str,
-        std::result::Result<Docker, bollard::errors::Error>,
-    )> = vec![("socket_defaults", Docker::connect_with_socket_defaults())];
+type ConnectAttempt = (
+    &'static str,
+    std::result::Result<Docker, bollard::errors::Error>,
+);
 
-    #[cfg(unix)]
-    {
-        use bollard::API_DEFAULT_VERSION;
-
-        if let Some(home) = std::env::var_os("HOME") {
-            let user_socket = Path::new(&home).join(".docker/run/docker.sock");
-            if user_socket.exists() {
-                if let Some(socket_path) = user_socket.to_str() {
-                    attempts.push((
-                        "user_socket",
-                        Docker::connect_with_unix(socket_path, 120, API_DEFAULT_VERSION),
-                    ));
-                }
-            }
-        }
+/// Docker Desktop and rootless installs expose a per-user socket.
+#[cfg(unix)]
+fn user_socket_attempt() -> Option<ConnectAttempt> {
+    let home = std::env::var_os("HOME")?;
+    let user_socket = Path::new(&home).join(".docker/run/docker.sock");
+    if !user_socket.exists() {
+        return None;
     }
+    let socket_path = user_socket.to_str()?;
+    Some((
+        "user_socket",
+        Docker::connect_with_unix(socket_path, 120, bollard::API_DEFAULT_VERSION),
+    ))
+}
+
+#[cfg(not(unix))]
+fn user_socket_attempt() -> Option<ConnectAttempt> {
+    None
+}
+
+fn connect_to_docker() -> Result<Docker> {
+    let mut attempts: Vec<ConnectAttempt> =
+        vec![("socket_defaults", Docker::connect_with_socket_defaults())];
+    attempts.extend(user_socket_attempt());
 
     let mut errors = Vec::new();
     for (label, attempt) in attempts {
@@ -656,10 +716,61 @@ impl std::fmt::Debug for DockerManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_create_body, build_host_config, is_missing_image_error, map_create_container_error,
+        build_create_body, build_host_config, docker_restart_policy, is_missing_image_error,
+        map_create_container_error,
     };
-    use crate::docker::container::ContainerConfig;
+    use crate::docker::container::{ContainerConfig, RestartPolicySpec};
     use crate::error::ExecutorError;
+    use bollard::models::RestartPolicyNameEnum;
+
+    #[test]
+    fn test_restart_policy_spec_parses_docker_spellings() {
+        assert_eq!(RestartPolicySpec::parse("no"), RestartPolicySpec::No);
+        assert_eq!(RestartPolicySpec::parse(""), RestartPolicySpec::No);
+        assert_eq!(
+            RestartPolicySpec::parse("always"),
+            RestartPolicySpec::Always
+        );
+        assert_eq!(
+            RestartPolicySpec::parse("unless-stopped"),
+            RestartPolicySpec::UnlessStopped
+        );
+        assert_eq!(
+            RestartPolicySpec::parse("on-failure"),
+            RestartPolicySpec::OnFailure(None)
+        );
+        assert_eq!(
+            RestartPolicySpec::parse("on-failure:3"),
+            RestartPolicySpec::OnFailure(Some(3))
+        );
+        assert_eq!(
+            RestartPolicySpec::parse(" On-Failure:5 "),
+            RestartPolicySpec::OnFailure(Some(5))
+        );
+        assert_eq!(
+            RestartPolicySpec::parse("on-failure:0"),
+            RestartPolicySpec::OnFailure(None)
+        );
+        assert_eq!(
+            RestartPolicySpec::parse("on-failure:x"),
+            RestartPolicySpec::No
+        );
+        assert_eq!(RestartPolicySpec::parse("sometimes"), RestartPolicySpec::No);
+    }
+
+    #[test]
+    fn test_docker_restart_policy_carries_retry_cap() {
+        let policy = docker_restart_policy("on-failure:3");
+        assert_eq!(policy.name, Some(RestartPolicyNameEnum::ON_FAILURE));
+        assert_eq!(policy.maximum_retry_count, Some(3));
+
+        let unlimited = docker_restart_policy("on-failure");
+        assert_eq!(unlimited.name, Some(RestartPolicyNameEnum::ON_FAILURE));
+        assert_eq!(unlimited.maximum_retry_count, None);
+
+        let none = docker_restart_policy("no");
+        assert_eq!(none.name, Some(RestartPolicyNameEnum::NO));
+    }
 
     #[test]
     fn test_host_config_creates_the_container_on_the_configured_network() {

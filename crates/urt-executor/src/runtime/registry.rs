@@ -12,13 +12,15 @@ use std::sync::Arc;
 /// would advertise a runtime that is still extracting code or running a build
 /// command. Only the create publishes its own entry.
 ///
-/// `failed` is the executor's verdict on a runtime that never listened, not a
-/// container state. Docker still reports that container as running, so applying
-/// the observation would resurrect the entry before the watchdog reaps it.
+/// `failed` is the executor's verdict on a runtime that never listened, and
+/// `quarantined` is its verdict on one that crash-looped. Neither is a container
+/// state, and Docker keeps reporting the container underneath them, so applying
+/// the observation would resurrect the entry before the watchdog reaps it or the
+/// quarantine expires.
 ///
 /// Returns whether the status was applied.
 fn apply_observed_status(runtime: &mut Runtime, observed_status: String) -> bool {
-    if runtime.is_pending() || runtime.is_failed() {
+    if runtime.is_pending() || runtime.is_failed() || runtime.is_quarantined() {
         return false;
     }
 
@@ -165,6 +167,77 @@ impl RuntimeRegistry {
         }
     }
 
+    /// Record that the container behind `name` has stopped: status, exit code
+    /// and the listening flag are updated so the next execution probes again.
+    ///
+    /// Returns the updated entry and whether it was `running` beforehand, so a
+    /// death observed twice (events task and execution path) is counted once.
+    pub async fn mark_dead(
+        &self,
+        name: &str,
+        status: &str,
+        exit_code: Option<i64>,
+    ) -> Option<(Runtime, bool)> {
+        self.runtimes.get_mut(name).map(|mut runtime| {
+            let was_running = runtime.is_running();
+            runtime.mark_dead(status, exit_code);
+            (runtime.clone(), was_running)
+        })
+    }
+
+    /// Overwrite the status of `name` without touching anything else.
+    pub async fn set_status(&self, name: &str, status: &str) -> Option<Runtime> {
+        self.runtimes.get_mut(name).map(|mut runtime| {
+            runtime.status = status.to_string();
+            runtime.clone()
+        })
+    }
+
+    /// Put `name` into quarantine until the given Unix timestamp.
+    pub async fn mark_quarantined(
+        &self,
+        name: &str,
+        until: f64,
+        exit_code: Option<i64>,
+    ) -> Option<Runtime> {
+        self.runtimes.get_mut(name).map(|mut runtime| {
+            runtime.mark_quarantined(until, exit_code);
+            runtime.clone()
+        })
+    }
+
+    /// Remove the entry for `name` only while it is quarantined.
+    pub async fn remove_if_quarantined(&self, name: &str) -> Option<Runtime> {
+        self.runtimes
+            .remove_if(name, |_, runtime| runtime.is_quarantined())
+            .map(|(_, runtime)| runtime)
+    }
+
+    /// Apply a fresh Docker inspect result to the entry for `name`.
+    ///
+    /// A container that is not running loses its listening flag, and a rising
+    /// restart count is carried over so callers can tell that Docker restarted
+    /// it since the last sync. Returns the updated entry.
+    pub fn apply_container_state(
+        &self,
+        name: &str,
+        info: &crate::docker::container::ContainerInfo,
+    ) -> Option<Runtime> {
+        self.runtimes.get_mut(name).map(|mut runtime| {
+            if !apply_observed_status(&mut runtime, info.state.clone()) {
+                return runtime.clone();
+            }
+            runtime.restart_count = info.restart_count;
+            if !info.state.eq_ignore_ascii_case("running") {
+                runtime.listening = 0;
+                if info.exit_code.is_some() {
+                    runtime.last_exit_code = info.exit_code;
+                }
+            }
+            runtime.clone()
+        })
+    }
+
     /// Sync container status from Docker
     /// Updates the runtime status based on current Docker container state
     /// Returns the updated runtime if found, None otherwise
@@ -177,34 +250,29 @@ impl RuntimeRegistry {
             return None;
         }
 
-        // Clone the current entry so we do not hold a DashMap shard lock across
-        // the async Docker inspect call (H2).
-        let _exists = self.runtimes.contains_key(name);
-
+        // The Docker inspect runs without any DashMap shard lock held; write
+        // access is re-acquired only for the mutation afterwards.
         match docker.inspect_container(name).await {
-            Ok(info) => {
-                // Re-acquire write access only for the mutation; the async work is done.
-                if let Some(mut runtime) = self.runtimes.get_mut(name) {
-                    apply_observed_status(&mut runtime, info.state);
-                    return Some(runtime.clone());
-                }
-                None
-            }
+            // Re-acquire write access only for the mutation; the async work is done.
+            Ok(info) => self.apply_container_state(name, &info),
             Err(ExecutorError::RuntimeNotFound) => {
-                // Read current state without holding across an await.
-                let is_pending = self
+                // Pending entries belong to a create that is still running and
+                // quarantined entries are kept as a visible record until the
+                // quarantine expires; neither is dropped because the container
+                // is absent.
+                let keep = self
                     .runtimes
                     .get(name)
-                    .map(|r| r.is_pending())
+                    .map(|r| r.is_pending() || r.is_quarantined())
                     .unwrap_or(false);
-                if is_pending {
+                if keep {
                     return self.runtimes.get(name).map(|r| r.clone());
                 }
-                // Container was removed outside the registry — atomically remove the
-                // stale metadata entry only when it is not pending.  remove_if closes
-                // the TOCTOU window that existed with the previous drop+re-check+remove
-                // sequence.
-                self.runtimes.remove_if(name, |_, r| !r.is_pending());
+                // Container was removed outside the registry: drop the stale
+                // metadata entry atomically so a concurrent state change cannot
+                // slip between the check and the removal.
+                self.runtimes
+                    .remove_if(name, |_, r| !r.is_pending() && !r.is_quarantined());
                 None
             }
             Err(_) => self.runtimes.get(name).map(|r| r.clone()),
@@ -408,6 +476,77 @@ mod tests {
 
         assert_eq!(idle_names, vec![impatient_name.as_str()]);
         assert!(!idle_names.contains(&patient_name.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_and_apply_container_state() {
+        use crate::docker::container::ContainerInfo;
+        use std::collections::HashMap;
+
+        let registry = RuntimeRegistry::new();
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        rt.set_listening();
+        let name = rt.name.clone();
+        registry.insert(rt).await.unwrap();
+
+        let (dead, was_running) = registry
+            .mark_dead(&name, "exited", Some(134))
+            .await
+            .unwrap();
+        assert!(was_running);
+        assert_eq!(dead.status, "exited");
+        assert!(!dead.is_listening());
+        assert_eq!(dead.last_exit_code, Some(134));
+
+        // A second observer of the same death sees no transition.
+        let (_, was_running) = registry
+            .mark_dead(&name, "exited", Some(134))
+            .await
+            .unwrap();
+        assert!(!was_running);
+
+        let info = ContainerInfo {
+            id: "id".to_string(),
+            name: name.clone(),
+            image: "img".to_string(),
+            state: "running".to_string(),
+            status: "running".to_string(),
+            created: 1,
+            labels: HashMap::new(),
+            env: HashMap::new(),
+            hostname: String::new(),
+            exit_code: Some(0),
+            oom_killed: false,
+            restart_policy: "on-failure".to_string(),
+            restart_max_retries: 3,
+            restart_count: 2,
+        };
+        let synced = registry.apply_container_state(&name, &info).unwrap();
+        assert_eq!(synced.status, "running");
+        assert_eq!(synced.restart_count, 2);
+        // A restarted container is not assumed to be listening again.
+        assert!(!synced.is_listening());
+        assert_eq!(synced.last_exit_code, Some(134));
+    }
+
+    #[tokio::test]
+    async fn test_quarantined_entries_survive_state_sync_and_removal_guard() {
+        let registry = RuntimeRegistry::new();
+        let rt = Runtime::new("test", "exec", "img", "v5", None);
+        let name = rt.name.clone();
+        registry.insert(rt).await.unwrap();
+
+        let quarantined = registry
+            .mark_quarantined(&name, 1_800_000_000.0, Some(137))
+            .await
+            .unwrap();
+        assert!(quarantined.is_quarantined());
+
+        assert!(registry.remove_if_quarantined("exec-other").await.is_none());
+        let removed = registry.remove_if_quarantined(&name).await.unwrap();
+        assert_eq!(removed.last_exit_code, Some(137));
+        assert!(!registry.exists(&name).await);
     }
 
     #[tokio::test]
