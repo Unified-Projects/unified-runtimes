@@ -7,6 +7,59 @@ pub fn temp_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
+/// Remove the Windows verbatim (`\\?\`) prefix that `canonicalize` returns.
+///
+/// The Docker daemon parses a bind-mount source itself and rejects a verbatim
+/// path, so the canonical form has to be reduced to the ordinary one before it
+/// is handed over. The prefix is kept when dropping it would change what the
+/// path refers to: a path at or over the legacy 260-character limit, or one
+/// whose components end in a dot or a space, is only addressable in verbatim
+/// form.
+#[cfg(windows)]
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+
+    let root = match prefix.kind() {
+        Prefix::VerbatimDisk(letter) => format!("{}:\\", letter as char),
+        Prefix::VerbatimUNC(server, share) => format!(
+            "\\\\{}\\{}\\",
+            server.to_string_lossy(),
+            share.to_string_lossy()
+        ),
+        _ => return path,
+    };
+
+    let mut plain = PathBuf::from(root);
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            other => {
+                let text = other.as_os_str().to_string_lossy();
+                if text.ends_with('.') || text.ends_with(' ') {
+                    return path;
+                }
+                plain.push(other.as_os_str());
+            }
+        }
+    }
+
+    if plain.as_os_str().len() >= 260 {
+        return path;
+    }
+
+    plain
+}
+
+#[cfg(not(windows))]
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
+}
+
 /// Set directory permissions to 0o777 (Unix) or no-op (Windows)
 #[cfg(unix)]
 pub async fn set_permissions_open(path: &std::path::Path) -> std::io::Result<()> {
@@ -42,6 +95,48 @@ pub async fn set_permissions_recursive(path: &std::path::Path) -> std::io::Resul
 #[cfg(not(unix))]
 pub async fn set_permissions_recursive(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod verbatim_prefix_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_disk_path_loses_its_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\runner\Temp\exc1-fn")),
+            PathBuf::from(r"C:\Users\runner\Temp\exc1-fn")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_path_that_is_already_plain_is_returned_as_is() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\Users\runner\Temp\exc1-fn")),
+            PathBuf::from(r"C:\Users\runner\Temp\exc1-fn")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_path_over_the_legacy_limit_keeps_its_prefix() {
+        let long = format!(r"\\?\C:\{}", "segment\\".repeat(40));
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(&long)),
+            PathBuf::from(&long)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_paths_are_untouched() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from("/tmp/exc1-fn")),
+            PathBuf::from("/tmp/exc1-fn")
+        );
+    }
 }
 
 // These tests assert Unix mode bits, which do not exist on other platforms.

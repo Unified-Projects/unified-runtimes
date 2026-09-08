@@ -334,8 +334,15 @@ pub(crate) async fn resolve_runtime_with_readiness(
             .ok_or(ExecutorError::RuntimeNotFound);
     }
 
+    // A name a recent attempt did not find is answered from memory: the
+    // inspect that follows is one Docker call per request, and a scan over
+    // unknown IDs would otherwise put all of it on the daemon.
+    if state.adoption_negative_cache.is_absent(full_name) {
+        return Err(ExecutorError::RuntimeNotFound);
+    }
+
     // Attempt on-demand re-adoption (Fix F: only when adopt=true).
-    let _ = crate::tasks::adopt_container_by_name(
+    let adopted = crate::tasks::adopt_container_by_name(
         &state.docker,
         &state.registry,
         &state.keep_alive_registry,
@@ -343,6 +350,12 @@ pub(crate) async fn resolve_runtime_with_readiness(
         full_name,
     )
     .await;
+
+    if adopted {
+        state.adoption_negative_cache.forget(full_name);
+    } else {
+        state.adoption_negative_cache.record_absent(full_name);
+    }
 
     if let Some(runtime) = state.registry.get(full_name).await {
         if runtime.is_pending() {

@@ -132,6 +132,7 @@ fn test_config(network: String) -> ExecutorConfig {
         warmup_required: false,
         pending_wait_max_secs: 60,
         pending_max_age_secs: 300,
+        adoption_negative_cache_ms: 2000,
     }
 }
 
@@ -348,6 +349,9 @@ async fn create_test_server_with(
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
+        adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
+            std::time::Duration::from_millis(2000),
+        ),
     };
 
     // Bind to random available port
@@ -1481,6 +1485,9 @@ async fn create_test_server_with_s3(s3_dsn: &str) -> TestServer {
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
+        adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
+            std::time::Duration::from_millis(2000),
+        ),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1748,19 +1755,19 @@ async fn test_s3_provider_factory_methods() {
     assert!(s3.is_ok(), "S3 factory should succeed with valid config");
 
     // Test DO Spaces factory
-    let do_spaces = S3Storage::new_do_spaces(&config);
+    let do_spaces = S3Storage::new_do_spaces(&config, None);
     assert!(do_spaces.is_ok(), "DO Spaces factory should succeed");
 
     // Test Backblaze factory
-    let backblaze = S3Storage::new_backblaze(&config);
+    let backblaze = S3Storage::new_backblaze(&config, None);
     assert!(backblaze.is_ok(), "Backblaze factory should succeed");
 
     // Test Linode factory
-    let linode = S3Storage::new_linode(&config);
+    let linode = S3Storage::new_linode(&config, None);
     assert!(linode.is_ok(), "Linode factory should succeed");
 
     // Test Wasabi factory
-    let wasabi = S3Storage::new_wasabi(&config);
+    let wasabi = S3Storage::new_wasabi(&config, None);
     assert!(wasabi.is_ok(), "Wasabi factory should succeed");
 
     // Test DSN parsing

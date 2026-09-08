@@ -1,5 +1,6 @@
 //! Runtime management module
 
+mod adoption;
 pub(crate) mod create_tracker;
 mod keep_alive;
 mod protocol;
@@ -8,6 +9,7 @@ mod registry;
 #[allow(clippy::module_inception)]
 mod runtime;
 
+pub use adoption::AdoptionNegativeCache;
 pub use create_tracker::CreateTracker;
 pub use keep_alive::KeepAliveRegistry;
 #[allow(unused_imports)]

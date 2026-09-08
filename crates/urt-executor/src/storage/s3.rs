@@ -10,7 +10,7 @@
 //!
 //! Features local file caching to speed up cold starts.
 
-use super::archive::{body_preview, validate_archive_bytes, validate_archive_file};
+use super::archive::{body_preview, validate_archive_file};
 use super::file_cache::StorageFileCache;
 use super::Storage;
 use crate::config::S3ProviderConfig;
@@ -21,11 +21,26 @@ use s3::region::Region;
 use s3::Bucket;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 /// Distinguishes concurrent partial downloads writing to the same directory.
 static PARTIAL_DOWNLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Guards the one-off `s3::set_retries` call.
+static DISABLE_LIBRARY_RETRIES: Once = Once::new();
+
+/// Turn off the retry loop inside `rust-s3`.
+///
+/// That loop retries every error the same way, including a 404 and a failed
+/// `put_object`, and sleeps whole seconds between attempts. With `fail-on-err`
+/// enabled a missing build-cache manifest would cost an extra request and a
+/// one-second sleep on every build. Retries are decided by
+/// `resilience::retry_with_backoff`, which classifies the status first.
+fn disable_library_retries() {
+    DISABLE_LIBRARY_RETRIES.call_once(|| s3::set_retries(0));
+}
 
 /// Check if an error indicates the object was not found
 fn is_not_found_error(err: &s3::error::S3Error) -> bool {
@@ -34,10 +49,11 @@ fn is_not_found_error(err: &s3::error::S3Error) -> bool {
 
 /// Whether a response status means the request succeeded.
 ///
-/// The `fail-on-err` feature of `rust-s3` is not enabled, so a failing request
-/// arrives as `Ok(ResponseData)` carrying the status and the error body. Every
-/// call site has to check the status itself; without that, a 503 and its XML
-/// body are indistinguishable from an object.
+/// `rust-s3` is built with `fail-on-err`, so a non-2xx normally arrives as
+/// `S3Error::HttpFailWithBody` and never reaches a status check. The status on
+/// an `Ok` response is still checked at every call site: the feature is a
+/// build-time flag on a dependency, and the cost of it being off is an error
+/// document mounted into a container as a build.
 fn is_success_status(status: u16) -> bool {
     (200..300).contains(&status)
 }
@@ -150,6 +166,8 @@ impl S3Storage {
         endpoint: &str,
         file_cache: Option<Arc<StorageFileCache>>,
     ) -> Result<Self> {
+        disable_library_retries();
+
         let region = Region::Custom {
             region: region.to_string(),
             endpoint: endpoint.to_string(),
@@ -194,35 +212,18 @@ impl S3Storage {
         })
     }
 
-    /// Create AWS S3 storage from config
-    pub fn new_s3(config: &S3ProviderConfig) -> Result<Self> {
-        let endpoint = config
-            .endpoint
-            .as_deref()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", config.region));
-
-        Self::new_with_endpoint_and_cache(
-            &config.access_key,
-            &config.secret,
-            &config.region,
-            &config.bucket,
-            &endpoint,
-            None,
-        )
-    }
-
-    /// Create AWS S3 storage from config with file cache
-    #[allow(dead_code)]
-    pub fn new_s3_with_cache(
+    /// Build a provider-backed bucket, honouring an endpoint override and
+    /// otherwise falling back to the provider's public endpoint.
+    fn with_provider_defaults(
         config: &S3ProviderConfig,
+        default_endpoint: Option<&str>,
         file_cache: Option<Arc<StorageFileCache>>,
     ) -> Result<Self> {
-        let endpoint = config
-            .endpoint
-            .as_deref()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", config.region));
+        let endpoint = match (config.endpoint.as_deref(), default_endpoint) {
+            (Some(explicit), _) => explicit.to_string(),
+            (None, Some(fallback)) => fallback.to_string(),
+            (None, None) => format!("https://s3.{}.amazonaws.com", config.region),
+        };
 
         Self::new_with_endpoint_and_cache(
             &config.access_key,
@@ -234,89 +235,71 @@ impl S3Storage {
         )
     }
 
-    /// Create DigitalOcean Spaces storage from config
+    /// Create AWS S3 storage from config
     #[allow(dead_code)]
-    pub fn new_do_spaces(config: &S3ProviderConfig) -> Result<Self> {
-        let endpoint = config
-            .endpoint
-            .as_deref()
-            .or(Some("https://nyc3.digitaloceanspaces.com"))
-            .map(|e| e.to_string())
-            .unwrap();
+    pub fn new_s3(config: &S3ProviderConfig) -> Result<Self> {
+        Self::with_provider_defaults(config, None, None)
+    }
 
-        Self::new_with_endpoint_and_cache(
-            &config.access_key,
-            &config.secret,
-            &config.region,
-            &config.bucket,
-            &endpoint,
-            None,
+    /// Create AWS S3 storage from config with file cache
+    pub fn new_s3_with_cache(
+        config: &S3ProviderConfig,
+        file_cache: Option<Arc<StorageFileCache>>,
+    ) -> Result<Self> {
+        Self::with_provider_defaults(config, None, file_cache)
+    }
+
+    /// Create DigitalOcean Spaces storage from config
+    pub fn new_do_spaces(
+        config: &S3ProviderConfig,
+        file_cache: Option<Arc<StorageFileCache>>,
+    ) -> Result<Self> {
+        Self::with_provider_defaults(
+            config,
+            Some("https://nyc3.digitaloceanspaces.com"),
+            file_cache,
         )
     }
 
     /// Create Backblaze B2 storage from config
-    #[allow(dead_code)]
-    pub fn new_backblaze(config: &S3ProviderConfig) -> Result<Self> {
-        let endpoint = config
-            .endpoint
-            .as_deref()
-            .or(Some("https://s3.us-west-004.backblazeb2.com"))
-            .map(|e| e.to_string())
-            .unwrap();
-
-        Self::new_with_endpoint_and_cache(
-            &config.access_key,
-            &config.secret,
-            &config.region,
-            &config.bucket,
-            &endpoint,
-            None,
+    pub fn new_backblaze(
+        config: &S3ProviderConfig,
+        file_cache: Option<Arc<StorageFileCache>>,
+    ) -> Result<Self> {
+        Self::with_provider_defaults(
+            config,
+            Some("https://s3.us-west-004.backblazeb2.com"),
+            file_cache,
         )
     }
 
     /// Create Linode Object Storage from config
-    #[allow(dead_code)]
-    pub fn new_linode(config: &S3ProviderConfig) -> Result<Self> {
-        let endpoint = config
-            .endpoint
-            .as_deref()
-            .or(Some("https://linode.com"))
-            .map(|e| e.to_string())
-            .unwrap();
-
-        Self::new_with_endpoint_and_cache(
-            &config.access_key,
-            &config.secret,
-            &config.region,
-            &config.bucket,
-            &endpoint,
-            None,
-        )
+    pub fn new_linode(
+        config: &S3ProviderConfig,
+        file_cache: Option<Arc<StorageFileCache>>,
+    ) -> Result<Self> {
+        Self::with_provider_defaults(config, Some("https://linode.com"), file_cache)
     }
 
     /// Create Wasabi storage from config
-    #[allow(dead_code)]
-    pub fn new_wasabi(config: &S3ProviderConfig) -> Result<Self> {
-        let endpoint = config
-            .endpoint
-            .as_deref()
-            .or(Some("https://s3.wasabisys.com"))
-            .map(|e| e.to_string())
-            .unwrap();
-
-        Self::new_with_endpoint_and_cache(
-            &config.access_key,
-            &config.secret,
-            &config.region,
-            &config.bucket,
-            &endpoint,
-            None,
-        )
+    pub fn new_wasabi(
+        config: &S3ProviderConfig,
+        file_cache: Option<Arc<StorageFileCache>>,
+    ) -> Result<Self> {
+        Self::with_provider_defaults(config, Some("https://s3.wasabisys.com"), file_cache)
     }
 
     /// Parse S3 DSN and create storage
     #[allow(dead_code)]
     pub fn from_dsn(dsn: &str) -> Result<Self> {
+        Self::from_dsn_with_cache(dsn, None)
+    }
+
+    /// Parse S3 DSN and create storage backed by a local file cache
+    pub fn from_dsn_with_cache(
+        dsn: &str,
+        file_cache: Option<Arc<StorageFileCache>>,
+    ) -> Result<Self> {
         // Format: s3://access_key:secret@endpoint/bucket
         let without_prefix = dsn.strip_prefix("s3://").unwrap_or(dsn);
 
@@ -335,7 +318,14 @@ impl S3Storage {
             .split_once('/')
             .ok_or_else(|| ExecutorError::Storage("Invalid S3 bucket format".to_string()))?;
 
-        Self::new_with_endpoint_and_cache(access_key, secret, "us-east-1", bucket, endpoint, None)
+        Self::new_with_endpoint_and_cache(
+            access_key,
+            secret,
+            "us-east-1",
+            bucket,
+            endpoint,
+            file_cache,
+        )
     }
 
     /// Fetch an object, treating any non-success status as an error rather than
@@ -382,40 +372,81 @@ impl S3Storage {
             )));
         }
 
-        if let Err(e) = fs::rename(&partial, local_path).await {
-            fs::remove_file(&partial).await.ok();
-            return Err(ExecutorError::Storage(format!(
-                "Failed to move cached file into place at '{}': {}",
-                local_path, e
-            )));
-        }
-
-        Ok(())
+        promote_partial(&partial, local_path).await
     }
 
-    /// Write a downloaded body to a temporary path and move it into place, so
-    /// the destination only ever holds a complete artefact.
-    async fn write_atomically(local_path: &str, data: &[u8]) -> Result<()> {
-        let partial = partial_download_path(local_path);
+    /// Stream an object onto `destination`, returning its validated size.
+    ///
+    /// The body is written as it arrives rather than collected, so a build of
+    /// any size costs one file handle instead of its own length in resident
+    /// memory. `destination` is removed on every failure path, including a
+    /// body that turns out not to be an archive.
+    async fn stream_object_to_file(&self, remote_path: &str, destination: &Path) -> Result<u64> {
+        let s3_key = self.get_s3_key(remote_path);
 
-        if let Err(e) = fs::write(&partial, data).await {
-            fs::remove_file(&partial).await.ok();
-            return Err(ExecutorError::Storage(format!(
-                "Failed to write downloaded file to '{}': {}",
-                local_path, e
-            )));
+        let mut file = fs::File::create(destination).await.map_err(|e| {
+            ExecutorError::Storage(format!(
+                "Failed to create download file '{}': {}",
+                destination.display(),
+                e
+            ))
+        })?;
+
+        let outcome = async {
+            let status = self
+                .bucket
+                .get_object_to_writer(s3_key, &mut file)
+                .await
+                .map_err(|e| transport_error("get_object", remote_path, e))?;
+
+            if !is_success_status(status) {
+                return Err(status_error("get_object", remote_path, status, &[]));
+            }
+
+            file.flush().await.map_err(|e| {
+                ExecutorError::Storage(format!(
+                    "Failed to flush download file '{}': {}",
+                    destination.display(),
+                    e
+                ))
+            })?;
+            file.sync_all().await.map_err(|e| {
+                ExecutorError::Storage(format!(
+                    "Failed to sync download file '{}': {}",
+                    destination.display(),
+                    e
+                ))
+            })
+        }
+        .await;
+
+        drop(file);
+
+        let validated = match outcome {
+            Ok(()) => validate_archive_file(remote_path, destination).await,
+            Err(e) => Err(e),
+        };
+
+        if validated.is_err() {
+            fs::remove_file(destination).await.ok();
         }
 
-        if let Err(e) = fs::rename(&partial, local_path).await {
-            fs::remove_file(&partial).await.ok();
-            return Err(ExecutorError::Storage(format!(
-                "Failed to move downloaded file into place at '{}': {}",
-                local_path, e
-            )));
-        }
-
-        Ok(())
+        validated
     }
+}
+
+/// Move a completed temporary file onto its destination, leaving nothing behind
+/// if the move fails.
+async fn promote_partial(partial: &Path, local_path: &str) -> Result<()> {
+    if let Err(e) = fs::rename(partial, local_path).await {
+        fs::remove_file(partial).await.ok();
+        return Err(ExecutorError::Storage(format!(
+            "Failed to move downloaded file into place at '{}': {}",
+            local_path, e
+        )));
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -503,20 +534,15 @@ impl Storage for S3Storage {
             self.get_s3_key(remote_path)
         );
 
-        let data = self.get_object_checked(remote_path).await?;
-        validate_archive_bytes(remote_path, &data)?;
+        let partial = partial_download_path(local_path);
+        let size = self.stream_object_to_file(remote_path, &partial).await?;
+        promote_partial(&partial, local_path).await?;
 
-        Self::write_atomically(local_path, &data).await?;
-
-        tracing::info!(
-            "Download completed for {} ({} bytes)",
-            remote_path,
-            data.len()
-        );
+        tracing::info!("Download completed for {} ({} bytes)", remote_path, size);
 
         // Only a body that passed the status and format checks reaches the cache.
         if let Some(ref cache) = self.file_cache {
-            if let Err(e) = cache.put(remote_path, &data).await {
+            if let Err(e) = cache.put_file(remote_path, Path::new(local_path)).await {
                 tracing::warn!("Failed to cache {}: {}", remote_path, e);
             }
         }
@@ -526,11 +552,13 @@ impl Storage for S3Storage {
 
     async fn delete(&self, path: &str) -> Result<()> {
         let s3_key = self.get_s3_key(path);
-        let response = self
-            .bucket
-            .delete_object(s3_key)
-            .await
-            .map_err(|e| transport_error("delete_object", path, e))?;
+        let response = match self.bucket.delete_object(s3_key).await {
+            Ok(response) => response,
+            // Deleting an object that is not there leaves the caller with what
+            // it asked for.
+            Err(e) if is_not_found_error(&e) => return Ok(()),
+            Err(e) => return Err(transport_error("delete_object", path, e)),
+        };
 
         let status = response.status_code();
         if !is_success_status(status) && status != 404 {
@@ -551,9 +579,7 @@ impl Storage for S3Storage {
             .bucket
             .list(s3_key.to_string(), None)
             .await
-            .map_err(|e| {
-                ExecutorError::Storage(format!("S3 list_objects failed for '{}': {}", prefix, e))
-            })?;
+            .map_err(|e| transport_error("list_objects", prefix, e))?;
 
         let mut keys = Vec::new();
         for result in response {
@@ -721,22 +747,164 @@ mod tests {
         assert_eq!(tokio::fs::read(&local_path).await.unwrap(), archive);
     }
 
+    /// A local endpoint that answers every S3 request with one canned response.
+    ///
+    /// Enough to drive the status handling in this module without a live
+    /// object store: `rust-s3` only cares about the status line and the body.
+    struct FakeS3 {
+        address: std::net::SocketAddr,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeS3 {
+        async fn responding(status: u16, body: Vec<u8>) -> Self {
+            let status = axum::http::StatusCode::from_u16(status).unwrap();
+            let router = axum::Router::new().fallback(move || {
+                let body = body.clone();
+                async move { (status, body) }
+            });
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.ok();
+            });
+
+            Self { address, server }
+        }
+
+        fn storage(&self) -> S3Storage {
+            S3Storage::new_with_endpoint(
+                "test-access-key",
+                "test-secret",
+                "us-east-1",
+                "unified",
+                &format!("http://{}", self.address),
+            )
+            .expect("fake endpoint is a valid bucket target")
+        }
+    }
+
+    impl Drop for FakeS3 {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
     #[tokio::test]
-    async fn atomic_write_leaves_no_partial_file_behind() {
+    async fn a_404_head_means_the_object_is_absent() {
+        let endpoint = FakeS3::responding(404, Vec::new()).await;
+
+        let present = endpoint
+            .storage()
+            .exists("unified/builds/app-1/manifest.json")
+            .await
+            .expect("a missing object is an answer, not a failure");
+
+        assert!(!present);
+    }
+
+    #[tokio::test]
+    async fn a_503_download_fails_and_leaves_nothing_on_disk() {
+        let endpoint = FakeS3::responding(503, S3_ERROR_BODY.to_vec()).await;
         let dir = tempfile::tempdir().unwrap();
         let local_path = dir.path().join("code.tar.gz");
-        let archive = gzip_archive();
 
-        S3Storage::write_atomically(&local_path.display().to_string(), &archive)
+        let error = endpoint
+            .storage()
+            .download(
+                "unified/builds/app-1/code.tar.gz",
+                &local_path.display().to_string(),
+            )
             .await
-            .expect("write succeeds");
+            .expect_err("a 503 is not a build");
+
+        assert!(error.to_string().contains("HTTP 503"), "{}", error);
+        assert!(is_transient_error(&error));
+        assert!(!local_path.exists());
+        assert!(!leftover_part_files(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn a_200_download_streams_the_archive_into_place() {
+        let archive = gzip_archive();
+        let endpoint = FakeS3::responding(200, archive.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("code.tar.gz");
+
+        endpoint
+            .storage()
+            .download(
+                "unified/builds/app-1/code.tar.gz",
+                &local_path.display().to_string(),
+            )
+            .await
+            .expect("a gzip body is a build");
 
         assert_eq!(tokio::fs::read(&local_path).await.unwrap(), archive);
+        assert!(!leftover_part_files(dir.path()).await);
+    }
 
-        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+    #[tokio::test]
+    async fn a_rejected_download_never_reaches_the_file_cache() {
+        let endpoint = FakeS3::responding(503, S3_ERROR_BODY.to_vec()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(StorageFileCache::new(
+            Some(dir.path().to_str().unwrap()),
+            None,
+            None,
+        ));
+        cache.initialize().await.unwrap();
+
+        let mut storage = endpoint.storage();
+        storage.file_cache = Some(cache.clone());
+
+        let remote_path = "unified/builds/app-1/code.tar.gz";
+        let local_path = dir.path().join("code.tar.gz");
+
+        storage
+            .download(remote_path, &local_path.display().to_string())
+            .await
+            .expect_err("a 503 is not a build");
+
+        assert!(!cache.exists(remote_path).await);
+    }
+
+    #[tokio::test]
+    async fn a_validated_download_populates_the_file_cache() {
+        let archive = gzip_archive();
+        let endpoint = FakeS3::responding(200, archive.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(StorageFileCache::new(
+            Some(dir.path().to_str().unwrap()),
+            None,
+            None,
+        ));
+        cache.initialize().await.unwrap();
+
+        let mut storage = endpoint.storage();
+        storage.file_cache = Some(cache.clone());
+
+        let remote_path = "unified/builds/app-1/code.tar.gz";
+        let local_path = dir.path().join("code.tar.gz");
+
+        storage
+            .download(remote_path, &local_path.display().to_string())
+            .await
+            .expect("a gzip body is a build");
+
+        assert!(cache.exists(remote_path).await);
+        let (cache_file, _) = cache.get_cache_path(remote_path);
+        assert_eq!(tokio::fs::read(&cache_file).await.unwrap(), archive);
+    }
+
+    async fn leftover_part_files(dir: &Path) -> bool {
+        let mut entries = tokio::fs::read_dir(dir).await.unwrap();
         while let Some(entry) = entries.next_entry().await.unwrap() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            assert!(!name.contains(".part."), "left a partial file: {}", name);
+            if entry.file_name().to_string_lossy().contains(".part.") {
+                return true;
+            }
         }
+        false
     }
 }

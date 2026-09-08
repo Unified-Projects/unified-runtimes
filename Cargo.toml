@@ -62,7 +62,13 @@ urlencoding = "2.1"
 bollard = "0.20"
 
 # S3 Storage
-rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-native-tls"] }
+rust-s3 = { version = "0.37.1", default-features = false, features = [
+    "tokio-native-tls",
+    # Without this a non-2xx response is returned as Ok(ResponseData) and every
+    # call site has to inspect the status itself; an error document then reads
+    # as object content.
+    "fail-on-err",
+] }
 
 # Streaming
 async-stream = "0.3"

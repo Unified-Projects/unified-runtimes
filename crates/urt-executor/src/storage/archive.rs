@@ -61,6 +61,10 @@ impl ArchiveFormat {
 ///
 /// `source_hint` is the storage key or file name; its extension selects the
 /// format check and it is named in any error.
+///
+/// Downloads stream to disk and go through `validate_archive_file`; this is the
+/// entry point for a payload that is already in memory.
+#[allow(dead_code)]
 pub fn validate_archive_bytes(source_hint: &str, data: &[u8]) -> Result<()> {
     validate_archive_head(source_hint, data, data.len() as u64)
 }

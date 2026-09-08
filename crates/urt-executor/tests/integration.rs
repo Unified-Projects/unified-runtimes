@@ -53,6 +53,7 @@ fn test_config() -> ExecutorConfig {
         warmup_required: false,
         pending_wait_max_secs: 60,
         pending_max_age_secs: 300,
+        adoption_negative_cache_ms: 2000,
     }
 }
 
@@ -82,6 +83,9 @@ async fn create_test_state() -> Option<AppState> {
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
+        adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
+            std::time::Duration::from_millis(2000),
+        ),
     })
 }
 
@@ -2476,6 +2480,7 @@ mod audit_fixes {
             retry_delay_ms: 500,
             pending_wait_max_secs: 60,
             pending_max_age_secs: 300,
+            adoption_negative_cache_ms: 2000,
         };
 
         assert!(
@@ -2896,6 +2901,7 @@ mod regression_pending_wait {
             // KEY: cap the pending-wait at 1 second, regardless of req.timeout.
             pending_wait_max_secs: 1,
             pending_max_age_secs: 300,
+            adoption_negative_cache_ms: 2000,
         };
 
         let docker = match DockerManager::new(config.clone()).await {
@@ -2925,6 +2931,9 @@ mod regression_pending_wait {
             runtime_create_limiter_capacity: None,
             readiness: Arc::new(dashmap::DashMap::new()),
             create_tracker: urt_executor::runtime::CreateTracker::new(),
+            adoption_negative_cache: urt_executor::runtime::AdoptionNegativeCache::new(
+                std::time::Duration::from_millis(2000),
+            ),
         };
 
         let hostname = state.config.hostname.clone();

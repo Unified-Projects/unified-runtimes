@@ -1,7 +1,7 @@
 //! Maintenance task for cleaning up inactive runtimes
 
 use crate::config::ExecutorConfig;
-use crate::docker::container::ContainerInfo;
+use crate::docker::container::{belongs_to_executor as belongs_to_hostname, ContainerInfo};
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;
 use crate::resilience::retry_with_backoff;
@@ -50,21 +50,6 @@ fn is_container_running(container: &ContainerInfo) -> bool {
 
     let status = container.status.to_ascii_lowercase();
     status == "running" || status == "up" || status.starts_with("up ")
-}
-
-fn belongs_to_hostname(container: &ContainerInfo, hostname: &str) -> bool {
-    if let Some(executor_hostname) = container
-        .labels
-        .get("urt.executor_hostname")
-        .filter(|value| !value.is_empty())
-    {
-        return executor_hostname == hostname;
-    }
-
-    container
-        .name
-        .strip_prefix(&format!("{}-", hostname))
-        .is_some()
 }
 
 fn runtime_id_from_container(container: &ContainerInfo, hostname: &str) -> Option<String> {

@@ -87,6 +87,7 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_KEEP_ALIVE` | `false` | Disable idle timeout (containers only removed via DELETE) |
 | `URT_INACTIVE_THRESHOLD` | `60` | Seconds before marking runtime inactive |
 | `URT_MAINTENANCE_INTERVAL` | `3600` | Seconds between cleanup tasks |
+| `URT_ADOPTION_NEGATIVE_CACHE_MS` | `2000` | How long a failed container adoption is remembered, so repeated requests for an unknown runtime ID do not each cost a Docker inspect (`0` disables) |
 | `URT_AUTOSCALE` | `false` | Enable autoscale mode with adaptive concurrency limiting |
 | `URT_MAX_CONCURRENT_EXECUTIONS` | `` | Optional max concurrent executions (autoscale mode) |
 | `URT_MAX_CONCURRENT_RUNTIME_CREATES` | `` | Optional max concurrent runtime creations (autoscale mode) |
