@@ -75,6 +75,17 @@ async fn create_test_state() -> Option<AppState> {
         Ok(d) => Arc::new(d),
         Err(_) => return None,
     };
+    // Match executor startup, which provisions its configured Docker networks.
+    // Serialise the first creation so parallel tests cannot race on the name.
+    static NETWORKS_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    NETWORKS_READY
+        .get_or_init(|| async {
+            docker
+                .ensure_networks()
+                .await
+                .expect("ensure test networks");
+        })
+        .await;
     let registry = RuntimeRegistry::new();
     let keep_alive_registry = KeepAliveRegistry::new();
     let http_client = reqwest::Client::new();
@@ -101,6 +112,35 @@ async fn create_test_state() -> Option<AppState> {
         ),
         health: urt_executor::runtime::RuntimeHealth::default(),
     })
+}
+
+/// A local HTTP endpoint for tests of readiness rather than container networking.
+/// The proxy directs synthetic container names to an ephemeral listener, avoiding
+/// host DNS and Docker liveness recovery after the readiness notification.
+struct RuntimeHttpFixture(tokio::task::JoinHandle<()>);
+
+impl RuntimeHttpFixture {
+    async fn attach(state: &mut AppState) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind runtime fixture");
+        let address = listener.local_addr().expect("runtime fixture address");
+        state.http_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{address}")).expect("fixture proxy"))
+            .build()
+            .expect("fixture HTTP client");
+        Self(tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().fallback(|| async { "ready" }))
+                .await
+                .expect("serve runtime fixture");
+        }))
+    }
+}
+
+impl Drop for RuntimeHttpFixture {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Helper to parse JSON response body
@@ -911,7 +951,9 @@ mod docker_integration {
         require_docker!(state);
         let app = create_router(state);
 
+        let runtime_id = format!("list-{}", uuid::Uuid::new_v4().simple());
         let payload = json!({
+            "runtimeId": runtime_id,
             "image": "alpine:latest",
             "entrypoint": "",
             "variables": {}
@@ -956,7 +998,7 @@ mod docker_integration {
         assert!(body.as_array().map(|a| !a.is_empty()).unwrap_or(false));
 
         // Cleanup
-        cleanup_runtime(app, "alpine").await;
+        cleanup_runtime(app, &runtime_id).await;
     }
 
     #[tokio::test]
@@ -965,11 +1007,12 @@ mod docker_integration {
         require_docker!(state);
         let app = create_router(state);
 
-        let runtime_id = "alpine";
+        let runtime_id = format!("lifecycle-{}", uuid::Uuid::new_v4().simple());
 
-        // 1. Create runtime
+        // 1. Create a Bash-capable runtime for the v5 commands endpoint.
         let create_payload = json!({
-            "image": "alpine:latest",
+            "runtimeId": runtime_id,
+            "image": "ubuntu:24.04",
             "entrypoint": "",
             "variables": {}
         });
@@ -1030,6 +1073,9 @@ mod docker_integration {
             "Command failed: {}",
             response.status()
         );
+
+        let command_body = parse_json_body(response.into_body()).await;
+        assert_eq!(command_body["output"].as_str().unwrap().trim(), "hello");
 
         // 4. Delete runtime
         let response = app
@@ -1494,9 +1540,8 @@ mod readiness_gate {
     /// Notify and wakes when we call readiness_notify_and_remove at ~150 ms.
     ///
     /// After waking, `resolve_runtime` returns the running runtime and the
-    /// execution proceeds immediately.  Even though the downstream TCP/HTTP
-    /// call to the fake runtime hostname fails (no real container), the
-    /// response arrives well before the 5-second execution deadline.
+    /// execution proceeds against a local HTTP fixture and completes well before
+    /// the execution deadline.
     ///
     /// Assertion strategy: use elapsed time.  A pending-timeout regression
     /// would hold the response for the full 5-second execution deadline.
@@ -1504,6 +1549,8 @@ mod readiness_gate {
     #[tokio::test]
     async fn first_execution_waits_for_runtime_ready() {
         require_docker!(state);
+        let mut state = state;
+        let _runtime_http = RuntimeHttpFixture::attach(&mut state).await;
 
         tokio::time::timeout(Duration::from_secs(8), async move {
             let hostname = state.config.hostname.clone();
@@ -1525,8 +1572,8 @@ mod readiness_gate {
             let app = create_router(state.clone());
 
             // Spawn the execution in the background; it will park on the Notify.
-            // Use a long timeout (30s) so the only way to get 504 quickly is
-            // via proper wakeup + network failure, not a deadline expiry.
+            // A long deadline makes a missing notification fail the outer bound
+            // instead of letting the execution deadline complete the test.
             let app_clone = app.clone();
             let runtime_id_owned = runtime_id.to_string();
             let start = Instant::now();
@@ -1565,12 +1612,11 @@ mod readiness_gate {
                 elapsed
             );
 
-            // After a proper wakeup the request proceeds past resolve_runtime;
-            // a 404 would mean the runtime was not found at all (wrong path).
-            assert_ne!(
+            // The waiter must resolve the runtime and complete its HTTP execution.
+            assert_eq!(
                 response.status(),
-                StatusCode::NOT_FOUND,
-                "Got 404 ({:?}): runtime was not resolved from the registry after notification",
+                StatusCode::OK,
+                "Execution failed ({:?}): runtime was not resolved from the registry after notification",
                 elapsed
             );
         })
@@ -1662,6 +1708,8 @@ mod readiness_gate {
     #[tokio::test]
     async fn concurrent_first_execution_storm_all_succeed() {
         require_docker!(state);
+        let mut state = state;
+        let _runtime_http = RuntimeHttpFixture::attach(&mut state).await;
 
         tokio::time::timeout(Duration::from_secs(10), async move {
             let hostname = state.config.hostname.clone();
@@ -1684,7 +1732,7 @@ mod readiness_gate {
                 let rid = runtime_id.to_string();
                 handles.push(tokio::spawn(async move {
                     // Long deadline so we can tell the difference between
-                    // wakeup-then-fast-fail versus pending-deadline-expiry.
+                    // notification followed by execution versus a pending deadline.
                     post_execution(app, &rid, 30).await
                 }));
             }
@@ -1708,7 +1756,7 @@ mod readiness_gate {
             state.readiness_notify_and_remove(&full_name);
 
             // All 50 tasks should resolve quickly (within 3 s of broadcast)
-            // because they wake and then fail fast on the fake hostname.
+            // because they wake and execute against the local HTTP fixture.
             let responses: Vec<_> =
                 tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(handles))
                     .await
@@ -1729,14 +1777,14 @@ mod readiness_gate {
                 elapsed
             );
 
-            let not_found = responses
+            let failed = responses
                 .iter()
-                .filter(|r| r.status() == StatusCode::NOT_FOUND)
+                .filter(|r| r.status() != StatusCode::OK)
                 .count();
             assert_eq!(
-                not_found, 0,
-                "{} out of {} executions got 404; waiters may have followed wrong path",
-                not_found, N
+                failed, 0,
+                "{} out of {} executions failed; waiters may have followed wrong path",
+                failed, N
             );
         })
         .await
@@ -2789,12 +2837,13 @@ mod regression_pending_wait {
     /// this path, so the request must still park and wake when notified.
     ///
     /// A background task notifies at ~200 ms, transitions the runtime to
-    /// running, then the request wakes and resolves the runtime.  The
-    /// downstream TCP connect to the fake hostname fails fast, but the
-    /// response must arrive well before `pending_wait_max_secs` (60 s default).
+    /// running, then the request wakes, resolves the runtime and executes against
+    /// a local HTTP fixture well before `pending_wait_max_secs` (60 s default).
     #[tokio::test]
     async fn legitimate_creation_request_still_waits_on_pending() {
         require_docker!(state);
+        let mut state = state;
+        let _runtime_http = RuntimeHttpFixture::attach(&mut state).await;
 
         tokio::time::timeout(Duration::from_secs(8), async move {
             let hostname = state.config.hostname.clone();
@@ -2840,7 +2889,7 @@ mod regression_pending_wait {
             let response = exec_handle.await.expect("execution task panicked");
             let elapsed = start.elapsed();
 
-            // Must resolve quickly (woken by notify, then fast-fails on network).
+            // Must resolve quickly and complete the local HTTP execution.
             assert!(
                 elapsed < Duration::from_secs(3),
                 "Response took {:?}; expected < 3 s — legitimate build request \
@@ -2850,10 +2899,10 @@ mod regression_pending_wait {
 
             // A 404 here means the runtime was not found after notification
             // (wrong path — the waiter must have resolved Ok(runtime)).
-            assert_ne!(
+            assert_eq!(
                 response.status(),
-                StatusCode::NOT_FOUND,
-                "Got 404 ({:?}): runtime was not resolved from registry after wakeup; \
+                StatusCode::OK,
+                "Execution failed ({:?}): runtime was not resolved from registry after wakeup; \
                  should_wait_for_pending path may be broken",
                 elapsed
             );
@@ -3338,7 +3387,7 @@ mod regression_pending_wait {
     ///
     /// Assertions:
     ///   (a) All 50 scan requests return 404 in < 1 s each.
-    ///   (b) The build path returns a non-404 status (woke via notify).
+    ///   (b) The build path executes successfully after the notification.
     ///   (c) p99 latency for the 50 scans is < 500 ms.
     ///
     /// Without the fix, all 50 scans would park for 30 s before returning 504,
@@ -3346,6 +3395,8 @@ mod regression_pending_wait {
     #[tokio::test]
     async fn bot_scan_concurrent_with_build_does_not_block_build() {
         require_docker!(state);
+        let mut state = state;
+        let _runtime_http = RuntimeHttpFixture::attach(&mut state).await;
 
         // Generous outer bound; real assertions are stricter.
         tokio::time::timeout(Duration::from_secs(15), async move {
@@ -3433,14 +3484,11 @@ mod regression_pending_wait {
                 N_SCANS
             );
 
-            // ── Assertion (b): build path returned a non-404 status ───────
-            // After wakeup the build resolves the running runtime; the HTTP
-            // connect to the fake hostname fails, but it must NOT be 404
-            // (which would mean the runtime was not found after notification).
-            assert_ne!(
+            // The notified build must resolve the runtime and execute successfully.
+            assert_eq!(
                 build_response.status(),
-                StatusCode::NOT_FOUND,
-                "Build path returned 404: runtime was not resolved after notification; \
+                StatusCode::OK,
+                "Build execution failed: runtime was not resolved after notification; \
                  the build task may not have woken correctly"
             );
 
@@ -4005,11 +4053,6 @@ mod create_path_hardening {
         let second = app.clone().oneshot(create(&second_id)).await.unwrap();
         let elapsed = started.elapsed();
         assert_eq!(second.status(), StatusCode::CREATED);
-        assert!(
-            elapsed < Duration::from_secs(8),
-            "the create must not wait out the previous owner's stop grace, took {:?}",
-            elapsed
-        );
 
         // The previous owner still goes, just not on the create's clock.
         let mut removed = false;
@@ -4020,13 +4063,17 @@ mod create_path_hardening {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        state.docker.remove_container(&second_name, true).await.ok();
+        state.docker.remove_container(&first_name, true).await.ok();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the create must not wait out the previous owner's stop grace, took {:?}",
+            elapsed
+        );
         assert!(
             removed,
             "the replaced keep-alive container must be removed in the background"
         );
-
-        state.docker.remove_container(&second_name, true).await.ok();
-        state.docker.remove_container(&first_name, true).await.ok();
     }
 }
 
@@ -4639,11 +4686,15 @@ mod dead_runtime_detection {
             StatusCode::NOT_FOUND,
             "with an image the dead runtime must be recreated rather than reported gone"
         );
+        let response_status = response.status();
+        let response_body = body_to_string(response.into_body()).await;
         let recreated = registry.get(&full_name).await;
         assert!(
             recreated.as_ref().is_some_and(|rt| !rt.is_quarantined()),
-            "a fresh entry must exist after the on-the-fly create, got {:?}",
-            recreated
+            "a fresh entry must exist after the on-the-fly create, got {:?}; response {}: {}",
+            recreated,
+            response_status,
+            response_body
         );
         assert!(
             docker.inspect_container(&full_name).await.is_ok(),

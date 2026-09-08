@@ -620,7 +620,7 @@ mod tests {
 
         let cache = StorageFileCache::new(
             Some(&cache_dir),
-            Some(Duration::from_millis(100)), // Short TTL (but long enough for file sync)
+            Some(Duration::from_secs(3600)),
             Some(1024 * 1024),
         );
         cache.initialize().await.unwrap();
@@ -632,11 +632,16 @@ mod tests {
         cache.put(remote_path, data).await.unwrap();
         assert!(cache.exists(remote_path).await);
 
-        // Wait for expiry (longer than TTL)
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Age the persisted entry so expiry does not depend on filesystem speed.
+        let (cache_file, meta_file) = cache.get_cache_path(remote_path);
+        let mut metadata = cache.read_metadata(&meta_file).await.unwrap();
+        metadata.created = SystemTime::now() - Duration::from_secs(7200);
+        cache.write_metadata(&meta_file, &metadata).await.unwrap();
 
         // Should be expired now
         assert!(!cache.exists(remote_path).await);
+        assert!(!cache_file.exists());
+        assert!(!meta_file.exists());
     }
 
     #[tokio::test]

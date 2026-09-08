@@ -33,10 +33,10 @@ pub async fn auth_middleware(
     State(secret): State<String>,
     request: Request,
     next: Next,
-) -> Result<Response, Response> {
+) -> Response {
     // If no secret configured, skip auth
     if secret.is_empty() {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     // Extract bearer token
@@ -48,8 +48,8 @@ pub async fn auth_middleware(
     let token = extract_bearer_token(auth_header);
 
     match token {
-        Some(t) if constant_time_compare(t, &secret) => Ok(next.run(request).await),
-        _ => Err(ExecutorError::Unauthorized.into_response()),
+        Some(t) if constant_time_compare(t, &secret) => next.run(request).await,
+        _ => ExecutorError::Unauthorized.into_response(),
     }
 }
 
