@@ -44,6 +44,7 @@ pub async fn set_permissions_recursive(_path: &std::path::Path) -> std::io::Resu
     Ok(())
 }
 
+// These tests assert Unix mode bits, which do not exist on other platforms.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -12,6 +12,26 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| lowered.contains(needle))
 }
 
+/// Read the response status a storage backend recorded in its message.
+///
+/// Storage errors are formatted as `... returned HTTP <code>: <body preview>`.
+/// Only the first such token is read, so status codes quoted inside an error
+/// body cannot change the retry decision: a 404 whose body mentions an earlier
+/// 503 stays non-retryable.
+fn storage_response_status(message: &str) -> Option<u16> {
+    let start = message.find("HTTP ")? + "HTTP ".len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+
+    if digits.len() == 3 {
+        digits.parse().ok()
+    } else {
+        None
+    }
+}
+
 pub fn is_transient_error(error: &ExecutorError) -> bool {
     match error {
         ExecutorError::Network(message) => contains_any(
@@ -31,19 +51,25 @@ pub fn is_transient_error(error: &ExecutorError) -> bool {
                 "429",
             ],
         ),
-        ExecutorError::Storage(message) => contains_any(
-            message,
-            &[
-                "slowdown",
-                "requesttimeout",
-                "temporarily unavailable",
-                "throttl",
-                "connection reset",
-                "timeout",
-                "503",
-                "500",
-            ],
-        ),
+        ExecutorError::Storage(message) => {
+            if let Some(status) = storage_response_status(message) {
+                // A status is authoritative: server faults and throttling are
+                // worth another attempt, a missing or forbidden object is not.
+                return status == 429 || (500..600).contains(&status);
+            }
+
+            contains_any(
+                message,
+                &[
+                    "slowdown",
+                    "requesttimeout",
+                    "temporarily unavailable",
+                    "throttl",
+                    "connection reset",
+                    "timeout",
+                ],
+            )
+        }
         ExecutorError::Docker(message) => {
             if contains_any(
                 message,
@@ -157,6 +183,52 @@ mod tests {
     fn test_storage_slowdown_is_retryable() {
         let err = ExecutorError::Storage("S3 SlowDown throttling".to_string());
         assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_storage_server_status_is_retryable() {
+        let err = ExecutorError::Storage(
+            "S3 get_object for 'builds/code.tar.gz' returned HTTP 503: <Error><Code>ServiceUnavailable</Code></Error>"
+                .to_string(),
+        );
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_storage_not_found_status_is_not_retryable() {
+        let err = ExecutorError::Storage(
+            "S3 get_object for 'builds/code.tar.gz' returned HTTP 404: <Error><Code>NoSuchKey</Code></Error>"
+                .to_string(),
+        );
+        assert!(!is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_storage_status_wins_over_digits_in_the_body() {
+        let err = ExecutorError::Storage(
+            "S3 get_object for 'builds/code.tar.gz' returned HTTP 404: retry after the 503 clears"
+                .to_string(),
+        );
+        assert!(!is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_invalid_archive_is_not_retryable() {
+        let err = ExecutorError::Storage(
+            "Downloaded artefact for 'builds/code.tar.gz' is not a valid gzip archive (500 bytes): <Error/>"
+                .to_string(),
+        );
+        assert!(!is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_storage_response_status_parsing() {
+        assert_eq!(
+            storage_response_status("S3 get_object for 'x' returned HTTP 503: body"),
+            Some(503)
+        );
+        assert_eq!(storage_response_status("no status here"), None);
+        assert_eq!(storage_response_status("HTTP 12 is too short"), None);
     }
 
     #[test]

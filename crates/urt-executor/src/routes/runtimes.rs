@@ -6,8 +6,9 @@ use super::AppState;
 use crate::docker::container::ContainerConfig;
 use crate::error::{ExecutorError, Result};
 use crate::platform;
-use crate::resilience::retry_with_backoff;
+use crate::resilience::{is_transient_error, retry_with_backoff};
 use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime};
+use crate::storage;
 use crate::tasks;
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
 use axum::{
@@ -504,6 +505,20 @@ pub struct CreateRuntimeResponse {
 
 // LogEntry is imported from super::logs
 
+/// Map a failed source fetch onto the error returned to the caller.
+///
+/// A fault that is worth another attempt, such as a 5xx from object storage,
+/// answers 500 so the caller retries; a source that is genuinely unusable
+/// answers 400.
+fn source_download_error(source: &str, error: ExecutorError) -> ExecutorError {
+    let message = format!("Failed to copy source code from '{}': {}", source, error);
+    if is_transient_error(&error) {
+        ExecutorError::Storage(message)
+    } else {
+        ExecutorError::RuntimeFailed(message)
+    }
+}
+
 /// POST /v1/runtimes - Create a new runtime
 /// Note: Accepts JSON regardless of Content-Type header for backwards compatibility
 pub async fn create_runtime(
@@ -785,29 +800,33 @@ pub async fn create_runtime(
         // Same derivation the OPEN_RUNTIMES_CODE_PATH env var uses, so the mounted
         // file name and the path handed to the runtime cannot drift.
         let local_source = src_dir.join(source_mount_file_name(&req.source));
-        let local_source_str = local_source.display().to_string();
 
-        info!("Downloading source {} to {}", req.source, local_source_str);
-        if let Err(e) = retry_with_backoff(
-            "runtime_source_download",
+        info!(
+            "Downloading source {} to {}",
+            req.source,
+            local_source.display()
+        );
+        match storage::download_verified_archive(
+            state.storage.as_ref(),
+            &req.source,
+            &local_source,
             state.config.retry_attempts,
             state.config.retry_delay_ms,
-            |_| async { state.storage.download(&req.source, &local_source_str).await },
         )
         .await
         {
-            error!("Failed to download source: {}", e);
-            drop(readiness_guard);
-            state.registry.remove(&full_name).await;
-            return Err(ExecutorError::RuntimeFailed(format!(
-                "Failed to copy source code: {}",
-                e
-            )));
-        }
-
-        // Verify download and log file size
-        if let Ok(metadata) = tokio::fs::metadata(&local_source).await {
-            info!("Source downloaded successfully: {} bytes", metadata.len());
+            Ok(size) => info!("Source downloaded successfully: {} bytes", size),
+            Err(e) => {
+                error!("Failed to download source {}: {}", req.source, e);
+                // Leave nothing behind: the pending entry, the readiness
+                // notifier and the tmp folder all go, so the next request for
+                // this deployment starts a fresh create rather than adopting a
+                // runtime built from a body that is not an archive.
+                drop(readiness_guard);
+                state.registry.remove(&full_name).await;
+                tokio::fs::remove_dir_all(&tmp_folder).await.ok();
+                return Err(source_download_error(&req.source, e));
+            }
         }
 
         // Fix permissions on all input source files before handing off to the runtime container.
