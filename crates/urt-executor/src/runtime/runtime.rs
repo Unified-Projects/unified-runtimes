@@ -7,6 +7,19 @@ use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Lifecycle state of a registry entry, tracked separately from the Docker
+/// status string so an observation of the container can never publish an entry
+/// that its create still owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeState {
+    /// A create inserted the entry and is still building it. Only that create
+    /// publishes it, by calling [`Runtime::mark_running`].
+    Pending,
+    /// The entry is published: its status reflects the container.
+    #[default]
+    Published,
+}
+
 /// Runtime state representing a containerized function instance
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Runtime {
@@ -28,6 +41,11 @@ pub struct Runtime {
     pub hostname: String,
     /// Container status: "pending" or Docker status string
     pub status: String,
+    /// Lifecycle state of this entry. Process-local: it is not part of the wire
+    /// contract, and an entry rebuilt from JSON describes a runtime this process
+    /// is not building, so it deserialises as published.
+    #[serde(skip)]
+    pub state: RuntimeState,
     /// Secret key for internal auth (32-char hex)
     pub key: String,
     /// Number of active listeners
@@ -75,6 +93,7 @@ impl Runtime {
             name: format!("{}-{}", executor_hostname, runtime_id),
             hostname: hex::encode(hostname_bytes),
             status: "pending".to_string(),
+            state: RuntimeState::Pending,
             key: hex::encode(key_bytes),
             listening: 0,
             image: image.to_string(),
@@ -86,9 +105,15 @@ impl Runtime {
         runtime
     }
 
+    /// Publish the entry with a container status, leaving pending state behind.
+    pub fn publish_status(&mut self, status: &str) {
+        self.status = status.to_string();
+        self.state = RuntimeState::Published;
+    }
+
     /// Mark runtime as running with the container status
     pub fn mark_running(&mut self, status: &str) {
-        self.status = status.to_string();
+        self.publish_status(status);
         self.initialised = 1;
         self.touch();
     }
@@ -113,7 +138,7 @@ impl Runtime {
 
     /// Check if the runtime is pending
     pub fn is_pending(&self) -> bool {
-        self.status == "pending"
+        self.state == RuntimeState::Pending
     }
 
     /// Check if the runtime is running
@@ -234,6 +259,27 @@ mod tests {
         assert!(!rt.is_pending());
         assert!(rt.is_running());
         assert_eq!(rt.initialised, 1);
+    }
+
+    #[test]
+    fn test_pending_is_a_state_not_a_status_string() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        assert!(rt.is_pending());
+
+        // A container that reports "pending" as its status is still a published
+        // entry: only the create that inserted the entry can clear pending.
+        rt.publish_status("pending");
+        assert!(!rt.is_pending());
+        assert_eq!(rt.status, "pending");
+    }
+
+    #[test]
+    fn test_status_string_alone_does_not_make_an_entry_pending() {
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        rt.status = "pending".to_string();
+
+        assert!(!rt.is_pending());
     }
 
     #[test]

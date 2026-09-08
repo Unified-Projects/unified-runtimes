@@ -358,18 +358,44 @@ impl DockerManager {
 
         // Connect to network if specified
         if let Some(ref network) = container_config.network {
-            connect_container(&self.docker, network, &container_config.name).await?;
+            if let Err(error) =
+                connect_container(&self.docker, network, &container_config.name).await
+            {
+                self.discard_unstarted_container(&container_config.name, "network attach failed")
+                    .await;
+                return Err(error);
+            }
         }
 
         // Start container
-        self.docker
+        if let Err(error) = self
+            .docker
             .start_container(&container_config.name, None::<StartContainerOptions>)
             .await
-            .map_err(|e| ExecutorError::Docker(e.to_string()))?;
+        {
+            self.discard_unstarted_container(&container_config.name, "start failed")
+                .await;
+            return Err(ExecutorError::Docker(error.to_string()));
+        }
 
         info!("Started container: {}", container_config.name);
 
         Ok(response.id)
+    }
+
+    /// Force-remove a container that was created but never reached the running
+    /// state. Docker holds the name until the container is removed, so leaving
+    /// it behind turns every later create for the same runtime ID into a 409.
+    async fn discard_unstarted_container(&self, name: &str, reason: &str) {
+        warn!("Removing container {} after {}", name, reason);
+
+        match self.remove_container(name, true).await {
+            Ok(()) | Err(ExecutorError::RuntimeNotFound) => {}
+            Err(error) => warn!(
+                "Failed to remove container {} after {}: {}. The name stays taken until it is removed.",
+                name, reason, error
+            ),
+        }
     }
 
     /// Stop a container

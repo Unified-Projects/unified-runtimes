@@ -126,11 +126,14 @@ fn runtime_from_container(container: &ContainerInfo, hostname: &str) -> Option<R
     runtime.name = container.name.clone();
     runtime.image = container.image.clone();
     runtime.version = version;
-    runtime.status = if container.state.is_empty() {
-        container.status.clone()
+    // Adoption describes a container that already exists, so the entry is
+    // published straight away: no create owns it and nothing else will clear
+    // its pending state.
+    runtime.publish_status(if container.state.is_empty() {
+        &container.status
     } else {
-        container.state.clone()
-    };
+        &container.state
+    });
     runtime.initialised = if is_container_running(container) {
         1
     } else {
@@ -677,6 +680,53 @@ async fn cleanup_untracked_managed_containers(
     }
 }
 
+/// Drop keep-alive owners whose container is not in the observed set.
+///
+/// A create registers ownership as soon as it inserts its pending entry, long
+/// before the container exists: it still has the source to download. Sweeping
+/// that owner away would leave the create to fail at its own registry update and
+/// tear down the container it had just built. Two rules keep that from
+/// happening: a pending entry is never touched, and the check and the removal
+/// both run under the per-ID keep-alive lock, which every create holds for the
+/// length of its build.
+async fn drop_missing_keep_alive_owners(
+    registry: &RuntimeRegistry,
+    keep_alive_registry: &KeepAliveRegistry,
+    container_names: &HashSet<String>,
+) {
+    for (ka_id, owner_name) in keep_alive_registry.get_all_owners() {
+        if container_names.contains(&owner_name) {
+            continue;
+        }
+
+        let _keep_alive_lock = keep_alive_registry.lock(&ka_id).await;
+
+        // Ownership can have moved on while this task waited for the lock.
+        if !keep_alive_registry.is_owner(&ka_id, &owner_name) {
+            continue;
+        }
+
+        if registry
+            .get(&owner_name)
+            .await
+            .is_some_and(|runtime| runtime.is_pending())
+        {
+            debug!(
+                "Keeping keep-alive owner '{}' for '{}': its create is still running",
+                owner_name, ka_id
+            );
+            continue;
+        }
+
+        debug!(
+            "Unregistering missing keep-alive owner '{}' for '{}'",
+            owner_name, ka_id
+        );
+        keep_alive_registry.unregister(&ka_id, &owner_name);
+        registry.remove(&owner_name).await;
+    }
+}
+
 /// Clean up orphaned keepalive containers
 ///
 /// This function handles cases where a container with a keep_alive_id was
@@ -715,17 +765,7 @@ async fn cleanup_orphaned_keepalive(
         }
     }
 
-    // Drop stale owners whose container no longer exists.
-    for (ka_id, owner_name) in keep_alive_registry.get_all_owners() {
-        if !container_names.contains(&owner_name) {
-            debug!(
-                "Unregistering missing keep-alive owner '{}' for '{}'",
-                owner_name, ka_id
-            );
-            keep_alive_registry.unregister(&ka_id, &owner_name);
-            registry.remove(&owner_name).await;
-        }
-    }
+    drop_missing_keep_alive_owners(registry, keep_alive_registry, &container_names).await;
 
     if by_keep_alive.is_empty() {
         debug!("No keep-alive labeled containers to reconcile");
@@ -861,9 +901,9 @@ mod tests {
     };
     use crate::docker::container::ContainerInfo;
     use crate::runtime::create_tracker::BeginCreate;
-    use crate::runtime::{CreateTracker, Runtime, RuntimeRegistry};
+    use crate::runtime::{CreateTracker, KeepAliveRegistry, Runtime, RuntimeRegistry};
     use dashmap::DashMap;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::Notify;
 
@@ -1059,5 +1099,93 @@ mod tests {
             .await
             .expect("a parked waiter must be woken by the reap, not left to its deadline")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_owner_sweep_leaves_a_pending_create_alone() {
+        let registry = RuntimeRegistry::new();
+        let keep_alive_registry = KeepAliveRegistry::new();
+
+        // A create that has registered its ownership and is still downloading:
+        // pending entry, no container yet.
+        registry
+            .insert(Runtime::new(
+                "building",
+                "executor",
+                "img",
+                "v5",
+                Some("svc".to_string()),
+            ))
+            .await
+            .unwrap();
+        keep_alive_registry.register("svc", "executor-building");
+
+        super::drop_missing_keep_alive_owners(&registry, &keep_alive_registry, &HashSet::new())
+            .await;
+
+        assert!(
+            keep_alive_registry.is_owner("svc", "executor-building"),
+            "a create in flight must keep the ownership it registered"
+        );
+        assert!(
+            registry.get("executor-building").await.is_some(),
+            "sweeping the entry would make the create fail at its own registry update"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_owner_sweep_drops_a_published_owner_with_no_container() {
+        let registry = RuntimeRegistry::new();
+        let keep_alive_registry = KeepAliveRegistry::new();
+
+        let mut runtime = Runtime::new("gone", "executor", "img", "v5", Some("svc".to_string()));
+        runtime.mark_running("running");
+        registry.insert(runtime).await.unwrap();
+        keep_alive_registry.register("svc", "executor-gone");
+
+        super::drop_missing_keep_alive_owners(&registry, &keep_alive_registry, &HashSet::new())
+            .await;
+
+        assert!(!keep_alive_registry.is_owner("svc", "executor-gone"));
+        assert!(registry.get("executor-gone").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_owner_sweep_waits_for_the_keep_alive_lock() {
+        let registry = RuntimeRegistry::new();
+        let keep_alive_registry = KeepAliveRegistry::new();
+
+        let mut runtime = Runtime::new("gone", "executor", "img", "v5", Some("svc".to_string()));
+        runtime.mark_running("running");
+        registry.insert(runtime).await.unwrap();
+        keep_alive_registry.register("svc", "executor-gone");
+
+        // A replacement create holds the per-ID lock.
+        let held = keep_alive_registry.lock("svc").await;
+
+        let sweep_registry = registry.clone();
+        let sweep_keep_alive = keep_alive_registry.clone();
+        let sweep = tokio::spawn(async move {
+            super::drop_missing_keep_alive_owners(
+                &sweep_registry,
+                &sweep_keep_alive,
+                &HashSet::new(),
+            )
+            .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            keep_alive_registry.is_owner("svc", "executor-gone"),
+            "the sweep must not touch ownership while a create holds the lock"
+        );
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(2), sweep)
+            .await
+            .expect("the sweep must proceed once the lock is free")
+            .unwrap();
+
+        assert!(!keep_alive_registry.is_owner("svc", "executor-gone"));
     }
 }

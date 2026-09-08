@@ -89,7 +89,8 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_MAINTENANCE_INTERVAL` | `3600` | Seconds between cleanup tasks |
 | `URT_AUTOSCALE` | `false` | Enable autoscale mode with adaptive concurrency limiting |
 | `URT_MAX_CONCURRENT_EXECUTIONS` | `` | Optional max concurrent executions (autoscale mode) |
-| `URT_MAX_CONCURRENT_RUNTIME_CREATES` | `` | Optional max concurrent runtime creations (autoscale mode) |
+| `URT_MAX_CONCURRENT_RUNTIME_CREATES` | `` | Optional max concurrent serve-style runtime creations |
+| `URT_MAX_CONCURRENT_BUILDS` | `max(2, cores / 2)` | Max concurrent build-style creates (build command, or `remove: true`) |
 | `URT_EXECUTION_QUEUE_WAIT_MS` | `2000` | Max queue wait before execution fast-fails with overload |
 | `URT_RUNTIME_CREATE_QUEUE_WAIT_MS` | `5000` | Max queue wait before runtime create fast-fails with overload |
 | `URT_MIN_CPUS` | `0` | Minimum CPU allocation override |

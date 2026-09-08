@@ -238,6 +238,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             .max(1);
         (Some(Arc::new(Semaphore::new(limit))), Some(limit))
     };
+    // Builds run a user command inside the container and can last minutes, so
+    // they draw on their own, smaller pool. Serve-style creates keep the pool
+    // above to themselves and stay answerable during a run of builds.
+    let runtime_build_limiter: Option<Arc<Semaphore>> = {
+        let default_limit = (num_cpus::get() / 2).max(2);
+        let limit = config.max_concurrent_builds.unwrap_or(default_limit).max(1);
+        info!(
+            "  Create concurrency: serve={:?}, build={}",
+            runtime_create_limiter_capacity, limit
+        );
+        Some(Arc::new(Semaphore::new(limit)))
+    };
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -304,6 +316,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         storage,
         execution_limiter,
         runtime_create_limiter,
+        runtime_build_limiter,
         execution_limiter_capacity,
         runtime_create_limiter_capacity,
         readiness,

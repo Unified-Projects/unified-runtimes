@@ -322,6 +322,10 @@ pub struct ExecutorConfig {
     pub eager_runtime_readiness: bool,
     pub max_concurrent_executions: Option<usize>,
     pub max_concurrent_runtime_creates: Option<usize>,
+    /// Permits for build-style creates (a create carrying a build command, or
+    /// one that removes its container afterwards). Separate from the serve-style
+    /// limit so a run of builds cannot starve cold starts.
+    pub max_concurrent_builds: Option<usize>,
     pub execution_queue_wait_ms: u64,
     pub runtime_create_queue_wait_ms: u64,
 
@@ -441,6 +445,9 @@ impl ExecutorConfig {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|v| *v > 0),
             max_concurrent_runtime_creates: env_urt_or_opr("MAX_CONCURRENT_RUNTIME_CREATES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0),
+            max_concurrent_builds: env_urt_or_opr("MAX_CONCURRENT_BUILDS")
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|v| *v > 0),
             execution_queue_wait_ms: env_urt_or_opr("EXECUTION_QUEUE_WAIT_MS")
