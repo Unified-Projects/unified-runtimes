@@ -139,7 +139,8 @@ mod verbatim_prefix_tests {
     }
 }
 
-// These tests assert Unix mode bits, which do not exist on other platforms.
+// The permission helpers are no-ops off Unix and these tests assert on Unix
+// modes, so the module only compiles there.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

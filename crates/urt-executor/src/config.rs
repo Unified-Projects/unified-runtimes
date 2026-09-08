@@ -194,49 +194,126 @@ fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
     deduped
 }
 
+/// Docker Hub namespace that publishes the official OpenRuntimes images.
+const DEFAULT_RUNTIME_NAMESPACE: &str = "openruntimes";
+
+/// Tag generation the runtime table describes. Tags are `<generation>-<version>`.
+const OFFICIAL_RUNTIME_GENERATION: &str = "v5";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OfficialRuntime {
     family: &'static str,
-    latest_image: &'static str,
+    /// Published `v5-*` versions, newest first.
+    versions: &'static [&'static str],
 }
 
-// Verified against Docker Hub on 2026-03-09.
+impl OfficialRuntime {
+    fn latest_version(&self) -> Option<&'static str> {
+        self.versions.first().copied()
+    }
+
+    /// Map a caller-supplied version onto a published tag.
+    ///
+    /// An exact match wins. Otherwise the newest version whose leading
+    /// dot-separated components match is used, so `node-20` reaches the
+    /// published `v5-20.0` tag and `java-21` reaches `v5-21.0`.
+    fn resolve_version(&self, requested: &str) -> Option<&'static str> {
+        if requested.is_empty() {
+            return self.latest_version();
+        }
+
+        if let Some(exact) = self.versions.iter().find(|version| **version == requested) {
+            return Some(exact);
+        }
+
+        self.versions
+            .iter()
+            .find(|version| {
+                version
+                    .strip_prefix(requested)
+                    .is_some_and(|rest| rest.starts_with('.'))
+            })
+            .copied()
+    }
+}
+
+// Verified against Docker Hub on 2026-09-08.
+// Regenerate with `python scripts/refresh-runtime-table.py`.
 const OFFICIAL_RUNTIMES: &[OfficialRuntime] = &[
     OfficialRuntime {
         family: "bun",
-        latest_image: "openruntimes/bun:v5-1.3",
+        versions: &["1.4", "1.3", "1.2", "1.1", "1.0"],
+    },
+    OfficialRuntime {
+        family: "cpp",
+        versions: &["23", "20", "17"],
     },
     OfficialRuntime {
         family: "dart",
-        latest_image: "openruntimes/dart:v5-3.10",
+        versions: &[
+            "3.13", "3.12", "3.11", "3.10", "3.9", "3.8", "3.5", "3.3", "3.1", "3.0", "2.19",
+            "2.18", "2.17", "2.16", "2.15",
+        ],
     },
     OfficialRuntime {
         family: "deno",
-        latest_image: "openruntimes/deno:v5-2.6",
+        versions: &["2.6", "2.5", "2.0", "1.46", "1.40", "1.35", "1.24", "1.21"],
     },
     OfficialRuntime {
         family: "dotnet",
-        latest_image: "openruntimes/dotnet:v5-10",
+        versions: &["10", "8.0", "7.0", "6.0"],
+    },
+    OfficialRuntime {
+        family: "flutter",
+        versions: &[
+            "3.47", "3.44", "3.41", "3.38", "3.35", "3.32", "3.29", "3.27", "3.24",
+        ],
+    },
+    OfficialRuntime {
+        family: "go",
+        versions: &["1.26", "1.25", "1.24", "1.23"],
+    },
+    OfficialRuntime {
+        family: "java",
+        versions: &["25", "22", "21.0", "18.0", "17.0", "11.0", "8.0"],
+    },
+    OfficialRuntime {
+        family: "kotlin",
+        versions: &["2.3", "2.0", "1.9", "1.8", "1.6"],
     },
     OfficialRuntime {
         family: "node",
-        latest_image: "openruntimes/node:v5-25",
+        versions: &[
+            "26", "25", "24", "23", "22", "21.0", "20.0", "19.0", "18.0", "16.0", "14.5",
+        ],
     },
     OfficialRuntime {
         family: "php",
-        latest_image: "openruntimes/php:v5-8.4",
+        versions: &["8.4", "8.3", "8.2", "8.1", "8.0"],
     },
     OfficialRuntime {
         family: "python",
-        latest_image: "openruntimes/python:v5-3.14",
+        versions: &["3.14", "3.13", "3.12", "3.11", "3.10", "3.9", "3.8"],
+    },
+    OfficialRuntime {
+        family: "python-ml",
+        versions: &["3.13", "3.12", "3.11"],
     },
     OfficialRuntime {
         family: "ruby",
-        latest_image: "openruntimes/ruby:v5-4.0",
+        versions: &["4.0", "3.4", "3.3", "3.2", "3.1", "3.0"],
+    },
+    OfficialRuntime {
+        family: "rust",
+        versions: &["1.83"],
     },
     OfficialRuntime {
         family: "static",
-        latest_image: "openruntimes/static:v5-1",
+        versions: &["1"],
+    },
+    OfficialRuntime {
+        family: "swift",
+        versions: &["6.2", "5.10", "5.9", "5.8"],
     },
 ];
 
@@ -246,33 +323,119 @@ fn official_runtime_by_family(family: &str) -> Option<&'static OfficialRuntime> 
         .find(|runtime| runtime.family == family)
 }
 
-fn parse_supported_runtime_family(image: &str) -> Option<&'static str> {
-    let trimmed = image.trim();
+/// Split a shorthand such as `node-22` or `python-ml-3.13` into its family and
+/// requested version. The longest matching family name wins, so `python-ml`
+/// is not read as the `python` family at version `ml`.
+fn split_official_shorthand(name: &str) -> Option<(&'static OfficialRuntime, &str)> {
+    let mut best: Option<(&'static OfficialRuntime, &str)> = None;
 
-    if trimmed.is_empty() {
-        return None;
+    for runtime in OFFICIAL_RUNTIMES {
+        let version = if name == runtime.family {
+            ""
+        } else if let Some(rest) = name
+            .strip_prefix(runtime.family)
+            .and_then(|rest| rest.strip_prefix('-'))
+        {
+            rest
+        } else {
+            continue;
+        };
+
+        if best.is_none_or(|(current, _)| current.family.len() < runtime.family.len()) {
+            best = Some((runtime, version));
+        }
     }
 
-    if let Some(rest) = trimmed.strip_prefix("openruntimes/") {
-        let repository = rest.split(':').next().unwrap_or(rest);
-        return official_runtime_by_family(repository).map(|runtime| runtime.family);
-    }
-
-    if trimmed.contains('/') || trimmed.contains(':') {
-        return None;
-    }
-
-    if let Some(runtime) = official_runtime_by_family(trimmed) {
-        return Some(runtime.family);
-    }
-
-    let (family, _) = trimmed.split_once('-')?;
-    official_runtime_by_family(family).map(|runtime| runtime.family)
+    best
 }
 
-fn is_official_runtime_image(image: &str) -> bool {
-    parse_supported_runtime_family(image).is_some()
+/// True when a caller-requested family is a more specific form of the family
+/// that entrypoint or command detection found, so the request is kept.
+fn family_covers(requested: &str, detected: &str) -> bool {
+    requested == detected
+        || matches!(
+            (requested, detected),
+            ("python-ml", "python") | ("flutter", "dart")
+        )
 }
+
+fn reconcile_family(requested: Option<&'static str>, detected: &'static str) -> &'static str {
+    match requested {
+        Some(requested) if family_covers(requested, detected) => requested,
+        _ => detected,
+    }
+}
+
+/// Command fragments that identify a runtime family, most specific first.
+const COMMAND_MARKERS: &[(&str, &[&str])] = &[
+    ("flutter", &["flutter ", "flutter/bin"]),
+    ("bun", &["bun ", "bunx "]),
+    ("deno", &["deno ", "denon "]),
+    ("php", &["composer ", "composer.phar", "php ", "artisan "]),
+    ("dotnet", &["dotnet ", "nuget "]),
+    (
+        "ruby",
+        &["bundle ", "bundler ", "gem ", "ruby ", "rake ", "rails "],
+    ),
+    ("dart", &["dart ", "pub get"]),
+    ("rust", &["cargo ", "cargo.toml", "rustc ", "rustup "]),
+    (
+        "go",
+        &[
+            "go build",
+            "go run ",
+            "go mod ",
+            "go get ",
+            "go test ",
+            "go install ",
+            "gofmt ",
+        ],
+    ),
+    ("swift", &["swift ", "swiftc ", "package.swift"]),
+    ("kotlin", &["gradlew", "kotlinc ", "kotlin "]),
+    // Plain `gradle` is deliberately absent: Kotlin and Java both use it, so a
+    // caller that asked for either keeps the family it asked for.
+    ("java", &["javac ", "java ", "mvn ", "maven "]),
+    ("cpp", &["cmake ", "cmakelists", "g++ ", "clang++ "]),
+    (
+        "python",
+        &[
+            "python ",
+            "python3 ",
+            "pip ",
+            "pip3 ",
+            "pytest ",
+            "uv ",
+            "poetry ",
+            "gunicorn ",
+            "uvicorn ",
+            "flask ",
+            "django-admin ",
+        ],
+    ),
+    (
+        "node",
+        &[
+            "npm ", "npx ", "pnpm ", "pnpx ", "yarn ", "node ", "tsx ", "ts-node ",
+        ],
+    ),
+];
+
+/// Entrypoint file extensions that identify a runtime family. `.js` and `.ts`
+/// are handled separately because several families share them.
+const ENTRYPOINT_EXTENSIONS: &[(&str, &[&str])] = &[
+    ("php", &[".php"]),
+    ("python", &[".py"]),
+    ("ruby", &[".rb"]),
+    ("dart", &[".dart"]),
+    ("dotnet", &[".cs", ".fs", ".vb"]),
+    ("go", &[".go"]),
+    ("rust", &[".rs"]),
+    ("swift", &[".swift"]),
+    ("kotlin", &[".kt", ".kts"]),
+    ("java", &[".java"]),
+    ("cpp", &[".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hh"]),
+];
 
 fn image_tag_numbers(image: &str) -> Vec<u32> {
     image
@@ -310,6 +473,13 @@ pub struct ExecutorConfig {
     pub runtime_versions: Vec<String>,
     pub image_pull_enabled: bool,
     pub auto_runtime: bool,
+    /// Registry host preferred for auto-resolved official runtimes.
+    /// Empty means Docker Hub.
+    pub runtime_registry: String,
+    /// Namespace preferred for auto-resolved official runtimes.
+    pub runtime_namespace: String,
+    /// Families served from the preferred namespace. Empty means all of them.
+    pub runtime_namespace_families: Vec<String>,
 
     // Resource overrides (URT enhancement)
     pub min_cpus: f64,
@@ -449,6 +619,21 @@ impl ExecutorConfig {
             auto_runtime: env_urt_or_opr("AUTO_RUNTIME")
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
+            runtime_registry: env_urt_or_opr("RUNTIME_REGISTRY")
+                .map(|v| v.trim().trim_matches('/').to_string())
+                .unwrap_or_default(),
+            runtime_namespace: env_urt_or_opr("RUNTIME_NAMESPACE")
+                .map(|v| v.trim().trim_matches('/').to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_RUNTIME_NAMESPACE.to_string()),
+            runtime_namespace_families: dedupe_preserve_order(
+                env_urt_or_opr("RUNTIME_NAMESPACE_FAMILIES")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            ),
 
             // Resource overrides
             min_cpus: env_urt_or_opr("MIN_CPUS")
@@ -593,12 +778,14 @@ impl ExecutorConfig {
     /// Matches against both raw allowed runtimes and their expanded forms
     /// e.g., if allowed_runtimes contains "node-22", it will match "openruntimes/node:v5-22"
     pub fn is_runtime_allowed(&self, image: &str) -> bool {
-        if self.auto_runtime && is_official_runtime_image(image) {
+        let family = self.supported_runtime_family(image);
+
+        if self.auto_runtime && family.is_some() {
             return true;
         }
 
         // Always allow the official static runtime for sites/assets
-        if Self::is_static_runtime_image(image) {
+        if family == Some("static") {
             return true;
         }
 
@@ -618,15 +805,6 @@ impl ExecutorConfig {
         })
     }
 
-    /// Detect the official OpenRuntimes static image (always allowed)
-    fn is_static_runtime_image(image: &str) -> bool {
-        let img = image.to_ascii_lowercase();
-        if let Some(rest) = img.strip_prefix("openruntimes/static") {
-            return rest.is_empty() || rest.starts_with(':');
-        }
-        false
-    }
-
     /// Get a random network from the configured networks
     pub fn random_network(&self) -> Option<&str> {
         if self.networks.is_empty() {
@@ -638,32 +816,41 @@ impl ExecutorConfig {
         }
     }
 
-    /// Expand a shorthand runtime name to a full image reference
-    /// OpenRuntimes format: openruntimes/{runtime}:{version}-{runtime_version}
-    /// Examples:
+    /// Expand a shorthand runtime name to a full image reference.
+    ///
+    /// Official families resolve through the runtime table, so a pinned
+    /// shorthand lands on a published tag and a bare family name lands on the
+    /// newest published version. The repository comes from the preferred
+    /// namespace when one is configured for that family.
+    ///
+    /// Examples with the default namespace:
     ///   "node-22" -> "openruntimes/node:v5-22"
-    ///   "node-20.0" -> "openruntimes/node:v5-20.0"
+    ///   "node-20" -> "openruntimes/node:v5-20.0"
     ///   "python-3.11" -> "openruntimes/python:v5-3.11"
     ///   "openruntimes/node:v5-22" -> "openruntimes/node:v5-22" (unchanged)
     ///   "myregistry/custom:latest" -> "myregistry/custom:latest" (unchanged)
     pub fn expand_runtime_name(&self, name: &str) -> String {
-        let default_version = self.default_runtime_version();
+        let name = name.trim();
+        let generation = self.default_runtime_version();
 
         if name.contains(':') {
             // Already has a tag, use as-is
-            name.to_string()
-        } else if name.contains('/') {
+            return name.to_string();
+        }
+
+        if let Some((runtime, requested_version)) = self.official_shorthand(name) {
+            let version = self
+                .table_version(runtime, requested_version)
+                .unwrap_or(requested_version);
+            return self.official_image(runtime.family, version);
+        }
+
+        if name.contains('/') {
             // Has registry/namespace but no tag, add default version
-            format!("{}:{}", name, default_version)
-        } else if let Some((runtime, runtime_version)) = name.split_once('-') {
-            // Shorthand like "node-22" -> "openruntimes/node:v5-22"
-            format!(
-                "openruntimes/{}:{}-{}",
-                runtime, default_version, runtime_version
-            )
+            format!("{}:{}", name, generation)
         } else {
-            // Just a runtime name without version, use as-is with version tag
-            format!("openruntimes/{}:{}", name, default_version)
+            // Unknown family without a version, keep the historical shape
+            format!("{}/{}:{}", DEFAULT_RUNTIME_NAMESPACE, name, generation)
         }
     }
 
@@ -671,7 +858,122 @@ impl ExecutorConfig {
         self.runtime_versions
             .first()
             .map(|s| s.as_str())
-            .unwrap_or("v5")
+            .unwrap_or(OFFICIAL_RUNTIME_GENERATION)
+    }
+
+    /// Version tags are only known for the generation the table describes; a
+    /// deployment pinned to an older generation keeps whatever it asked for.
+    fn table_version(
+        &self,
+        runtime: &'static OfficialRuntime,
+        requested: &str,
+    ) -> Option<&'static str> {
+        if self.default_runtime_version() != OFFICIAL_RUNTIME_GENERATION {
+            return None;
+        }
+
+        runtime.resolve_version(requested)
+    }
+
+    /// True when `family` should be served from the configured namespace
+    /// instead of the official `openruntimes` one.
+    fn uses_preferred_namespace(&self, family: &str) -> bool {
+        if self.runtime_registry.is_empty() && self.runtime_namespace == DEFAULT_RUNTIME_NAMESPACE {
+            return false;
+        }
+
+        self.runtime_namespace_families.is_empty()
+            || self
+                .runtime_namespace_families
+                .iter()
+                .any(|listed| listed == family)
+    }
+
+    /// Repository prefix (`<registry>/<namespace>/`) of the preferred
+    /// namespace, or `None` when the default namespace is in use.
+    fn preferred_repository_prefix(&self) -> Option<String> {
+        if self.runtime_registry.is_empty() && self.runtime_namespace == DEFAULT_RUNTIME_NAMESPACE {
+            return None;
+        }
+
+        if self.runtime_registry.is_empty() {
+            Some(format!("{}/", self.runtime_namespace))
+        } else {
+            Some(format!(
+                "{}/{}/",
+                self.runtime_registry, self.runtime_namespace
+            ))
+        }
+    }
+
+    fn runtime_repository(&self, family: &str) -> String {
+        match self.preferred_repository_prefix() {
+            Some(prefix) if self.uses_preferred_namespace(family) => {
+                format!("{}{}", prefix, family)
+            }
+            _ => format!("{}/{}", DEFAULT_RUNTIME_NAMESPACE, family),
+        }
+    }
+
+    fn official_image(&self, family: &str, version: &str) -> String {
+        let repository = self.runtime_repository(family);
+        let generation = self.default_runtime_version();
+
+        if version.is_empty() {
+            format!("{}:{}", repository, generation)
+        } else {
+            format!("{}:{}-{}", repository, generation, version)
+        }
+    }
+
+    /// Family and requested version of an untagged official reference, whether
+    /// written as a bare shorthand (`node-22`) or with a recognised repository
+    /// (`openruntimes/node`, `ghcr.io/unified-runtimes/node`).
+    fn official_shorthand<'a>(&self, name: &'a str) -> Option<(&'static OfficialRuntime, &'a str)> {
+        if name.is_empty() {
+            return None;
+        }
+
+        if let Some(family) = name.strip_prefix(&format!("{}/", DEFAULT_RUNTIME_NAMESPACE)) {
+            return official_runtime_by_family(family).map(|runtime| (runtime, ""));
+        }
+
+        if let Some(prefix) = self.preferred_repository_prefix() {
+            if let Some(family) = name.strip_prefix(prefix.as_str()) {
+                return official_runtime_by_family(family)
+                    .filter(|runtime| self.uses_preferred_namespace(runtime.family))
+                    .map(|runtime| (runtime, ""));
+            }
+        }
+
+        if name.contains('/') {
+            return None;
+        }
+
+        split_official_shorthand(name)
+    }
+
+    /// Family of an official runtime image, or `None` for third-party images.
+    pub fn supported_runtime_family(&self, image: &str) -> Option<&'static str> {
+        let trimmed = image.trim();
+
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let repository = trimmed.split(':').next().unwrap_or(trimmed);
+
+        if repository.contains('/') {
+            return self
+                .official_shorthand(repository)
+                .map(|(runtime, _)| runtime.family);
+        }
+
+        if trimmed.contains(':') {
+            return None;
+        }
+
+        split_official_shorthand(trimmed).map(|(runtime, _)| runtime.family)
     }
 
     fn latest_allowed_official_image(&self, family: &str) -> Option<String> {
@@ -680,8 +982,7 @@ impl ExecutorConfig {
             .iter()
             .map(|image| self.normalize_runtime_image(image))
             .filter(|image| {
-                image.starts_with("openruntimes/")
-                    && parse_supported_runtime_family(image) == Some(family)
+                image.contains('/') && self.supported_runtime_family(image) == Some(family)
             })
             .collect();
 
@@ -691,10 +992,13 @@ impl ExecutorConfig {
 
     fn preferred_official_image(&self, family: &str) -> Option<String> {
         if self.auto_runtime || self.allowed_runtimes.is_empty() {
-            official_runtime_by_family(family).map(|runtime| runtime.latest_image.to_string())
-        } else {
-            self.latest_allowed_official_image(family)
+            let runtime = official_runtime_by_family(family)?;
+            if let Some(version) = self.table_version(runtime, "") {
+                return Some(self.official_image(family, version));
+            }
         }
+
+        self.latest_allowed_official_image(family)
     }
 
     fn detect_runtime_family(
@@ -717,71 +1021,26 @@ impl ExecutorConfig {
             return requested_family;
         }
 
-        for (family, markers) in [
-            ("bun", &["bun ", "bunx "][..]),
-            ("deno", &["deno ", "denon "][..]),
-            (
-                "php",
-                &["composer ", "composer.phar", "php ", "artisan "][..],
-            ),
-            ("dotnet", &["dotnet ", "nuget "][..]),
-            (
-                "ruby",
-                &["bundle ", "bundler ", "gem ", "ruby ", "rake ", "rails "][..],
-            ),
-            (
-                "dart",
-                &["dart ", "flutter pub ", "flutter run ", "flutter build "][..],
-            ),
-            (
-                "python",
-                &[
-                    "python ",
-                    "python3 ",
-                    "pip ",
-                    "pip3 ",
-                    "pytest ",
-                    "uv ",
-                    "poetry ",
-                    "gunicorn ",
-                    "uvicorn ",
-                    "flask ",
-                    "django-admin ",
-                ][..],
-            ),
-            (
-                "node",
-                &[
-                    "npm ", "npx ", "pnpm ", "pnpx ", "yarn ", "node ", "tsx ", "ts-node ",
-                ][..],
-            ),
-        ] {
+        for (family, markers) in COMMAND_MARKERS {
             if markers
                 .iter()
                 .any(|marker| command_context.contains(marker))
             {
-                return Some(family);
+                return Some(reconcile_family(requested_family, family));
             }
         }
 
         let entrypoint = entrypoint.trim().to_ascii_lowercase();
 
-        if entrypoint.ends_with(".php") {
-            return Some("php");
+        for (family, extensions) in ENTRYPOINT_EXTENSIONS {
+            if extensions
+                .iter()
+                .any(|extension| entrypoint.ends_with(extension))
+            {
+                return Some(reconcile_family(requested_family, family));
+            }
         }
-        if entrypoint.ends_with(".py") {
-            return Some("python");
-        }
-        if entrypoint.ends_with(".rb") {
-            return Some("ruby");
-        }
-        if entrypoint.ends_with(".dart") {
-            return Some("dart");
-        }
-        if entrypoint.ends_with(".cs") || entrypoint.ends_with(".fs") || entrypoint.ends_with(".vb")
-        {
-            return Some("dotnet");
-        }
+
         if entrypoint.ends_with(".js")
             || entrypoint.ends_with(".cjs")
             || entrypoint.ends_with(".mjs")
@@ -812,9 +1071,7 @@ impl ExecutorConfig {
             return String::new();
         }
 
-        if (trimmed.starts_with("openruntimes/") || !trimmed.contains('/'))
-            && parse_supported_runtime_family(trimmed).is_some()
-        {
+        if self.supported_runtime_family(trimmed).is_some() {
             return self.expand_runtime_name(trimmed);
         }
 
@@ -834,8 +1091,9 @@ impl ExecutorConfig {
             return normalized_image;
         }
 
-        let requested_family = parse_supported_runtime_family(image)
-            .or_else(|| parse_supported_runtime_family(&normalized_image));
+        let requested_family = self
+            .supported_runtime_family(image)
+            .or_else(|| self.supported_runtime_family(&normalized_image));
         let auto_managed_image = image.trim().is_empty() || requested_family.is_some();
         let detected_family =
             self.detect_runtime_family(requested_family, entrypoint, runtime_entrypoint, command);
@@ -1003,7 +1261,7 @@ mod tests {
         // With namespace but no tag -> add version
         assert_eq!(
             config.expand_runtime_name("openruntimes/node"),
-            "openruntimes/node:v5"
+            "openruntimes/node:v5-26"
         );
         assert_eq!(
             config.expand_runtime_name("myregistry/custom"),
@@ -1066,11 +1324,11 @@ mod tests {
         );
         assert_eq!(
             config.normalize_runtime_image("node"),
-            "openruntimes/node:v5"
+            "openruntimes/node:v5-26"
         );
         assert_eq!(
             config.normalize_runtime_image("openruntimes/php"),
-            "openruntimes/php:v5"
+            "openruntimes/php:v5-8.4"
         );
     }
 
@@ -1082,7 +1340,7 @@ mod tests {
 
         assert_eq!(
             config.resolve_runtime_image("node-22", "index.js", "", ""),
-            "openruntimes/node:v5-25"
+            "openruntimes/node:v5-26"
         );
     }
 
@@ -1094,7 +1352,7 @@ mod tests {
 
         assert_eq!(
             config.resolve_runtime_image("node-22", "index.js", "", "bun install"),
-            "openruntimes/bun:v5-1.3"
+            "openruntimes/bun:v5-1.4"
         );
     }
 
@@ -1111,7 +1369,7 @@ mod tests {
                 "",
                 "tar -zxf /tmp/code.tar.gz -C /mnt/code && helpers/build.sh 'source /usr/local/server/helpers/next-js/env.sh && bun install && bun run build'"
             ),
-            "openruntimes/node:v5-25"
+            "openruntimes/node:v5-26"
         );
     }
 
@@ -1135,7 +1393,7 @@ mod tests {
 
         assert_eq!(
             config.resolve_runtime_image("node-22", "index.js", "", "npm install"),
-            "openruntimes/node:v5-25"
+            "openruntimes/node:v5-26"
         );
     }
 
@@ -1161,5 +1419,383 @@ mod tests {
             config.resolve_runtime_image("", "index.php", "", ""),
             "openruntimes/php:v5-8.4"
         );
+    }
+
+    fn version_components(version: &str) -> Vec<u32> {
+        version
+            .split('.')
+            .map(|part| part.parse::<u32>().expect("version component is numeric"))
+            .collect()
+    }
+
+    fn auto_config() -> ExecutorConfig {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec![];
+        config.runtime_versions = vec!["v5".to_string()];
+        config.runtime_registry = String::new();
+        config.runtime_namespace = DEFAULT_RUNTIME_NAMESPACE.to_string();
+        config.runtime_namespace_families = vec![];
+        config
+    }
+
+    fn namespaced_config(families: Vec<String>) -> ExecutorConfig {
+        let mut config = auto_config();
+        config.runtime_registry = "ghcr.io".to_string();
+        config.runtime_namespace = "unified-runtimes".to_string();
+        config.runtime_namespace_families = families;
+        config
+    }
+
+    #[test]
+    fn test_official_runtime_table_is_well_formed() {
+        let mut families: Vec<&str> = Vec::new();
+
+        for runtime in OFFICIAL_RUNTIMES {
+            assert!(
+                !runtime.versions.is_empty(),
+                "{} has no versions",
+                runtime.family
+            );
+            assert!(
+                !families.contains(&runtime.family),
+                "{} is listed twice",
+                runtime.family
+            );
+            assert!(
+                runtime
+                    .family
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '-'),
+                "{} is not a lowercase family name",
+                runtime.family
+            );
+            families.push(runtime.family);
+
+            assert_eq!(
+                runtime.latest_version(),
+                runtime.versions.first().copied(),
+                "{} latest version is not the head of its version list",
+                runtime.family
+            );
+
+            let mut previous: Option<Vec<u32>> = None;
+            for version in runtime.versions {
+                assert!(
+                    !version.is_empty()
+                        && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+                        && !version.starts_with('.')
+                        && !version.ends_with('.'),
+                    "{}:{} is not a well-formed version",
+                    runtime.family,
+                    version
+                );
+
+                let components = version_components(version);
+                if let Some(previous) = previous {
+                    assert!(
+                        previous > components,
+                        "{} versions are not ordered newest first ({:?} then {:?})",
+                        runtime.family,
+                        previous,
+                        components
+                    );
+                }
+                previous = Some(components);
+            }
+        }
+
+        assert!(
+            families.windows(2).all(|pair| pair[0] < pair[1]),
+            "families are not in alphabetical order"
+        );
+    }
+
+    #[test]
+    fn test_official_latest_images_are_well_formed_v5_tags() {
+        let config = auto_config();
+
+        for runtime in OFFICIAL_RUNTIMES {
+            let latest = runtime
+                .latest_version()
+                .expect("family has a latest version");
+            let image = config.official_image(runtime.family, latest);
+
+            assert_eq!(
+                image,
+                format!("openruntimes/{}:v5-{}", runtime.family, latest)
+            );
+            assert_eq!(
+                config.supported_runtime_family(&image),
+                Some(runtime.family)
+            );
+            assert!(
+                runtime.versions.contains(&latest),
+                "{} latest tag is missing from its version list",
+                runtime.family
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_family_resolves_from_its_bare_shorthand() {
+        let config = auto_config();
+
+        for runtime in OFFICIAL_RUNTIMES {
+            let latest = runtime
+                .latest_version()
+                .expect("family has a latest version");
+
+            assert_eq!(
+                config.normalize_runtime_image(runtime.family),
+                format!("openruntimes/{}:v5-{}", runtime.family, latest),
+                "bare {} shorthand did not resolve to its latest tag",
+                runtime.family
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_runtime_name_new_families() {
+        let config = auto_config();
+
+        assert_eq!(
+            config.expand_runtime_name("go-1.23"),
+            "openruntimes/go:v5-1.23"
+        );
+        assert_eq!(
+            config.expand_runtime_name("rust-1.83"),
+            "openruntimes/rust:v5-1.83"
+        );
+        assert_eq!(
+            config.expand_runtime_name("swift-6.2"),
+            "openruntimes/swift:v5-6.2"
+        );
+        assert_eq!(
+            config.expand_runtime_name("kotlin-2.3"),
+            "openruntimes/kotlin:v5-2.3"
+        );
+        assert_eq!(
+            config.expand_runtime_name("cpp-23"),
+            "openruntimes/cpp:v5-23"
+        );
+        assert_eq!(
+            config.expand_runtime_name("flutter-3.47"),
+            "openruntimes/flutter:v5-3.47"
+        );
+        assert_eq!(
+            config.expand_runtime_name("python-ml-3.12"),
+            "openruntimes/python-ml:v5-3.12"
+        );
+    }
+
+    #[test]
+    fn test_expand_runtime_name_maps_pins_onto_published_tags() {
+        let config = auto_config();
+
+        // Published tags carry a trailing ".0" for these versions.
+        assert_eq!(
+            config.expand_runtime_name("node-20"),
+            "openruntimes/node:v5-20.0"
+        );
+        assert_eq!(
+            config.expand_runtime_name("java-21"),
+            "openruntimes/java:v5-21.0"
+        );
+        assert_eq!(
+            config.expand_runtime_name("dotnet-8"),
+            "openruntimes/dotnet:v5-8.0"
+        );
+
+        // Exact matches are preserved.
+        assert_eq!(
+            config.expand_runtime_name("node-22"),
+            "openruntimes/node:v5-22"
+        );
+        assert_eq!(
+            config.expand_runtime_name("go-1.26"),
+            "openruntimes/go:v5-1.26"
+        );
+
+        // A version the table does not know is passed through untouched so a
+        // deployment can pin a tag published after the last table refresh.
+        assert_eq!(
+            config.expand_runtime_name("node-99"),
+            "openruntimes/node:v5-99"
+        );
+    }
+
+    #[test]
+    fn test_python_ml_shorthand_is_not_read_as_python() {
+        let config = auto_config();
+
+        assert_eq!(
+            config.supported_runtime_family("python-ml-3.11"),
+            Some("python-ml")
+        );
+        assert_eq!(
+            config.expand_runtime_name("python-ml-3.11"),
+            "openruntimes/python-ml:v5-3.11"
+        );
+        assert_eq!(
+            config.resolve_runtime_image(
+                "python-ml-3.13",
+                "main.py",
+                "",
+                "pip install -r requirements.txt"
+            ),
+            "openruntimes/python-ml:v5-3.13"
+        );
+    }
+
+    #[test]
+    fn test_preferred_namespace_used_for_auto_resolution() {
+        let config = namespaced_config(vec![]);
+
+        assert_eq!(
+            config.resolve_runtime_image("node-22", "index.js", "", "npm install"),
+            "ghcr.io/unified-runtimes/node:v5-26"
+        );
+        assert_eq!(
+            config.normalize_runtime_image("node-22"),
+            "ghcr.io/unified-runtimes/node:v5-22"
+        );
+        assert_eq!(
+            config.normalize_runtime_image("openruntimes/go"),
+            "ghcr.io/unified-runtimes/go:v5-1.26"
+        );
+        assert_eq!(
+            config.supported_runtime_family("ghcr.io/unified-runtimes/node:v5-24"),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn test_preferred_namespace_falls_back_for_unlisted_families() {
+        let config = namespaced_config(vec!["node".to_string(), "go".to_string()]);
+
+        assert_eq!(
+            config.resolve_runtime_image("", "main.go", "", ""),
+            "ghcr.io/unified-runtimes/go:v5-1.26"
+        );
+        assert_eq!(
+            config.resolve_runtime_image("", "index.php", "", ""),
+            "openruntimes/php:v5-8.4"
+        );
+        assert_eq!(
+            config.normalize_runtime_image("python-3.11"),
+            "openruntimes/python:v5-3.11"
+        );
+
+        // An unlisted family stays a third-party reference when a caller spells
+        // it out against the preferred namespace.
+        assert_eq!(
+            config.supported_runtime_family("ghcr.io/unified-runtimes/python:v5-3.11"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_namespace_without_registry_targets_docker_hub() {
+        let mut config = auto_config();
+        config.runtime_namespace = "unifiedruntimes".to_string();
+
+        assert_eq!(
+            config.resolve_runtime_image("node-22", "index.js", "", ""),
+            "unifiedruntimes/node:v5-26"
+        );
+    }
+
+    #[test]
+    fn test_preferred_namespace_never_rewrites_explicit_images() {
+        let config = namespaced_config(vec![]);
+
+        assert_eq!(
+            config.resolve_runtime_image("custom/runtime:latest", "index.js", "", "npm install"),
+            "custom/runtime:latest"
+        );
+        assert_eq!(
+            config.resolve_runtime_image("ghcr.io/someone-else/node:v5-22", "index.js", "", ""),
+            "ghcr.io/someone-else/node:v5-22"
+        );
+    }
+
+    #[test]
+    fn test_detect_runtime_family_from_new_entrypoints() {
+        let config = auto_config();
+
+        for (entrypoint, expected) in [
+            ("main.go", "openruntimes/go:v5-1.26"),
+            ("src/main.rs", "openruntimes/rust:v5-1.83"),
+            ("Sources/Tests.swift", "openruntimes/swift:v5-6.2"),
+            ("Tests.kt", "openruntimes/kotlin:v5-2.3"),
+            ("Tests.java", "openruntimes/java:v5-25"),
+            ("tests.cc", "openruntimes/cpp:v5-23"),
+            ("src/main.cpp", "openruntimes/cpp:v5-23"),
+        ] {
+            assert_eq!(
+                config.resolve_runtime_image("", entrypoint, "", ""),
+                expected,
+                "entrypoint {} was not detected",
+                entrypoint
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_runtime_family_from_new_commands() {
+        let config = auto_config();
+
+        for (command, expected) in [
+            ("go build -o server .", "openruntimes/go:v5-1.26"),
+            ("cargo build --release", "openruntimes/rust:v5-1.83"),
+            ("cat Cargo.toml", "openruntimes/rust:v5-1.83"),
+            ("swift build -c release", "openruntimes/swift:v5-6.2"),
+            ("bash gradlew build", "openruntimes/kotlin:v5-2.3"),
+            ("mvn package", "openruntimes/java:v5-25"),
+            ("cmake -S . -B build", "openruntimes/cpp:v5-23"),
+            ("flutter build web", "openruntimes/flutter:v5-3.47"),
+        ] {
+            assert_eq!(
+                config.resolve_runtime_image("", "", "", command),
+                expected,
+                "command {} was not detected",
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_runtime_family_keeps_more_specific_request() {
+        let config = auto_config();
+
+        // Flutter builds run Dart code; a flutter request is not downgraded.
+        assert_eq!(
+            config.resolve_runtime_image("flutter-3.47", "lib/main.dart", "", "dart pub get"),
+            "openruntimes/flutter:v5-3.47"
+        );
+
+        // A dart request still resolves to dart.
+        assert_eq!(
+            config.resolve_runtime_image("dart-3.13", "lib/main.dart", "", "dart pub get"),
+            "openruntimes/dart:v5-3.13"
+        );
+
+        // A flutter command overrides a dart request.
+        assert_eq!(
+            config.resolve_runtime_image("dart-3.13", "", "", "flutter build web"),
+            "openruntimes/flutter:v5-3.47"
+        );
+    }
+
+    #[test]
+    fn test_is_runtime_allowed_covers_new_families() {
+        let mut config = ExecutorConfig::from_env();
+        config.auto_runtime = true;
+        config.allowed_runtimes = vec!["node-22".to_string()];
+
+        assert!(config.is_runtime_allowed("openruntimes/go:v5-1.26"));
+        assert!(config.is_runtime_allowed("openruntimes/python-ml:v5-3.13"));
+        assert!(!config.is_runtime_allowed("custom/go:v5-1.26"));
     }
 }

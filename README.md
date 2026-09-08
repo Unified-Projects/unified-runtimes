@@ -106,10 +106,53 @@ All configuration is via environment variables. URT variables take priority over
 | `URT_CRASH_LOOP_THRESHOLD` | `3` | Deaths inside the crash-loop window that quarantine a runtime |
 | `URT_CRASH_LOOP_WINDOW_SECS` | `60` | Window over which runtime deaths are counted |
 | `URT_QUARANTINE_SECS` | `300` | How long a crash-looping runtime answers 503 on execute and 409 on create |
+| `URT_RUNTIME_NAMESPACE` | `openruntimes` | Namespace auto-resolution prefers for official runtime families |
+| `URT_RUNTIME_REGISTRY` | `` | Registry host for the preferred namespace (empty means Docker Hub), e.g. `ghcr.io` |
+| `URT_RUNTIME_NAMESPACE_FAMILIES` | `` | Comma-separated families served from the preferred namespace; empty means all of them |
 | `URT_CONNECTION_STORAGE` | `local://localhost` | Storage DSN for builds |
 | `URT_CACHE_CLEANUP_ON_SHUTDOWN` | `false` | If true, purge local download cache during shutdown |
 
 See `.env.example` for the complete list with descriptions.
+
+### Runtime resolution
+
+The executor ships a table of the official OpenRuntimes families and their
+published `v5` tags: `bun`, `cpp`, `dart`, `deno`, `dotnet`, `flutter`, `go`,
+`java`, `kotlin`, `node`, `php`, `python`, `python-ml`, `ruby`, `rust`,
+`static` and `swift`.
+
+Shorthands in `URT_RUNTIMES` and in `image` on `POST /v1/runtimes` expand
+against that table:
+
+- `node-22` becomes `openruntimes/node:v5-22`
+- `node-20` becomes `openruntimes/node:v5-20.0`, the tag that is actually
+  published for that line
+- `go` (no version) becomes the newest published tag for the family
+- a version the table does not know, such as `node-99`, is passed through as
+  `openruntimes/node:v5-99` so a deployment can pin a tag published after the
+  last table refresh
+
+With `URT_AUTO_RUNTIME=true` (the default) a request whose entrypoint or build
+command reveals a different family, for example `main.go` or `cargo build`, is
+resolved to the newest tag of the family it really needs.
+
+Set `URT_RUNTIME_NAMESPACE` and `URT_RUNTIME_REGISTRY` to serve those families
+from your own mirror. With `URT_RUNTIME_REGISTRY=ghcr.io` and
+`URT_RUNTIME_NAMESPACE=unified-runtimes`, `node-22` resolves to
+`ghcr.io/unified-runtimes/node:v5-22`. `URT_RUNTIME_NAMESPACE_FAMILIES` narrows
+that to a subset, for example `node,python,go`; every other family keeps
+falling back to `openruntimes/<family>`. Image references that are not an
+official family are never rewritten, whichever namespace is configured.
+
+The table is static data, verified against Docker Hub on the date recorded in
+`crates/urt-executor/src/config.rs`. Regenerate it with:
+
+```bash
+python scripts/refresh-runtime-table.py
+```
+
+The script prints the `OFFICIAL_RUNTIMES` constant, refreshed comment included,
+ready to paste over the existing one. `--json` prints the raw tag data instead.
 
 ## API Endpoints
 

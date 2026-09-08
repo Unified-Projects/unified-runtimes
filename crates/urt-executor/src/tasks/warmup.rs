@@ -23,7 +23,7 @@ pub async fn run_warmup(docker: Arc<DockerManager>, config: ExecutorConfig) {
     }
 
     // Expand shorthand runtime names to full image references
-    // e.g., "node-22" -> "openruntimes/node-22:v5"
+    // e.g., "node-22" -> "openruntimes/node:v5-22"
     let expanded_runtimes = config.expanded_runtimes();
 
     info!(
