@@ -44,7 +44,9 @@ pub async fn set_permissions_recursive(_path: &std::path::Path) -> std::io::Resu
     Ok(())
 }
 
-#[cfg(test)]
+// The permission helpers are no-ops off Unix and these tests assert on Unix
+// modes, so the module only compiles there.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
