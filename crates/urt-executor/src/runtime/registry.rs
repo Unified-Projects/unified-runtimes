@@ -114,14 +114,33 @@ impl RuntimeRegistry {
         }
     }
 
-    /// Mark a runtime as listening on port 3000
-    /// Called after successful TCP port check (matching executor-main)
+    /// Mark a runtime as listening on port 3000, which is also what sets
+    /// `initialised`. Called after a successful TCP port check.
     pub async fn set_listening(&self, name: &str) -> Result<()> {
         if let Some(mut runtime) = self.runtimes.get_mut(name) {
             runtime.set_listening();
             Ok(())
         } else {
             Err(ExecutorError::RuntimeNotFound)
+        }
+    }
+
+    /// Record that a runtime started but never listened within its startup
+    /// window. The entry keeps its place in the registry with a `failed` status
+    /// so `GET /v1/runtimes` shows the verdict; the listening watchdog removes it
+    /// on its next cycle. Returns the runtime as it now stands.
+    ///
+    /// A runtime that is already listening is left alone, which closes the race
+    /// against a probe that succeeded while the sweep was deciding.
+    pub async fn mark_failed(&self, name: &str) -> Result<Runtime> {
+        match self.runtimes.get_mut(name) {
+            Some(mut runtime) => {
+                if !runtime.is_listening() {
+                    runtime.mark_failed();
+                }
+                Ok(runtime.clone())
+            }
+            None => Err(ExecutorError::RuntimeNotFound),
         }
     }
 
@@ -145,7 +164,13 @@ impl RuntimeRegistry {
             Ok(info) => {
                 // Re-acquire write access only for the mutation; the async work is done.
                 if let Some(mut runtime) = self.runtimes.get_mut(name) {
-                    runtime.status = info.state;
+                    // `failed` is the executor's verdict on a runtime that never
+                    // listened, not a container state. Docker still reports the
+                    // container as running, so overwriting here would resurrect
+                    // the entry before the watchdog reaps it.
+                    if !runtime.is_failed() {
+                        runtime.status = info.state;
+                    }
                     return Some(runtime.clone());
                 }
                 None
@@ -171,11 +196,14 @@ impl RuntimeRegistry {
         }
     }
 
-    /// Get runtimes that have been idle for more than threshold seconds
-    pub async fn get_idle(&self, threshold_secs: u64) -> Vec<Runtime> {
+    /// Get runtimes that have been idle for longer than they tolerate.
+    ///
+    /// Each runtime is measured against its own `inactiveThreshold`;
+    /// `default_threshold` applies to entries that carry no value of their own.
+    pub async fn get_idle(&self, default_threshold: u64) -> Vec<Runtime> {
         self.runtimes
             .iter()
-            .filter(|r| r.idle_seconds() > threshold_secs)
+            .filter(|r| r.idle_seconds() > r.effective_inactive_threshold(default_threshold))
             .map(|r| r.clone())
             .collect()
     }
@@ -285,6 +313,62 @@ mod tests {
 
         let updated = registry.get(&name).await.unwrap();
         assert_eq!(updated.updated, original_updated);
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed_sets_the_status_and_clears_initialised() {
+        let registry = RuntimeRegistry::new();
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        let name = rt.name.clone();
+        registry.insert(rt).await.unwrap();
+
+        let failed = registry.mark_failed(&name).await.unwrap();
+        assert!(failed.is_failed());
+        assert_eq!(failed.initialised, 0);
+
+        // Still listed, so operators can see the verdict before it is reaped.
+        assert_eq!(registry.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed_does_not_condemn_a_runtime_that_started_listening() {
+        let registry = RuntimeRegistry::new();
+        let mut rt = Runtime::new("test", "exec", "img", "v5", None);
+        rt.mark_running("running");
+        let name = rt.name.clone();
+        registry.insert(rt).await.unwrap();
+        registry.set_listening(&name).await.unwrap();
+
+        let runtime = registry.mark_failed(&name).await.unwrap();
+        assert!(!runtime.is_failed());
+        assert_eq!(runtime.initialised, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_idle_uses_the_per_runtime_threshold() {
+        let registry = RuntimeRegistry::new();
+
+        let mut patient = Runtime::new("patient", "exec", "img", "v5", None);
+        patient.mark_running("running");
+        patient.inactive_threshold = 3_600;
+        patient.updated -= 120.0;
+        let patient_name = patient.name.clone();
+
+        let mut impatient = Runtime::new("impatient", "exec", "img", "v5", None);
+        impatient.mark_running("running");
+        impatient.inactive_threshold = 5;
+        impatient.updated -= 120.0;
+        let impatient_name = impatient.name.clone();
+
+        registry.insert(patient).await.unwrap();
+        registry.insert(impatient).await.unwrap();
+
+        let idle = registry.get_idle(60).await;
+        let idle_names: Vec<&str> = idle.iter().map(|r| r.name.as_str()).collect();
+
+        assert_eq!(idle_names, vec![impatient_name.as_str()]);
+        assert!(!idle_names.contains(&patient_name.as_str()));
     }
 
     #[tokio::test]

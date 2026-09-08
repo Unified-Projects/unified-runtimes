@@ -9,7 +9,9 @@ use crate::platform;
 use crate::resilience::{is_transient_error, retry_with_backoff};
 use crate::runtime::create_tracker::spawn_or_join;
 use crate::runtime::readiness::ReadinessGuard;
-use crate::runtime::{wait_for_runtime_port, KeepAliveRegistry, Runtime};
+use crate::runtime::{
+    wait_for_runtime_port, KeepAliveRegistry, Runtime, RuntimeLifecycle, RUNTIME_PORT,
+};
 use crate::storage;
 use crate::tasks;
 use crate::telemetry::{metrics, LatencyKind, OperationTimer};
@@ -64,6 +66,31 @@ pub struct CreateRuntimeRequest {
     /// Fallback: reads URT_KEEP_ALIVE from container's env if not provided.
     #[serde(default)]
     pub keep_alive_id: Option<String>,
+    /// Seconds this runtime has to start listening on its port before the
+    /// executor marks it failed. Defaults to `URT_STARTUP_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub startup_timeout: Option<u64>,
+    /// Seconds of inactivity before maintenance may reclaim this runtime.
+    /// Defaults to `URT_INACTIVE_THRESHOLD`.
+    #[serde(default)]
+    pub inactive_threshold: Option<u64>,
+    /// Cap on executions in flight against this runtime. Defaults to
+    /// `URT_RUNTIME_MAX_CONCURRENCY`, which is unlimited unless set.
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
+}
+
+impl CreateRuntimeRequest {
+    /// Resolve the per-runtime lifecycle knobs against the executor defaults.
+    fn lifecycle(&self, defaults: RuntimeLifecycle) -> RuntimeLifecycle {
+        RuntimeLifecycle {
+            startup_timeout: self.startup_timeout.unwrap_or(defaults.startup_timeout),
+            inactive_threshold: self
+                .inactive_threshold
+                .unwrap_or(defaults.inactive_threshold),
+            max_concurrency: self.max_concurrency.or(defaults.max_concurrency),
+        }
+    }
 }
 
 pub fn default_timeout() -> u32 {
@@ -496,6 +523,7 @@ async fn reconcile_existing_runtime_id(
                 &state.keep_alive_registry,
                 &state.config.hostname,
                 full_name,
+                state.config.runtime_lifecycle_defaults(),
             )
             .await
             {
@@ -557,6 +585,37 @@ fn source_download_error(source: &str, error: ExecutorError) -> ExecutorError {
     } else {
         ExecutorError::RuntimeFailed(message)
     }
+}
+
+/// Watch a freshly created runtime until it starts listening, then record it.
+///
+/// `initialised` is only ever set by an observed listener, so without this a
+/// runtime that nothing executes against would stay uninitialised until the
+/// watchdog's next sweep. The task ends at the runtime's startup window; the
+/// watchdog owns the decision to give up on it.
+fn spawn_listening_probe(state: &AppState, full_name: String, startup_timeout: u64) {
+    let registry = state.registry.clone();
+
+    tokio::spawn(async move {
+        let window = Duration::from_secs(startup_timeout.max(1));
+
+        match wait_for_runtime_port(&full_name, RUNTIME_PORT, window).await {
+            Ok(()) => {
+                if registry.set_listening(&full_name).await.is_ok() {
+                    debug!(
+                        "Runtime {} is listening on port {}",
+                        full_name, RUNTIME_PORT
+                    );
+                }
+            }
+            Err(_) => {
+                debug!(
+                    "Runtime {} has not listened on port {} within {}s",
+                    full_name, RUNTIME_PORT, startup_timeout
+                );
+            }
+        }
+    });
 }
 
 /// Everything a build needs once the request has been validated.
@@ -712,13 +771,15 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
     };
 
     // Create runtime entry
+    let lifecycle = req.lifecycle(state.config.runtime_lifecycle_defaults());
     let runtime = Runtime::new(
         &req.runtime_id,
         &state.config.hostname,
         &resolved_image,
         &req.version,
         keep_alive_id.clone(),
-    );
+    )
+    .with_lifecycle(lifecycle);
 
     // Register as pending. The 409 from a concurrent create_runtime surfaces here
     // before any notifier or Docker resource is allocated (M8).
@@ -784,8 +845,10 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
     env.insert("CI".to_string(), "true".to_string());
 
     // Build container config
+    // The container hostname is left to Docker, matching executor-main. Nothing
+    // reaches a runtime by hostname; the lifecycle knobs are carried as labels so
+    // adoption after an executor restart restores them.
     let mut container = ContainerConfig::new(&full_name, &resolved_image)
-        .with_hostname(&runtime.hostname)
         .with_cpus(cpus)
         .with_memory_mb(memory)
         .with_envs(env)
@@ -793,7 +856,8 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
         .with_label("urt.managed", "true")
         .with_label("urt.executor_hostname", &state.config.hostname)
         .with_label("urt.runtime_id", &req.runtime_id)
-        .with_label("urt.version", &req.version);
+        .with_label("urt.version", &req.version)
+        .with_labels(runtime.lifecycle().to_labels());
 
     if let Some(ref ka_id) = keep_alive_id {
         container = container.with_label("urt.keep_alive_id", ka_id);
@@ -1248,9 +1312,12 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
         let mut updated_runtime = runtime.clone();
         if state.config.eager_runtime_readiness {
             let port_timeout_secs = u64::from(req.timeout.clamp(1, 30));
-            if let Err(error) =
-                wait_for_runtime_port(&full_name, 3000, Duration::from_secs(port_timeout_secs))
-                    .await
+            if let Err(error) = wait_for_runtime_port(
+                &full_name,
+                RUNTIME_PORT,
+                Duration::from_secs(port_timeout_secs),
+            )
+            .await
             {
                 error!(
                     "Runtime {} failed port readiness: {}",
@@ -1265,6 +1332,8 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
             updated_runtime.set_listening();
         }
         updated_runtime.mark_running("running");
+        let listening = updated_runtime.is_listening();
+        let startup_timeout = updated_runtime.startup_timeout;
         if let Err(e) = state.registry.update(updated_runtime).await {
             // Entry was concurrently removed (e.g. a racing DELETE). Wake any
             // parked waiters first so they re-check and return a deterministic
@@ -1280,6 +1349,14 @@ async fn run_create(build: RuntimeBuild) -> Result<CreateRuntimeResponse> {
         // that woken waiters find a non-pending entry.
         readiness_guard.disarm();
         state.readiness_notify_and_remove(&full_name);
+
+        // The runtime is published as running but not yet initialised: it has
+        // not proved it can serve. This probe flips `initialised` the moment it
+        // starts listening, for runtimes that no execution arrives at. A runtime
+        // that never listens is left to the watchdog, which marks it failed.
+        if !listening {
+            spawn_listening_probe(&state, full_name.clone(), startup_timeout);
+        }
     }
 
     // If a keep-alive ID was transferred, clean up the previous owner now that
@@ -1334,6 +1411,7 @@ pub async fn get_runtime(
             &state.keep_alive_registry,
             &state.config.hostname,
             &full_name,
+            state.config.runtime_lifecycle_defaults(),
         )
         .await;
 
@@ -1505,10 +1583,11 @@ async fn cleanup_previous_keep_alive_runtime(
 mod tests {
     use super::{
         apply_runtime_env_vars, is_legacy_v2, is_live_container_state, sanitize_tar_flags,
-        source_mount_file_name, uses_modern_runtime_layout, KeepAliveRegistrationGuard,
-        RuntimeEnvVars, DEFAULT_RUNTIME_BIND_HOSTNAME, RUNTIME_BIND_HOSTNAME_VAR,
+        source_mount_file_name, uses_modern_runtime_layout, CreateRuntimeRequest,
+        KeepAliveRegistrationGuard, RuntimeEnvVars, DEFAULT_RUNTIME_BIND_HOSTNAME,
+        RUNTIME_BIND_HOSTNAME_VAR,
     };
-    use crate::runtime::{KeepAliveRegistry, Runtime};
+    use crate::runtime::{KeepAliveRegistry, Runtime, RuntimeLifecycle};
     use std::collections::HashMap;
 
     #[test]
@@ -1630,6 +1709,188 @@ mod tests {
         }
 
         assert_eq!(registry.get_owner("svc-b"), Some("runtime-new".to_string()));
+    }
+
+    #[test]
+    fn test_create_request_without_lifecycle_fields_takes_the_executor_defaults() {
+        let body = r#"{
+            "runtimeId": "fn-1",
+            "image": "openruntimes/node:v5-25",
+            "entrypoint": "index.js",
+            "version": "v5"
+        }"#;
+
+        let req: CreateRuntimeRequest = serde_json::from_str(body).unwrap();
+        assert_eq!(req.startup_timeout, None);
+        assert_eq!(req.inactive_threshold, None);
+        assert_eq!(req.max_concurrency, None);
+
+        let defaults = RuntimeLifecycle {
+            startup_timeout: 90,
+            inactive_threshold: 120,
+            max_concurrency: Some(16),
+        };
+        assert_eq!(req.lifecycle(defaults), defaults);
+    }
+
+    #[test]
+    fn test_create_request_lifecycle_fields_override_the_defaults() {
+        let body = r#"{
+            "runtimeId": "fn-1",
+            "image": "openruntimes/node:v5-25",
+            "startupTimeout": 300,
+            "inactiveThreshold": 900,
+            "maxConcurrency": 4
+        }"#;
+
+        let req: CreateRuntimeRequest = serde_json::from_str(body).unwrap();
+        let lifecycle = req.lifecycle(RuntimeLifecycle::default());
+
+        assert_eq!(lifecycle.startup_timeout, 300);
+        assert_eq!(lifecycle.inactive_threshold, 900);
+        assert_eq!(lifecycle.max_concurrency, Some(4));
+    }
+
+    #[test]
+    fn test_create_request_lifecycle_fields_can_be_set_one_at_a_time() {
+        let body = r#"{
+            "runtimeId": "fn-1",
+            "image": "openruntimes/node:v5-25",
+            "startupTimeout": 300
+        }"#;
+
+        let req: CreateRuntimeRequest = serde_json::from_str(body).unwrap();
+        let defaults = RuntimeLifecycle {
+            startup_timeout: 60,
+            inactive_threshold: 120,
+            max_concurrency: Some(2),
+        };
+        let lifecycle = req.lifecycle(defaults);
+
+        assert_eq!(lifecycle.startup_timeout, 300);
+        assert_eq!(lifecycle.inactive_threshold, 120);
+        assert_eq!(lifecycle.max_concurrency, Some(2));
+    }
+
+    #[test]
+    fn test_legacy_v2_create_request_parses_with_lifecycle_fields() {
+        let body = r#"{
+            "runtimeId": "old-fn",
+            "image": "openruntimes/node:v2-18",
+            "version": "v2",
+            "entrypoint": "index.js",
+            "startupTimeout": 30,
+            "maxConcurrency": 1
+        }"#;
+
+        let req: CreateRuntimeRequest = serde_json::from_str(body).unwrap();
+
+        assert_eq!(req.version, "v2");
+        assert!(is_legacy_v2(&req.version));
+        let lifecycle = req.lifecycle(RuntimeLifecycle::default());
+        assert_eq!(lifecycle.startup_timeout, 30);
+        assert_eq!(lifecycle.max_concurrency, Some(1));
+    }
+
+    #[test]
+    fn test_create_request_ignores_unknown_fields_from_openruntimes_callers() {
+        let body = r#"{
+            "runtimeId": "fn-1",
+            "image": "openruntimes/node:v5-25",
+            "startupTimeout": 45,
+            "someFutureField": {"nested": true},
+            "workdir": "/usr/local/server",
+            "networks": ["a", "b"]
+        }"#;
+
+        let req: CreateRuntimeRequest = serde_json::from_str(body).unwrap();
+
+        assert_eq!(req.runtime_id, "fn-1");
+        assert_eq!(req.startup_timeout, Some(45));
+    }
+
+    #[test]
+    fn test_create_request_lifecycle_null_is_treated_as_absent() {
+        // The on-the-fly create path serialises unset knobs as null.
+        let body = r#"{
+            "runtimeId": "fn-1",
+            "image": "openruntimes/node:v5-25",
+            "startupTimeout": null,
+            "inactiveThreshold": null,
+            "maxConcurrency": null
+        }"#;
+
+        let req: CreateRuntimeRequest = serde_json::from_str(body).unwrap();
+        let defaults = RuntimeLifecycle {
+            startup_timeout: 90,
+            inactive_threshold: 120,
+            max_concurrency: Some(16),
+        };
+
+        assert_eq!(req.lifecycle(defaults), defaults);
+    }
+
+    #[test]
+    fn test_lifecycle_labels_round_trip() {
+        let lifecycle = RuntimeLifecycle {
+            startup_timeout: 300,
+            inactive_threshold: 900,
+            max_concurrency: Some(4),
+        };
+
+        let labels = lifecycle.to_labels();
+        assert_eq!(labels.get("urt.startup_timeout").unwrap(), "300");
+        assert_eq!(labels.get("urt.inactive_threshold").unwrap(), "900");
+        assert_eq!(labels.get("urt.max_concurrency").unwrap(), "4");
+
+        assert_eq!(
+            RuntimeLifecycle::from_labels(&labels, RuntimeLifecycle::default()),
+            lifecycle
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_labels_round_trip_an_uncapped_runtime() {
+        let lifecycle = RuntimeLifecycle {
+            startup_timeout: 60,
+            inactive_threshold: 60,
+            max_concurrency: None,
+        };
+
+        let labels = lifecycle.to_labels();
+        assert_eq!(labels.get("urt.max_concurrency").unwrap(), "0");
+
+        // A deliberate "no cap" survives even when the executor default caps.
+        let capped_defaults = RuntimeLifecycle {
+            max_concurrency: Some(8),
+            ..RuntimeLifecycle::default()
+        };
+        assert_eq!(
+            RuntimeLifecycle::from_labels(&labels, capped_defaults).max_concurrency,
+            None
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_labels_fall_back_on_missing_or_bad_values() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "urt.startup_timeout".to_string(),
+            "not-a-number".to_string(),
+        );
+        labels.insert("urt.inactive_threshold".to_string(), "0".to_string());
+
+        let defaults = RuntimeLifecycle {
+            startup_timeout: 45,
+            inactive_threshold: 120,
+            max_concurrency: Some(3),
+        };
+        let lifecycle = RuntimeLifecycle::from_labels(&labels, defaults);
+
+        assert_eq!(lifecycle.startup_timeout, 45);
+        // An explicit zero threshold is honoured: it means "reclaim as soon as idle".
+        assert_eq!(lifecycle.inactive_threshold, 0);
+        assert_eq!(lifecycle.max_concurrency, Some(3));
     }
 
     #[test]

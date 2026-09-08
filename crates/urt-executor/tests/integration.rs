@@ -38,6 +38,8 @@ fn test_config() -> ExecutorConfig {
         min_memory: 0,
         keep_alive: true,
         inactive_threshold: 60,
+        startup_timeout_secs: 60,
+        runtime_max_concurrency: None,
         maintenance_interval: 3600,
         autoscale: false,
         eager_runtime_readiness: false,
@@ -81,6 +83,7 @@ async fn create_test_state() -> Option<AppState> {
         execution_limiter_capacity: None,
         runtime_create_limiter_capacity: None,
         readiness: std::sync::Arc::new(dashmap::DashMap::new()),
+        runtime_concurrency: urt_executor::runtime::RuntimeConcurrency::new(),
         create_tracker: urt_executor::runtime::CreateTracker::new(),
     })
 }
@@ -2462,6 +2465,8 @@ mod audit_fixes {
             min_memory: 0,
             keep_alive: false,
             inactive_threshold: 60,
+            startup_timeout_secs: 60,
+            runtime_max_concurrency: None,
             maintenance_interval: 3600,
             autoscale: false,
             eager_runtime_readiness: false,
@@ -2880,6 +2885,8 @@ mod regression_pending_wait {
             min_memory: 0,
             keep_alive: false,
             inactive_threshold: 60,
+            startup_timeout_secs: 60,
+            runtime_max_concurrency: None,
             maintenance_interval: 3600,
             autoscale: false,
             eager_runtime_readiness: false,
@@ -2924,6 +2931,7 @@ mod regression_pending_wait {
             execution_limiter_capacity: None,
             runtime_create_limiter_capacity: None,
             readiness: Arc::new(dashmap::DashMap::new()),
+            runtime_concurrency: urt_executor::runtime::RuntimeConcurrency::new(),
             create_tracker: urt_executor::runtime::CreateTracker::new(),
         };
 
@@ -3786,5 +3794,312 @@ mod cold_start_wedge {
         }
 
         assert_eq!(from_env.pending_max_age_secs, 45);
+    }
+}
+
+/// Runtime lifecycle policy: the listening gate on `initialised`, the failed
+/// verdict for a runtime that never listens, and the per-runtime knobs.
+mod lifecycle_policy {
+    use super::*;
+    use std::time::Duration;
+    use urt_executor::config::ExecutorConfig;
+    use urt_executor::runtime::{Runtime, RuntimeLifecycle, RuntimeRegistry};
+
+    /// A runtime that Docker reports as up, created `age_secs` ago, that has
+    /// never been observed listening.
+    fn running_but_silent(runtime_id: &str, age_secs: f64, startup_timeout: u64) -> Runtime {
+        let mut runtime = Runtime::new(
+            runtime_id,
+            "test-executor",
+            "openruntimes/node:v5-25",
+            "v5",
+            None,
+        );
+        runtime.apply_lifecycle(RuntimeLifecycle {
+            startup_timeout,
+            ..RuntimeLifecycle::default()
+        });
+        runtime.mark_running("running");
+        runtime.created -= age_secs;
+        runtime.updated -= age_secs;
+        runtime
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_that_never_listens_is_marked_failed_after_its_window() {
+        let registry = RuntimeRegistry::new();
+        registry
+            .insert(running_but_silent("silent", 300.0, 60))
+            .await
+            .expect("insert runtime");
+
+        // Before the sweep the entry looks healthy apart from `listening`, which
+        // is exactly the state that hid two production outages.
+        let before = registry.get("test-executor-silent").await.unwrap();
+        assert!(before.is_running());
+        assert_eq!(before.initialised, 0);
+        assert_eq!(before.listening, 0);
+
+        let failed = urt_executor::tasks::sweep_listening_state(&registry).await;
+
+        assert_eq!(failed, vec!["test-executor-silent".to_string()]);
+
+        let after = registry.get("test-executor-silent").await.unwrap();
+        assert!(
+            after.is_failed(),
+            "a runtime past its startup window with no listener must be marked failed"
+        );
+        assert_eq!(after.status, "failed");
+        assert_eq!(after.initialised, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_inside_its_window_is_left_alone() {
+        let registry = RuntimeRegistry::new();
+        registry
+            .insert(running_but_silent("starting", 10.0, 60))
+            .await
+            .expect("insert runtime");
+
+        assert!(urt_executor::tasks::sweep_listening_state(&registry)
+            .await
+            .is_empty());
+        assert!(!registry
+            .get("test-executor-starting")
+            .await
+            .unwrap()
+            .is_failed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_per_runtime_startup_timeout_widens_the_window() {
+        let registry = RuntimeRegistry::new();
+        // Five minutes old, well past the 60s default, but its own window is
+        // ten minutes.
+        registry
+            .insert(running_but_silent("slow-boot", 300.0, 600))
+            .await
+            .expect("insert runtime");
+
+        assert!(urt_executor::tasks::sweep_listening_state(&registry)
+            .await
+            .is_empty());
+        assert!(!registry
+            .get("test-executor-slow-boot")
+            .await
+            .unwrap()
+            .is_failed());
+    }
+
+    #[tokio::test]
+    async fn a_failed_runtime_is_reaped_on_the_next_watchdog_cycle() {
+        require_docker!(state);
+
+        let mut runtime = running_but_silent("condemned", 300.0, 60);
+        runtime.mark_failed();
+        state
+            .registry
+            .insert(runtime)
+            .await
+            .expect("insert failed runtime");
+
+        let reaped = urt_executor::tasks::reap_failed_runtimes(
+            &state.docker,
+            &state.registry,
+            &state.keep_alive_registry,
+        )
+        .await;
+
+        assert_eq!(reaped, 1);
+        assert!(
+            state
+                .registry
+                .get("test-executor-condemned")
+                .await
+                .is_none(),
+            "a failed runtime must leave the registry so the next request recreates it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_runtime_is_listed_before_it_is_reaped() {
+        require_docker!(state);
+
+        let mut runtime = running_but_silent("condemned-visible", 300.0, 60);
+        runtime.mark_failed();
+        state.registry.insert(runtime).await.expect("insert");
+
+        let app = create_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/runtimes")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = parse_json_body(response.into_body()).await;
+        let entry = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rt| rt["name"] == "test-executor-condemned-visible")
+            .expect("the failed runtime must still be listed")
+            .clone();
+
+        assert_eq!(entry["status"], "failed");
+        assert_eq!(entry["initialised"], 0);
+        assert_eq!(entry["listening"], 0);
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_honours_a_per_runtime_inactive_threshold() {
+        require_docker!(state);
+
+        // Both have been idle for two minutes; the executor default is 60s.
+        let mut patient = running_but_silent("patient", 0.0, 60);
+        patient.inactive_threshold = 3_600;
+        patient.updated -= 120.0;
+
+        let mut impatient = running_but_silent("impatient", 0.0, 60);
+        impatient.inactive_threshold = 5;
+        impatient.updated -= 120.0;
+
+        state.registry.insert(patient).await.expect("insert");
+        state.registry.insert(impatient).await.expect("insert");
+
+        urt_executor::tasks::cleanup_idle(
+            &state.docker,
+            &state.registry,
+            &state.keep_alive_registry,
+            state.config.inactive_threshold,
+        )
+        .await;
+
+        assert!(
+            state
+                .registry
+                .get("test-executor-impatient")
+                .await
+                .is_none(),
+            "a runtime whose own threshold has passed must be reclaimed"
+        );
+        assert!(
+            state.registry.get("test-executor-patient").await.is_some(),
+            "a runtime that asked to stay warm for an hour must not be reclaimed at 2 minutes"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_concurrency_refuses_executions_beyond_the_cap() {
+        require_docker!(state);
+        let mut state = state;
+
+        // Keep the queue wait short so the refusal is quick and deterministic.
+        state.config.execution_queue_wait_ms = 50;
+
+        let mut runtime = running_but_silent("capped", 0.0, 60);
+        runtime.max_concurrency = Some(1);
+        runtime.set_listening();
+        state.registry.insert(runtime).await.expect("insert");
+
+        // Hold the runtime's only slot, as an execution in flight would.
+        let _held = state
+            .runtime_concurrency
+            .acquire("test-executor-capped", 1, Duration::from_millis(50))
+            .await
+            .expect("the first slot must be free");
+
+        let app = create_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes/capped/executions")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        json!({"body": "", "path": "/", "method": "GET", "timeout": 15})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = parse_json_body(response.into_body()).await;
+        assert_eq!(body["type"], "runtime_at_capacity");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("limit of 1 concurrent executions"),
+            "the body must name the runtime and its cap: {}",
+            body["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncapped_runtime_is_never_refused_on_admission() {
+        require_docker!(state);
+        let mut state = state;
+        state.config.execution_queue_wait_ms = 50;
+
+        let mut runtime = running_but_silent("uncapped", 0.0, 60);
+        runtime.max_concurrency = None;
+        runtime.set_listening();
+        state.registry.insert(runtime).await.expect("insert");
+
+        let app = create_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runtimes/uncapped/executions")
+                    .header("Authorization", "Bearer test-secret-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        json!({"body": "", "path": "/", "method": "GET", "timeout": 2}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No container backs this runtime, so the execution fails downstream;
+        // what matters is that it was never refused on admission.
+        assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn lifecycle_defaults_come_from_the_environment() {
+        assert_eq!(test_config().startup_timeout_secs, 60);
+        assert_eq!(test_config().runtime_max_concurrency, None);
+
+        // SAFETY: single-threaded test; no concurrent env mutation.
+        unsafe {
+            std::env::set_var("URT_STARTUP_TIMEOUT_SECS", "120");
+            std::env::set_var("URT_RUNTIME_MAX_CONCURRENCY", "8");
+        }
+        let from_env = ExecutorConfig::from_env();
+        unsafe {
+            std::env::remove_var("URT_STARTUP_TIMEOUT_SECS");
+            std::env::remove_var("URT_RUNTIME_MAX_CONCURRENCY");
+        }
+
+        assert_eq!(from_env.startup_timeout_secs, 120);
+        assert_eq!(from_env.runtime_max_concurrency, Some(8));
+        assert_eq!(
+            from_env.runtime_lifecycle_defaults().startup_timeout,
+            120,
+            "the defaults handed to a create must follow the environment"
+        );
     }
 }

@@ -341,6 +341,7 @@ pub(crate) async fn resolve_runtime_with_readiness(
         &state.keep_alive_registry,
         &state.config.hostname,
         full_name,
+        state.config.runtime_lifecycle_defaults(),
     )
     .await;
 

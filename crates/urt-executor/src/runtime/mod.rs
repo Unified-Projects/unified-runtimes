@@ -1,5 +1,6 @@
 //! Runtime management module
 
+pub mod concurrency;
 pub(crate) mod create_tracker;
 mod keep_alive;
 mod protocol;
@@ -8,6 +9,7 @@ mod registry;
 #[allow(clippy::module_inception)]
 mod runtime;
 
+pub use concurrency::RuntimeConcurrency;
 pub use create_tracker::CreateTracker;
 pub use keep_alive::KeepAliveRegistry;
 #[allow(unused_imports)]
@@ -16,4 +18,7 @@ pub use protocol::{
     V2Protocol, V5Protocol,
 };
 pub use registry::RuntimeRegistry;
-pub use runtime::{wait_for_runtime_port, Runtime};
+pub use runtime::{
+    is_runtime_listening, wait_for_runtime_port, Runtime, RuntimeLifecycle,
+    DEFAULT_INACTIVE_THRESHOLD_SECS, DEFAULT_STARTUP_TIMEOUT_SECS, RUNTIME_PORT,
+};

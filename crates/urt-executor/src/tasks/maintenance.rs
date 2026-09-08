@@ -6,7 +6,8 @@ use crate::docker::DockerManager;
 use crate::error::ExecutorError;
 use crate::resilience::retry_with_backoff;
 use crate::runtime::{
-    wait_for_runtime_port, CreateTracker, KeepAliveRegistry, Runtime, RuntimeRegistry,
+    wait_for_runtime_port, CreateTracker, KeepAliveRegistry, Runtime, RuntimeLifecycle,
+    RuntimeRegistry, RUNTIME_PORT,
 };
 use crate::storage::{BuildCache, Storage};
 use dashmap::DashMap;
@@ -109,7 +110,17 @@ fn keep_alive_generation_from_container(container: &ContainerInfo) -> Option<u64
         .filter(|value| *value > 0)
 }
 
-fn runtime_from_container(container: &ContainerInfo, hostname: &str) -> Option<Runtime> {
+/// Rebuild a registry entry from a container the executor is adopting.
+///
+/// The lifecycle knobs come back off the container's labels, so a runtime
+/// created with a longer startup window or a concurrency cap keeps them across
+/// an executor restart; `defaults` covers containers created before the labels
+/// existed.
+fn runtime_from_container(
+    container: &ContainerInfo,
+    hostname: &str,
+    defaults: RuntimeLifecycle,
+) -> Option<Runtime> {
     let runtime_id = runtime_id_from_container(container, hostname)?;
     let version = infer_runtime_version(&container.image, &container.labels);
     let keep_alive_id = keep_alive_id_from_container(container);
@@ -131,11 +142,10 @@ fn runtime_from_container(container: &ContainerInfo, hostname: &str) -> Option<R
     } else {
         container.state.clone()
     };
-    runtime.initialised = if is_container_running(container) {
-        1
-    } else {
-        0
-    };
+    // A running container has not proved it can serve; only an observed listener
+    // sets `initialised`, which the caller does after probing the port.
+    runtime.initialised = 0;
+    runtime.apply_lifecycle(RuntimeLifecycle::from_labels(&container.labels, defaults));
 
     if container.created > 0 {
         runtime.created = container.created as f64;
@@ -163,6 +173,7 @@ async fn adopt_inspected_container(
     keep_alive_registry: &KeepAliveRegistry,
     hostname: &str,
     inspected: ContainerInfo,
+    defaults: RuntimeLifecycle,
 ) -> bool {
     let name = inspected.name.clone();
 
@@ -186,7 +197,7 @@ async fn adopt_inspected_container(
         return false;
     }
 
-    let runtime = match runtime_from_container(&inspected, hostname) {
+    let runtime = match runtime_from_container(&inspected, hostname, defaults) {
         Some(rt) => rt,
         None => {
             warn!(
@@ -198,11 +209,11 @@ async fn adopt_inspected_container(
     };
 
     let mut runtime = runtime;
-    if wait_for_runtime_port(&runtime.name, 3000, Duration::from_millis(200))
+    if wait_for_runtime_port(&runtime.name, RUNTIME_PORT, Duration::from_millis(200))
         .await
         .is_ok()
     {
-        runtime.listening = 1;
+        runtime.set_listening();
     }
 
     if let Err(e) = registry.insert(runtime.clone()).await {
@@ -258,6 +269,7 @@ pub async fn adopt_container_by_name(
     keep_alive_registry: &KeepAliveRegistry,
     hostname: &str,
     container_name: &str,
+    defaults: RuntimeLifecycle,
 ) -> bool {
     if registry.exists(container_name).await {
         return true;
@@ -268,7 +280,7 @@ pub async fn adopt_container_by_name(
         Err(_) => return false,
     };
 
-    adopt_inspected_container(registry, keep_alive_registry, hostname, inspected).await
+    adopt_inspected_container(registry, keep_alive_registry, hostname, inspected, defaults).await
 }
 
 /// Adopt existing managed containers on startup
@@ -281,6 +293,7 @@ pub async fn adopt_existing_containers(
     registry: &RuntimeRegistry,
     keep_alive_registry: &KeepAliveRegistry,
     hostname: &str,
+    defaults: RuntimeLifecycle,
 ) {
     let label = "urt.managed=true";
 
@@ -374,7 +387,9 @@ pub async fn adopt_existing_containers(
             continue;
         }
 
-        if adopt_inspected_container(registry, keep_alive_registry, hostname, inspected).await {
+        if adopt_inspected_container(registry, keep_alive_registry, hostname, inspected, defaults)
+            .await
+        {
             adopted_count += 1;
         }
     }
@@ -494,15 +509,19 @@ async fn cleanup_build_cache<S: Storage>(cache: &BuildCache<S>) {
     }
 }
 
-/// Clean up runtimes that have been idle longer than threshold
-/// Runtimes with a keep_alive_id that they currently own are protected from cleanup.
-async fn cleanup_idle(
+/// Clean up runtimes that have been idle longer than they tolerate.
+///
+/// Each runtime is measured against its own `inactiveThreshold`, so a caller can
+/// keep a rarely-used runtime warm for longer than the executor default without
+/// changing it for everything else; `default_threshold` covers runtimes that
+/// asked for nothing. Runtimes that currently own a keep-alive ID are protected.
+pub async fn cleanup_idle(
     docker: &DockerManager,
     registry: &RuntimeRegistry,
     keep_alive_registry: &KeepAliveRegistry,
-    threshold: u64,
+    default_threshold: u64,
 ) {
-    let idle_runtimes = registry.get_idle(threshold).await;
+    let idle_runtimes = registry.get_idle(default_threshold).await;
 
     if idle_runtimes.is_empty() {
         debug!("No idle runtimes to clean up");
@@ -861,7 +880,7 @@ mod tests {
     };
     use crate::docker::container::ContainerInfo;
     use crate::runtime::create_tracker::BeginCreate;
-    use crate::runtime::{CreateTracker, Runtime, RuntimeRegistry};
+    use crate::runtime::{CreateTracker, Runtime, RuntimeLifecycle, RuntimeRegistry};
     use dashmap::DashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -955,8 +974,61 @@ mod tests {
         );
         container.hostname = "runtime-host-123".to_string();
 
-        let runtime = super::runtime_from_container(&container, "executor").unwrap();
+        let runtime =
+            super::runtime_from_container(&container, "executor", RuntimeLifecycle::default())
+                .unwrap();
         assert_eq!(runtime.hostname, "runtime-host-123");
+    }
+
+    #[test]
+    fn test_runtime_from_container_restores_lifecycle_labels() {
+        let mut container = container("executor-my-runtime");
+        container
+            .labels
+            .insert("urt.startup_timeout".to_string(), "300".to_string());
+        container
+            .labels
+            .insert("urt.inactive_threshold".to_string(), "900".to_string());
+        container
+            .labels
+            .insert("urt.max_concurrency".to_string(), "4".to_string());
+
+        let runtime =
+            super::runtime_from_container(&container, "executor", RuntimeLifecycle::default())
+                .unwrap();
+
+        assert_eq!(runtime.startup_timeout, 300);
+        assert_eq!(runtime.inactive_threshold, 900);
+        assert_eq!(runtime.max_concurrency, Some(4));
+    }
+
+    #[test]
+    fn test_runtime_from_container_falls_back_to_executor_defaults() {
+        let container = container("executor-my-runtime");
+        let defaults = RuntimeLifecycle {
+            startup_timeout: 45,
+            inactive_threshold: 120,
+            max_concurrency: Some(8),
+        };
+
+        let runtime = super::runtime_from_container(&container, "executor", defaults).unwrap();
+
+        assert_eq!(runtime.startup_timeout, 45);
+        assert_eq!(runtime.inactive_threshold, 120);
+        assert_eq!(runtime.max_concurrency, Some(8));
+    }
+
+    #[test]
+    fn test_runtime_from_container_never_adopts_as_initialised() {
+        let container = container("executor-my-runtime");
+
+        let runtime =
+            super::runtime_from_container(&container, "executor", RuntimeLifecycle::default())
+                .unwrap();
+
+        assert!(is_container_running(&container));
+        assert_eq!(runtime.initialised, 0);
+        assert_eq!(runtime.listening, 0);
     }
 
     /// A pending entry aged `age_secs` seconds.

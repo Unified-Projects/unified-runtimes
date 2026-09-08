@@ -8,15 +8,13 @@ mod logs;
 mod metrics;
 pub(crate) mod runtimes;
 
-pub(crate) use runtimes::{DEFAULT_RUNTIME_BIND_HOSTNAME, RUNTIME_BIND_HOSTNAME_VAR};
-
 use crate::config::ExecutorConfig;
 use crate::docker::DockerManager;
 use crate::error::ExecutorError;
 use crate::middleware::{
     auth::auth_middleware, request_context_middleware, security_headers_middleware,
 };
-use crate::runtime::{CreateTracker, KeepAliveRegistry, RuntimeRegistry};
+use crate::runtime::{CreateTracker, KeepAliveRegistry, RuntimeConcurrency, RuntimeRegistry};
 use crate::storage::Storage;
 use axum::{
     extract::DefaultBodyLimit,
@@ -44,6 +42,9 @@ pub struct AppState {
     /// Per-runtime readiness notifiers. Inserted when a runtime enters pending state,
     /// fired (notify_waiters) and removed when it leaves pending (success or failure).
     pub readiness: Arc<DashMap<String, Arc<Notify>>>,
+    /// Per-runtime execution admission, enforcing each runtime's
+    /// `maxConcurrency`. Runtimes with no cap never touch it.
+    pub runtime_concurrency: RuntimeConcurrency,
     /// Runtime creates that are currently building. A create is registered for the
     /// whole duration of its build, so concurrent creates can join it and
     /// maintenance can tell an orphaned pending entry from a live one.

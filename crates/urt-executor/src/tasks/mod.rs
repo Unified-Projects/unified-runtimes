@@ -5,11 +5,14 @@ mod maintenance;
 mod stats;
 mod warmup;
 
-pub use listening_watch::run_listening_watch;
+#[allow(unused_imports)]
+pub use listening_watch::{
+    reap_failed_runtimes, run_listening_watch, sweep_listening_state, ListeningWatchHandles,
+};
 #[allow(unused_imports)]
 pub use maintenance::{
-    adopt_container_by_name, adopt_existing_containers, cleanup_stale_pending, run_maintenance,
-    MaintenanceHandles,
+    adopt_container_by_name, adopt_existing_containers, cleanup_idle, cleanup_stale_pending,
+    run_maintenance, MaintenanceHandles,
 };
 pub use stats::run_stats_collector;
 pub use warmup::run_warmup;
